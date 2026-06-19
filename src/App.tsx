@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ping,
@@ -271,9 +271,14 @@ export default function App() {
   const [pythonLogsOpen, setPythonLogsOpen] = useState(false);
   const [pyLogsMouseDown, setPyLogsMouseDown] = useState(false);
   const updateBusyRef = useRef(false);
-  const setUpdateBusyTracked = (v: boolean) => {
+  // Stable identity (useCallback, no deps) so UpdateOverlay's effect — which
+  // depends on this via `run` — doesn't re-fire on every unrelated App
+  // re-render. The actual duplicate-download bug is now guarded in
+  // UpdateOverlay itself, but keeping this stable avoids the pointless
+  // clear/reschedule churn too.
+  const setUpdateBusyTracked = useCallback((v: boolean) => {
     updateBusyRef.current = v;
-  };
+  }, []);
   // Python-string progress. `stage` distinguishes the two passes (classify =
   // deciding what to translate, translate = the actual work) so the bar resetting
   // to 0 between them reads as a NEW stage, not a regress. Each stage's total is

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useT } from "./i18n";
@@ -15,8 +15,19 @@ export default function UpdateOverlay({
 }) {
   const { t } = useT();
   const [state, setState] = useState<UpdateState>(null);
+  // Guards against duplicate downloads: the effect below re-fires whenever
+  // `run`'s identity changes (which happens whenever the parent re-renders and
+  // hands us a fresh `onStateChange` closure). Without this, a re-render that
+  // lands *after* a download has already started would schedule a SECOND
+  // parallel check()+downloadAndInstall() — two independent downloads both
+  // writing to the same `state`, which is what made the progress bar jump
+  // back and forth. This ref makes the actual work run at most once per
+  // mount, no matter how many times the effect/timer re-fires.
+  const startedRef = useRef(false);
 
   const run = useCallback(async () => {
+    if (startedRef.current) return;
+    startedRef.current = true;
     try {
       const update = await check();
       if (!update) return;
