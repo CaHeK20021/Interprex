@@ -30,7 +30,7 @@ class GeminiProvider(BaseProvider):
 
     def __init__(self):
         super().__init__()
-        self._use_proxy_fallback = False
+        self._use_proxy_fallback = True
 
     def list_models(self, cfg: ProviderConfig) -> list[str]:
         """Models the key can use, via GET v1beta/models, filtered to those that
