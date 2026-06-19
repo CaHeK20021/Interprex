@@ -40,7 +40,8 @@ export default function UpdateOverlay({
 
       setState({ kind: "ready" });
       await relaunch();
-    } catch {
+    } catch (err) {
+      console.error("[updater] check/download/install failed:", err);
       setState(null);
       onStateChange(false);
     }
