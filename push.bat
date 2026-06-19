@@ -71,8 +71,8 @@ git push -u origin "!BRANCH!"
 echo.
 echo  Bumping version and tagging...
 
-:: Read current version from package.json
-for /f tokens^=2^ delims^=^" %%V in ('findstr /r "\"version\":.*\"[0-9]" package.json') do set "CURVER=%%V"
+:: Read current version from package.json via PowerShell
+for /f %%V in ('powershell -Command "(Get-Content 'package.json' -Raw | ConvertFrom-Json).version"') do set "CURVER=%%V"
 if "!CURVER!"=="" (
     echo  [WARN] Could not read version from package.json, skipping tag.
     echo.
