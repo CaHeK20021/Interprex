@@ -193,6 +193,7 @@ def _is_existing_translation_file(text: str) -> bool:
     return not _TOPLEVEL_SOURCE_RE.search(text)
 
 _LABEL_RE = re.compile(r'^\s*label\s+(?P<name>\.?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)')
+_RESET_FLOW_RE = re.compile(r'^\s*(?:jump|call|return|scene)\b')
 
 # A `translate <lang> …:` block opener — the start of an EXISTING translation
 # (a say block `translate ru id:`, a `translate ru strings:`, or a
@@ -819,10 +820,14 @@ class RenPyParser(BaseParser):
             "{alpha=*0.5}, {p}, {w}, {nw}, {fast}, {cps=N} are Ren'Py display tags. "
             "Preserve all opening and closing tags exactly as they appear.\n"
             "SCENE / TONE: the 'context' field often contains the label name (e.g. "
-            "'label: romance', 'label: dm', 'label: office'). Use it to set the right "
-            "register \u2014 romantic scenes \u2192 informal '\u0442\u044b'; business scenes \u2192 formal '\u0432\u044b'; "
-            "chat/DM scenes \u2192 casual chat style. If the label is absent or unclear, "
-            "translate naturally.\n"
+            "'label: romance', 'label: dm', 'label: office') and may include the "
+            "immediately preceding dialogue line: Prev line: '...' (speaker). Use it "
+            "to match tone and register, maintain consistent T-V distinction (\u0442\u044b/\u0432\u044b), "
+            "and resolve gender or pronoun ambiguities. Visual novels are highly personal; "
+            "when translating 'you' into languages with T-V distinction (like Russian, "
+            "Spanish, French, German), default to the informal address (e.g., '\u0442\u044b', "
+            "'t\u00fa', 'tu', 'du') unless the context clearly dictates a formal address (e.g., "
+            "a teacher, boss, or stranger).\n"
             "DIALOGUE NATURALNESS: these are spoken lines of a visual novel. The "
             "translation should sound like a real person talking, not a subtitle or a "
             "technical manual.\n"
@@ -1011,6 +1016,7 @@ class RenPyParser(BaseParser):
         global_label = ""
         # (label, kind) -> running count for narrative strings.
         counts: dict[tuple[str, str], int] = {}
+        last_dialogue: dict[str, str] | None = None
         # variable name -> display name, built from `define` lines so that
         # `e "Hello."` can be annotated with "Eileen" instead of just "e".
         char_names: dict[str, str] = {}
@@ -1114,6 +1120,10 @@ class RenPyParser(BaseParser):
             if line.lstrip().startswith("#"):
                 continue
 
+            if _RESET_FLOW_RE.match(line):
+                last_dialogue = None
+                continue
+
             # Inside an inline `translate <lang> …:` block? Its body is already
             # translated — skip it. Leave the block on the first line de-dented to
             # or past the opener. (Checked before the opener match so a sibling
@@ -1128,6 +1138,7 @@ class RenPyParser(BaseParser):
             if to:
                 translate_indent = len(to.group("indent"))
                 pending_prefix = []  # don't let a stale prefix bind across it
+                last_dialogue = None
                 continue
 
             # Translatable PREFIX nodes accumulate, waiting for the next say to
@@ -1156,8 +1167,9 @@ class RenPyParser(BaseParser):
                 screen_for_indent = -1
                 pending_caption = False
                 menu_indent = -1
+                last_dialogue = None
                 continue
-
+ 
             # -- Screen interior ------------------------------------------
             if screen_indent >= 0:
                 if cur_indent <= screen_indent:
@@ -1169,6 +1181,7 @@ class RenPyParser(BaseParser):
                     screen_counts = {}
                     screen_for_vars = {}
                     screen_for_indent = -1
+                    last_dialogue = None
                     # fall through to narrative processing below
                 else:
                     # Track for-loop variable bindings: `for x, w in [("STR", 137), ...]:`
@@ -1241,6 +1254,7 @@ class RenPyParser(BaseParser):
                 set_label(m.group("name"))
                 pending_caption = False
                 menu_indent = -1
+                last_dialogue = None
                 continue
 
             # menu: opener — arm the caption flag for the first say inside.
@@ -1254,12 +1268,14 @@ class RenPyParser(BaseParser):
                     set_label(nm.group("name"))
                 pending_caption = True
                 menu_indent = cur_indent
+                last_dialogue = None
                 continue
 
             # Leaving the menu block (dedent to/past the menu keyword) disarms.
             if menu_indent >= 0 and cur_indent <= menu_indent:
                 pending_caption = False
                 menu_indent = -1
+                last_dialogue = None
 
             # Character display names: define e = Character("Eileen", ...)
             # _LINE_RE never matches these (= breaks the prefix pattern), so
@@ -1367,16 +1383,8 @@ class RenPyParser(BaseParser):
                 pending_caption = False
                 menu_indent = -1
 
-            # Speaker context for the LLM.
-            # say:  display name from the define table, variable name as fallback,
-            #       or "narrator" for bare strings with no speaker prefix.
-            # menu: player choices have no speaker — leave blank.
             is_generic = _is_generic_label(label)
-            if kind == "say":
-                speaker = char_names.get(first, first) if first else "narrator"
-                ctx = f"Label: {label} | Speaker: {speaker}" if not is_generic else f"Speaker: {speaker}"
-            else:
-                ctx = f"Label: {label}" if not is_generic else ""
+            speaker = char_names.get(first, first) if first else "narrator"
 
             # Check if this is a technical string (like style backgrounds, fonts, etc.)
             if is_technical_string(m.group("text")):
@@ -1404,6 +1412,28 @@ class RenPyParser(BaseParser):
                 attrs = []
                 is_caption = False
                 say_args = None  # only say lines carry an argument list
+
+            # Finalize context and track dialogue history
+            if native_kind == "say":
+                ctx = f"Label: {label} | Speaker: {speaker}" if not is_generic else f"Speaker: {speaker}"
+                if last_dialogue is not None:
+                    prev_text = last_dialogue["text"]
+                    if len(prev_text) > 250:
+                        prev_text = prev_text[:150] + "..."
+                    ctx += f" | Prev line: '{prev_text}' ({last_dialogue['speaker']})"
+                
+                # Update dialogue state
+                if speaker == "extend":
+                    if last_dialogue is not None and m.group("text").strip():
+                        sep = " " if not (last_dialogue["text"].endswith(" ") or m.group("text").startswith(" ")) else ""
+                        last_dialogue["text"] += sep + m.group("text")
+                elif m.group("text").strip():
+                    last_dialogue = {"text": m.group("text"), "speaker": speaker}
+            else:
+                if kind == "say":
+                    ctx = f"Label: {label} | Speaker: {speaker}" if not is_generic else f"Speaker: {speaker}"
+                else:
+                    ctx = f"Label: {label}" if not is_generic else ""
 
             yield {
                 "path": ["label", label, kind, str(idx)],
