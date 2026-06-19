@@ -55,18 +55,16 @@ class GeminiProvider(BaseProvider):
             timeout_proxy_2 = httpx.Timeout(connect=20.0, read=90.0, write=10.0, pool=5.0)
             timeout_direct = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
 
-            if self._use_proxy_fallback:
-                steps = [
-                    (proxy_url, timeout_proxy_1, True),
-                    (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
-                    (direct_url, timeout_direct, False),
-                ]
-            else:
-                steps = [
-                    (direct_url, timeout_direct, False),
-                    (proxy_url, timeout_proxy_1, True),
-                    (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
-                ]
+            # base_url is set only when the user/autocheck chose a proxy route.
+            # Never fall back to direct Google here — geo-blocked regions (RU etc.)
+            # get "User location is not supported" on direct even when the proxy works.
+            steps = [
+                (proxy_url, timeout_proxy_1, True),
+                (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
+            ]
+            if not self._use_proxy_fallback:
+                # Last successful path was direct (same session) — try it once before proxy.
+                steps = [(direct_url, timeout_direct, False)] + steps
         else:
             timeout_direct = httpx.Timeout(connect=20.0, read=45.0, write=10.0, pool=5.0)
             steps = [
@@ -103,11 +101,12 @@ class GeminiProvider(BaseProvider):
             logger.warning("Failed to parse models JSON: %s", parse_e)
             return []
 
-    def active_model(self, cfg: ProviderConfig) -> str:
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """Return the preferred default model so the UI pre-selects it instead of
         landing on the first alphabetical entry. For cloud providers there's no
         'loaded' model — we just steer toward the recommended one."""
-        models = self.list_models(cfg)
+        if models is None:
+            models = self.list_models(cfg)
         if not models:
             return ""
         # Prefer the module default if the key can actually use it.
@@ -115,8 +114,10 @@ class GeminiProvider(BaseProvider):
 
     def _complete(self, prompt: str, cfg: ProviderConfig) -> CompletionResult:
         model = cfg.model or _DEFAULT_MODEL
-        if self._use_proxy_fallback and cfg.base_url:
+        if cfg.base_url:
+            # Explicit proxy base — always route through it (geo-blocked users).
             url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
+            self._use_proxy_fallback = True
         else:
             url = f"{_API_ROOT}/{model}:generateContent"
         

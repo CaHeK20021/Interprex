@@ -108,7 +108,7 @@ class OllamaProvider(_OpenAICompat):
         base = self._base(cfg)
         return base[:-3] if base.endswith("/v1") else base
 
-    def active_model(self, cfg: ProviderConfig) -> str:
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """The model Ollama currently has loaded in VRAM, via native /api/ps. If
         several are loaded, the first is returned; "" if none (or server down) so
         the UI falls back to the full model list."""
@@ -150,10 +150,11 @@ class LMStudioProvider(_OpenAICompat):
     name = "lmstudio"
     default_base_url = "http://localhost:1234/v1"
 
-    def active_model(self, cfg: ProviderConfig) -> str:
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """LM Studio's /v1/models lists the models it has loaded, so the first
         entry is effectively the active one. "" if none loaded / server down."""
-        models = self.list_models(cfg)
+        if models is None:
+            models = self.list_models(cfg)
         return models[0] if models else ""
 
 
@@ -177,10 +178,11 @@ class KaggleProvider(_OpenAICompat):
     extra_headers = {"ngrok-skip-browser-warning": "true"}
     sends_num_ctx = False
 
-    def active_model(self, cfg: ProviderConfig) -> str:
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """Whatever the server has loaded — typically one model per Kaggle
         session, so the first listed id is the active one. "" if unreachable."""
-        models = self.list_models(cfg)
+        if models is None:
+            models = self.list_models(cfg)
         return models[0] if models else ""
 
 

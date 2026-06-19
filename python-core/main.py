@@ -265,9 +265,10 @@ def models(req: ModelsReq) -> dict:
         api_key=req.api_key,
         free_only=req.free_only,
     )
+    models = provider.list_models(cfg)
     return {
-        "models": provider.list_models(cfg),
-        "active": provider.active_model(cfg),
+        "models": models,
+        "active": provider.active_model(cfg, models),
     }
 
 

@@ -375,11 +375,12 @@ class BaseProvider(ABC):
         UI then falls back to a free-text field. Must never raise."""
         return []
 
-    def active_model(self, cfg: ProviderConfig) -> str:
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """The model the backend would use right now if asked — i.e. the one
         loaded in VRAM for a local server. "" when there's no notion of an active
-        model (cloud) or it can't be determined. The UI preselects this so a
-        local user usually doesn't have to pick. Must never raise."""
+        model (cloud) or it can't be determined. Pass ``models`` when the caller
+        already fetched the list (avoids a duplicate network round-trip). Must
+        never raise."""
         return ""
 
     def complete_prompt(self, prompt: str, items: list[TranslateItem],

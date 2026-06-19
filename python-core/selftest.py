@@ -2723,6 +2723,36 @@ def check_providers() -> None:
         models_err = provider.list_models(cfg)
         assert models_err == [], f"expected empty list on error, got {models_err}"
 
+    # Gemini: with an explicit proxy base_url, list_models must not fall back to
+    # direct Google (geo-blocked regions get 400 "User location is not supported").
+    from providers.gemini import GeminiProvider, _API_ROOT
+
+    gemini = GeminiProvider()
+    gcfg = ProviderConfig(
+        api_key="test-key",
+        base_url="https://example-proxy.hf.space/v1",
+    )
+    proxy_root = "https://example-proxy.hf.space/v1/v1beta/models"
+    mock_g = MagicMock()
+    mock_g.status_code = 200
+    mock_g.json.return_value = {
+        "models": [
+            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+        ]
+    }
+    with patch("httpx.get", return_value=mock_g) as mock_get:
+        models_g = gemini.list_models(gcfg)
+        assert models_g == ["gemini-2.5-flash"], models_g
+        assert mock_get.call_count == 1
+        assert mock_get.call_args[0][0] == proxy_root
+        for url in [c[0][0] for c in mock_get.call_args_list]:
+            assert not url.startswith(_API_ROOT), f"direct Google leaked: {url}"
+
+    # /models endpoint: active_model must reuse the fetched list (one HTTP call).
+    with patch.object(gemini, "list_models", return_value=["gemini-2.5-flash"]) as mock_list:
+        assert gemini.active_model(gcfg, models=["gemini-2.5-flash"]) == "gemini-2.5-flash"
+        mock_list.assert_not_called()
+
 
 def check_scheduler() -> None:
     """The parallel translation scheduler (scheduler.py): correctness under the
