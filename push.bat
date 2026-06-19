@@ -46,9 +46,9 @@ echo.
 
 git status --porcelain > "%TEMP%\gst.tmp" 2>&1
 for %%A in ("%TEMP%\gst.tmp") do if %%~zA==0 (
-    echo  Nothing to commit.
+    echo  No code changes.
     del "%TEMP%\gst.tmp" >nul 2>&1
-    pause & exit /b 0
+    goto :skip_commit
 )
 del "%TEMP%\gst.tmp" >nul 2>&1
 
@@ -58,10 +58,8 @@ if "!MSG!"=="" set "MSG=update"
 
 git add .
 git commit -m "!MSG!"
-if errorlevel 1 (
-    echo  Nothing new to commit.
-    pause & exit /b 0
-)
+
+:skip_commit
 
 for /f "tokens=*" %%B in ('git branch --show-current 2^>nul') do set "BRANCH=%%B"
 if "!BRANCH!"=="" set "BRANCH=main"
@@ -104,9 +102,10 @@ powershell -Command "(Get-Content 'package.json') -replace '\"version\":\s*\"!CU
 :: Update tauri.conf.json version
 powershell -Command "(Get-Content 'src-tauri\tauri.conf.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'src-tauri\tauri.conf.json' -NoNewline"
 
-:: Commit version bump
+:: Commit version bump and push
 git add package.json src-tauri/tauri.conf.json
 git commit -m "v!NEWVER!"
+git push origin "!BRANCH!"
 
 :: Tag and push
 git tag !NEWTAG!

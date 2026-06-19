@@ -1566,6 +1566,14 @@ class RenPyParser(BaseParser):
             fit_box_w = fit_box_h = 0
             fit_font_size = 32
             fit_src_lang = target_lang
+            # Menu-CHOICE one-line budget: a choice button with a fixed width and a
+            # fixed-height background Frame grows DOWNWARD when a long translation
+            # wraps to 2 lines (we set choice_button.ysize=None), so it spills below
+            # the UI frame (real Killer Chat bug). Fit the text to ONE LINE by
+            # shrinking the font to the button's inner width, so the button never
+            # grows. 0 = unknown -> don't touch (same contract as dialogue).
+            choice_box_w = 0
+            choice_font_size = 30
             try:
                 _gui_strs, _gui_ints = parse_gui_rpy(root)
                 _w = _gui_ints.get("dialogue_width")
@@ -1573,8 +1581,20 @@ class RenPyParser(BaseParser):
                 if isinstance(_w, int) and isinstance(_h, int) and _w > 0 and _h > 0:
                     fit_box_w, fit_box_h = _w, _h
                     fit_font_size = _gui_ints.get("text_size") or 32
+                # Choice button width: gui.choice_button_width, else the explicit
+                # `style choice_button: xsize N` baked into a custom UI (Killer Chat).
+                _cw = _gui_ints.get("choice_button_width")
+                if not (isinstance(_cw, int) and _cw > 0):
+                    _cw = self._style_box_width(root, "choice_button")
+                if isinstance(_cw, int) and _cw > 0:
+                    choice_box_w = _cw
+                    choice_font_size = (
+                        _gui_ints.get("choice_button_text_size")
+                        or self._parse_style_text_sizes(self._iter_sources(root)).get("choice_button")
+                        or _gui_ints.get("text_size") or 30
+                    )
             except Exception as e_fit:
-                logger.warning("dialogue auto-fit budget unavailable: %s", e_fit)
+                logger.warning("auto-fit budgets unavailable: %s", e_fit)
             # Every font FILE the game references by name (e.g. font "TinyUnicode.ttf",
             # gui.bsod_text_font = "AnalogueOS-Regular.ttf"). The engine resolves ANY
             # font name through config.font_name_map.get(name, name) (renpy/text/text.py),
@@ -1701,8 +1721,18 @@ class RenPyParser(BaseParser):
                         if old_decoded in seen_strings:
                             continue
                         seen_strings.add(old_decoded)
+                        # Menu choices: shrink the font so the FULL text fits ONE
+                        # line of the fixed-width button — stops the button growing
+                        # to 2 lines and spilling below the UI frame. No-op when the
+                        # button width is unknown or the text already fits.
+                        entry_tr = tr
+                        if kind == "menu_choice":
+                            entry_tr = self._fit_one_line(
+                                tr, choice_box_w, choice_font_size, target_lang,
+                                font_style,
+                            )
                         string_entries.setdefault(tl_rel, []).append(
-                            (f"{file_rel}:{rec['src_line']}", old_decoded, tr))
+                            (f"{file_rel}:{rec['src_line']}", old_decoded, entry_tr))
 
                     if detected_font is None:
                         detected_font = self._detect_font(tr_val, font_style)
@@ -1740,6 +1770,57 @@ class RenPyParser(BaseParser):
         if scale >= 0.999:
             return tr
         return "{size=*%s}%s{/size}" % (scale, tr)
+
+    @staticmethod
+    def _fit_one_line(tr: str, box_w: int, font_size: int,
+                      target_lang: str, font_style: str) -> str:
+        """Shrink a menu-choice caption with {size=*scale} so the FULL text fits a
+        SINGLE line of a fixed-width button (box_w px inner width). This keeps the
+        button one line tall, so it can't grow and spill below the UI frame. Returns
+        `tr` unchanged when the width is unknown (0), it already fits, or it carries
+        a leading {size=...}. Never cuts the text; floor is _FIT_FONT_FLOOR."""
+        if box_w <= 0:
+            return tr
+        if tr.lstrip().startswith("{size="):
+            return tr
+        scale = fit_scale_one_line(tr, target_lang, font_size, box_w, font_style)
+        if scale >= 0.999:
+            return tr
+        return "{size=*%s}%s{/size}" % (scale, tr)
+
+    @staticmethod
+    def _style_box_width(root: str, style_name: str) -> int:
+        """Largest literal `xsize N` declared in `style <style_name>:` blocks across
+        the game's sources (loose + archived). 0 if none — custom UIs (Killer Chat)
+        bake `style choice_button: xsize 940` instead of a gui.* constant."""
+        import re as _re
+        head = _re.compile(r'^([ \t]*)style\s+' + _re.escape(style_name) + r'\b.*:\s*(?:#.*)?$')
+        xsize = _re.compile(r'^\s*(?:xsize|xmaximum)\s+(\d+)\b')
+        best = 0
+        try:
+            from .renpy import RenPyParser as _RP  # self, but keep static
+        except Exception:
+            pass
+        parser = RenPyParser()
+        for _file_rel, text in parser._iter_sources(root):
+            lines = text.split("\n")
+            i = 0
+            while i < len(lines):
+                m = head.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                indent = len(m.group(1))
+                i += 1
+                while i < len(lines):
+                    l = lines[i]
+                    if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                        break
+                    xm = xsize.match(l)
+                    if xm:
+                        best = max(best, int(xm.group(1)))
+                    i += 1
+        return best
 
     def finalize_backups(self, root: str) -> None:
         """Delete files marked as ``type=created`` in backup metadata, except
@@ -1971,6 +2052,32 @@ class RenPyParser(BaseParser):
             f'            pass\n'
             f'    renpy.notify("Interprex: шрифт переведённого текста подставлен автоматически")\n'
             f"\n"
+            f"    # Set Python locale so strftime(\"%B\") returns translated month names,\n"
+            f"    # not English. Every game that formats dates via strftime benefits.\n"
+            f"    import locale as _ix_locale\n"
+            f"    _ix_locale_map = {{\n"
+            f'        "russian": "ru_RU.UTF-8", "spanish": "es_ES.UTF-8",\n'
+            f'        "french": "fr_FR.UTF-8", "german": "de_DE.UTF-8",\n'
+            f'        "italian": "it_IT.UTF-8", "portuguese": "pt_BR.UTF-8",\n'
+            f'        "chinese": "zh_CN.UTF-8", "japanese": "ja_JP.UTF-8",\n'
+            f'        "korean": "ko_KR.UTF-8", "polish": "pl_PL.UTF-8",\n'
+            f'        "turkish": "tr_TR.UTF-8", "arabic": "ar_SA.UTF-8",\n'
+            f'        "dutch": "nl_NL.UTF-8", "swedish": "sv_SE.UTF-8",\n'
+            f'        "czech": "cs_CZ.UTF-8", "hungarian": "hu_HU.UTF-8",\n'
+            f'        "romanian": "ro_RO.UTF-8", "ukrainian": "uk_UA.UTF-8",\n'
+            f'        "vietnamese": "vi_VN.UTF-8", "thai": "th_TH.UTF-8",\n'
+            f'        "hindi": "hi_IN.UTF-8", "indonesian": "id_ID.UTF-8",\n'
+            f'        "portuguese (brazil)": "pt_BR.UTF-8",\n'
+            f'        "chinese (simplified)": "zh_CN.UTF-8",\n'
+            f'        "chinese (traditional)": "zh_TW.UTF-8",\n'
+            f"    }}\n"
+            f"    _ix_loc = _ix_locale_map.get(\"{lang}\")\n"
+            f"    if _ix_loc:\n"
+            f"        try:\n"
+            f"            _ix_locale.setlocale(_ix_locale.LC_TIME, _ix_loc)\n"
+            f"        except _ix_locale.Error:\n"
+            f"            pass\n"
+            f"\n"
             f"    # Style overrides for choice buttons (auto height and subtitle layout fallback)\n"
             f"    style.choice_button.ysize = None\n"
             f"    style.choice_button_text.layout = 'subtitle'\n"
@@ -1986,9 +2093,15 @@ class RenPyParser(BaseParser):
             f"    # default arg so the swapped code needs no globals. Defensive: if the\n"
             f"    # function carries free variables the __code__ swap is impossible, so\n"
             f"    # we skip it (ping-translation off) rather than ever crash.\n"
-            f"    if 'add_ping_hyperlinks' in globals():\n"
-            f"        import types as _ix_types\n"
+            f"    # Resolve the function: prefer store.add_ping_hyperlinks (Ren'Py's\n"
+            f"    # canonical namespace) over globals() (which may be a copy in\n"
+            f"    # translate blocks). Pickling verifies against store.* identity.\n"
+            f"    _ix_store = globals().get('store', None)\n"
+            f"    _ix_aph = getattr(_ix_store, 'add_ping_hyperlinks', None) if _ix_store else None\n"
+            f"    if _ix_aph is None and 'add_ping_hyperlinks' in globals():\n"
             f"        _ix_aph = globals()['add_ping_hyperlinks']\n"
+            f"    if _ix_aph is not None and callable(_ix_aph):\n"
+            f"        import types as _ix_types\n"
             f"        if not getattr(_ix_aph, '_patched_by_interprex', False):\n"
             f"            try:\n"
             f"                _ix_old_aph = _ix_types.FunctionType(\n"
@@ -2153,6 +2266,9 @@ class RenPyParser(BaseParser):
             r'^([ \t]*)style\s+(\w[\w.]*)_text\b(?:\s+is\s+(\w[\w.]*?)(?:_text)?\b)?.*:\s*(?:#.*)?$'
         )
         _SIZE_RE = re.compile(r'^\s*size\s+(\d+)\b')
+        _SIZE_EXPR_RE = re.compile(r'^\s*size\s+\(')
+        _LAST_INT_RE = re.compile(r'(\d+)\s*\)*\s*$')
+        _IS_RE = re.compile(r'^\s+is\s+(\w[\w.]*)\b')
         sizes: dict[str, int] = {}
         parents: dict[str, str] = {}  # prefix -> parent prefix (from `is`)
         for _file_rel, text in sources:
@@ -2177,6 +2293,25 @@ class RenPyParser(BaseParser):
                         # First explicit size wins; keep the largest if a prefix's
                         # _text style appears more than once (be conservative).
                         sizes[prefix] = max(sizes.get(prefix, 0), int(zm.group(1)))
+                    elif _SIZE_EXPR_RE.match(l):
+                        # Ternary like `size (55 if ... else 29)` — take the last
+                        # integer before the closing paren, which is the default
+                        # (else) branch value.
+                        em = _LAST_INT_RE.search(l)
+                        if em:
+                            sizes[prefix] = max(sizes.get(prefix, 0), int(em.group(1)))
+                    elif not parents.get(prefix):
+                        # `is Parent` on a separate line inside the block (common
+                        # in Killer Chat: `style X:\n    is Y`). Capture it so the
+                        # one-level inheritance below can resolve the size.
+                        im = _IS_RE.match(l)
+                        if im:
+                            # Strip trailing `_text` to match the prefix namespace
+                            # used by _STYLE_DEF_RE (startup_text -> startup).
+                            pname = im.group(1)
+                            if pname.endswith('_text'):
+                                pname = pname[:-5]
+                            parents.setdefault(prefix, pname)
                     i += 1
 
         # Resolve one level of `is` inheritance for styles without their own size.
@@ -2216,6 +2351,11 @@ class RenPyParser(BaseParser):
         _BOX_AXIS_RE = re.compile(
             r'^\s*(?:ysize|ymaximum|xsize|xmaximum)\s+(\d+)\b'
         )
+        # Height-only: for frame_heights we must NOT count xsize/xmaximum as
+        # container height (a narrow width ≠ a short frame).
+        _BOX_HEIGHT_RE = re.compile(
+            r'^\s*(?:ysize|ymaximum)\s+(\d+)\b'
+        )
         _SCREEN_DEF_RE = re.compile(
             r'^(\s*)screen\s+(\w[\w.]*)\s*(?:\(([^)]*)\))?\s*:'
         )
@@ -2252,6 +2392,19 @@ class RenPyParser(BaseParser):
             body_size = 22
 
         style_overrides: dict[str, set[str]] = {}
+        # Per-prefix frame geometry — drives the tight-frame shrink below
+        # body_size when a fixed-height container is too small for translated text.
+        # frame_heights: max frame height per prefix (for backwards compat).
+        # frame_dims: (frame_w, frame_h, pad_x, pad_y) from the OUTERMOST
+        # xysize(W,H) + padding(N,M) in the screen — drives PIL-based measurement.
+        frame_heights: dict[str, int] = {}
+        frame_dims: dict[str, tuple[int, int, int, int]] = {}
+        _BOX_TUPLE_SCAN = re.compile(
+            r'^\s*(?:xysize|maximum)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)'
+        )
+        _PADDING_RE = re.compile(
+            r'padding\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)'
+        )
 
         for file_rel, text in all_sources:
             lines = text.split("\n")
@@ -2272,16 +2425,36 @@ class RenPyParser(BaseParser):
                     screen_body = lines[screen_start:i]
                     has_fixed_height = False
                     prefixes: set[str] = set()
+                    max_frame_h = 0
+                    first_frame_w = 0
+                    frame_pad_x = 0
+                    frame_pad_y = 0
                     for sl in screen_body:
                         mt = _BOX_TUPLE_RE.match(sl)
                         if mt and int(mt.group(1)) > 0:
                             has_fixed_height = True
+                            h = int(mt.group(1))
+                            if h > max_frame_h:
+                                max_frame_h = h
+                            if first_frame_w == 0:
+                                ms = _BOX_TUPLE_SCAN.match(sl)
+                                if ms:
+                                    first_frame_w = int(ms.group(1))
                         ma = _BOX_AXIS_RE.match(sl)
                         if ma and int(ma.group(1)) > 0:
                             has_fixed_height = True
-                        pm = _STYLE_PREFIX_RE.match(sl)
-                        if pm:
-                            prefixes.add(pm.group(1))
+                        mh = _BOX_HEIGHT_RE.match(sl)
+                        if mh and int(mh.group(1)) > 0:
+                            h = int(mh.group(1))
+                            if h > max_frame_h:
+                                max_frame_h = h
+                        pm = _PADDING_RE.search(sl)
+                        if pm and frame_pad_x == 0:
+                            frame_pad_x = int(pm.group(1))
+                            frame_pad_y = int(pm.group(2))
+                        sp = _STYLE_PREFIX_RE.match(sl)
+                        if sp:
+                            prefixes.add(sp.group(1))
                         # A widget naming its own style covers screens with no
                         # style_prefix at all (3b).
                         wm = _WIDGET_STYLE_RE.match(sl)
@@ -2290,6 +2463,14 @@ class RenPyParser(BaseParser):
                     if has_fixed_height and prefixes:
                         for p in prefixes:
                             style_overrides.setdefault(p, set()).add(f"style {p}_text:")
+                            if max_frame_h > 0:
+                                cur = frame_heights.get(p)
+                                if cur is None or max_frame_h > cur:
+                                    frame_heights[p] = max_frame_h
+                            if first_frame_w > 0 and max_frame_h > 0:
+                                existing = frame_dims.get(p)
+                                if existing is None or max_frame_h > existing[1]:
+                                    frame_dims[p] = (first_frame_w, max_frame_h, frame_pad_x, frame_pad_y)
                 else:
                     i += 1
 
@@ -2324,6 +2505,41 @@ class RenPyParser(BaseParser):
             )
             # Static path: shrink to the game's body size (never enlarge).
             reduced = min(orig, body_size)
+            # Tight-frame path: when the style lives inside a small fixed-height
+            # frame, shrink BELOW body_size by measuring how many lines of
+            # representative Russian text fit in the frame at body_size via PIL,
+            # then computing the exact shrink to fit. Falls back to heuristic if
+            # PIL is unavailable. Only frames >= 400 px — smaller values are UI chrome.
+            fd = frame_dims.get(prefix)
+            if fd and 400 <= fd[1] < 600:
+                fw, fh, px, py = fd
+                inner_w = max(1, fw - 2 * px)
+                # Non-text area: padding + buttons/nulls ≈ 35% of frame height
+                # (empirical: screens typically dedicate ~65% to text content)
+                text_budget_h = max(1, int((fh - 2 * py) * 0.65))
+                tight_size = body_size
+                try:
+                    font = _target_font("russian", body_size)
+                    # Representative Russian screen text: 3 paragraphs of typical
+                    # dialog-screen length (~50 words each). Must match the
+                    # density of real translated screens to produce accurate shrink.
+                    sample = (
+                        "Благодарим за терпение.\n\n"
+                        "Для обеспечения безопасности вашего аккаунта требуется "
+                        "дополнительное подтверждение личности через нашу новую "
+                        "систему косметической перекрестной проверки.\n\n"
+                        "Чтобы подтвердить, что вы не робот, и перейти к "
+                        "следующему этапу, пожалуйста, нажмите правую кнопку."
+                    )
+                    lines = _wrapped_line_count(sample, font, inner_w)
+                    needed_h = lines * body_size * _LINE_HEIGHT_MULT
+                    if needed_h > text_budget_h:
+                        factor = text_budget_h / needed_h
+                        tight_size = max(12, int(body_size * factor))
+                except Exception:
+                    # PIL unavailable: fallback to heuristic
+                    tight_size = max(12, int(body_size * (fh / 550)))
+                reduced = min(reduced, tight_size)
             # Measured path: if the scheduler saw this style's text actually
             # overflow, shrink by the exact measured factor too. Floor at 12px so
             # text stays legible; take whichever path yields the smaller size.
@@ -2729,15 +2945,47 @@ def fit_scale_for_box(translation: str, target_lang: str, font_size: int,
     plain = _strip_tags(translation)
     if not plain.strip():
         return 1.0
-    s = 1.0
-    while s >= _FIT_FONT_FLOOR - 1e-9:
-        fs = max(1, int(round(font_size * s)))
-        font = _target_font(target_lang, fs, font_style)
-        lines = _wrapped_line_count(plain, font, box_width)
-        if lines * fs * _LINE_HEIGHT_MULT <= box_height:
-            return round(s, 3)
-        s -= 0.05
-    return round(_FIT_FONT_FLOOR, 3)
+    # Measurement needs PIL (Pillow). If it's unavailable (or any measurement
+    # error), DEGRADE GRACEFULLY to no-shrink — auto-fit is a nicety; it must
+    # NEVER make inject fail. (Project rule: degrade, never raise.)
+    try:
+        s = 1.0
+        while s >= _FIT_FONT_FLOOR - 1e-9:
+            fs = max(1, int(round(font_size * s)))
+            font = _target_font(target_lang, fs, font_style)
+            lines = _wrapped_line_count(plain, font, box_width)
+            if lines * fs * _LINE_HEIGHT_MULT <= box_height:
+                return round(s, 3)
+            s -= 0.05
+        return round(_FIT_FONT_FLOOR, 3)
+    except Exception:
+        return 1.0
+
+
+def fit_scale_one_line(translation: str, target_lang: str, font_size: int,
+                       box_width: float, font_style: str = "smooth") -> float:
+    """Largest font-scale in [_FIT_FONT_FLOOR, 1.0] at which the WIDEST line of
+    `translation` fits `box_width` on a SINGLE line (no wrap). Used to keep a
+    fixed-width menu button one line tall so it can't grow and spill past the UI
+    frame. Returns 1.0 if it already fits or box_width is unknown/<=0."""
+    if box_width <= 0:
+        return 1.0
+    plain = _strip_tags(translation)
+    if not plain.strip():
+        return 1.0
+    # Degrade to no-shrink if PIL/measurement is unavailable (see fit_scale_for_box).
+    try:
+        s = 1.0
+        while s >= _FIT_FONT_FLOOR - 1e-9:
+            fs = max(1, int(round(font_size * s)))
+            font = _target_font(target_lang, fs, font_style)
+            # Widest existing line (honor explicit \n) must fit on one line.
+            if _max_line_px(plain, font, fs) <= box_width:
+                return round(s, 3)
+            s -= 0.05
+        return round(_FIT_FONT_FLOOR, 3)
+    except Exception:
+        return 1.0
 
 
 def _avg_char_width(target_lang: str, font_size: int, font_style: str = "smooth") -> float:

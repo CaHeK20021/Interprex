@@ -952,6 +952,25 @@ def check_renpy_risk() -> None:
     print("OK — renpy dialogue auto-fit: fits=untouched, overflow={size=*} full text, "
           "unknown box untouched, no double-wrap")
 
+    # --- menu-choice one-line fit (stops button growing past the UI frame) ---
+    from parsers.renpy import fit_scale_one_line, RenPyParser as _RP2
+    CB_W, CB_FS = 920, 30  # Killer Chat choice_button inner width / font
+    short_c = "Да, конечно!"
+    long_c = ("Я не уверен что это очень хорошая идея, давай обсудим это чуть "
+              "попозже, когда будет время " * 2)
+    # Short choice fits one line -> untouched.
+    assert fit_scale_one_line(short_c, "Russian", CB_FS, CB_W) == 1.0
+    assert _RP2._fit_one_line(short_c, CB_W, CB_FS, "Russian", "smooth") == short_c
+    # Long choice would wrap -> shrunk so it fits one line (scale < 1, >= floor).
+    s_long = fit_scale_one_line(long_c, "Russian", CB_FS, CB_W)
+    assert 0.6 <= s_long < 1.0, s_long
+    wrapped_c = _RP2._fit_one_line(long_c, CB_W, CB_FS, "Russian", "smooth")
+    assert wrapped_c.startswith("{size=*") and long_c in wrapped_c, wrapped_c
+    # Unknown button width -> never touch (contract).
+    assert _RP2._fit_one_line(long_c, 0, CB_FS, "Russian", "smooth") == long_c
+    print("OK — renpy menu-choice one-line fit: short untouched, long shrunk to one "
+          "line, unknown width untouched")
+
 
 def check_renpy_identifier_parity() -> None:
     """Anchor our engine-identifier algorithm to values verified against an

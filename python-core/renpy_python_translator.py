@@ -1499,6 +1499,24 @@ def _write_inline_strings_file(game_path: Path, lang: str,
     if written == 0:
         return 0
 
+    # Auto-detect format patterns like "MONTH {}" in game source and generate
+    # translated variants (e.g. "MONTH 1" → "МЕСЯЦ 1"). These are dynamic
+    # strings our LLM pipeline never sees (no _() call), but the engine's
+    # translate_string() can match them at runtime.
+    try:
+        from parsers.renpy import RenPyParser
+        _fmt_pairs = _detect_format_patterns(game_path, lang)
+        for orig, trans in _fmt_pairs:
+            if orig not in seen:
+                seen.add(orig)
+                new_val = _escape_bad_percent(trans)
+                lines.append("")
+                lines.append(f"    old {_string_quote(orig)}")
+                lines.append(f"    new {_string_quote(new_val)}")
+                written += 1
+    except Exception:
+        pass
+
     rel = _INLINE_STRINGS_REL.format(lang=lang)
     abs_path = game_path / rel.replace("/", os.sep)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1512,6 +1530,50 @@ def _write_inline_strings_file(game_path: Path, lang: str,
     logger.info("Wrote inline strings file: %s (%d entries, %d skipped as already in tl/)",
                 rel, written, skipped_dupe)
     return written
+
+
+# Common format patterns across games: "MONTH {}" → "МЕСЯЦ N", etc.
+# Maps English format prefix → list of (number, translated) pairs.
+_FORMAT_PATTERN_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "MONTH": {
+        "russian": {str(i): f"МЕСЯЦ {i}" for i in range(1, 13)},
+    },
+}
+
+
+def _detect_format_patterns(game_path: Path, lang: str) -> list[tuple[str, str]]:
+    """Scan game source for common format patterns (e.g. "MONTH {}") and
+    generate translate_string()-ready old/new pairs. Returns pairs that
+    should be added to the inline strings dict."""
+    pairs: list[tuple[str, str]] = []
+    lang_lower = lang.lower()
+
+    # Find all format patterns in source: "PREFIX {}".format(...) or f"PREFIX {var}"
+    import re
+    _FMT_RE = re.compile(r'''(?:"|')([A-Z]{2,15})\s*\{\}(?:"|')''')
+
+    try:
+        from parsers.renpy import RenPyParser
+        p = RenPyParser()
+        for _fp, text in p._iter_sources(str(game_path)):
+            for m in _FMT_RE.finditer(text):
+                prefix = m.group(1)
+                translations = _FORMAT_PATTERN_TRANSLATIONS.get(prefix, {})
+                # Try exact lang match, then script name (e.g. "russian" from "Russian")
+                trans_map = translations.get(lang_lower)
+                if not trans_map:
+                    for key, val in translations.items():
+                        if key in lang_lower or lang_lower in key:
+                            trans_map = val
+                            break
+                if not trans_map:
+                    continue
+                for num, translated in trans_map.items():
+                    orig = f"{prefix} {num}"
+                    pairs.append((orig, translated))
+    except Exception:
+        pass
+    return pairs
 
 
 # ---------------------------------------------------------------------------
