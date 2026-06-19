@@ -50,8 +50,8 @@ class GeminiProvider(BaseProvider):
             resp = httpx.get(
                 url,
                 params={"pageSize": 1000},
-                headers={"x-goog-api-key": api_key},
-                timeout=15,
+                headers={"x-goog-api-key": api_key, "x-provider": "gemini"},
+                timeout=60,
             )
             resp.raise_for_status()
         except Exception as e:
@@ -62,8 +62,8 @@ class GeminiProvider(BaseProvider):
                     resp = httpx.get(
                         proxy_url,
                         params={"pageSize": 1000},
-                        headers={"x-goog-api-key": api_key},
-                        timeout=15,
+                        headers={"x-goog-api-key": api_key, "x-provider": "gemini"},
+                        timeout=60,
                     )
                     resp.raise_for_status()
                     self._use_proxy_fallback = True
