@@ -96,14 +96,8 @@ set "NEWTAG=v!NEWVER!"
 
 echo  !CURVER! --^> !NEWVER!
 
-:: Update package.json version (first occurrence)
-powershell -Command "(Get-Content 'package.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'package.json' -NoNewline"
-
-:: Update tauri.conf.json version
-powershell -Command "(Get-Content 'src-tauri\tauri.conf.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'src-tauri\tauri.conf.json' -NoNewline"
-
-:: Update Cargo.toml version
-powershell -Command "(Get-Content 'src-tauri\Cargo.toml') -replace '^version = \"!CURVER!\"', 'version = \"!NEWVER!\"' | Set-Content 'src-tauri\Cargo.toml' -NoNewline"
+:: Update all versions (Python preserves Cargo.toml formatting)
+python set_version000.py set !NEWVER!
 
 :: Commit version bump and push
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
