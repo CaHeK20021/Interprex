@@ -721,6 +721,43 @@ def detect(req: DetectReq) -> dict:
     return {"engine": detect_engine(req.root)}
 
 
+class RenpyRiskReq(BaseModel):
+    root: str
+
+
+@app.post("/renpy/risk")
+def renpy_risk(req: RenpyRiskReq) -> dict:
+    """Static text-overflow risk report for a Ren'Py game (READ-ONLY, no engine
+    run). Degrades to an 'unknown' verdict rather than raising."""
+    try:
+        from parsers.renpy_risk import analyze
+        return analyze(req.root)
+    except Exception as e:  # never 500 a diagnostic
+        return {"dialogue_overflow_risk": "unknown",
+                "dialogue_reason": f"risk analysis failed: {e}"}
+
+
+class RenpyLintReq(BaseModel):
+    root: str
+    lang: str | None = None
+    timeout: int = 240
+
+
+@app.post("/renpy/lint")
+def renpy_lint(req: RenpyLintReq) -> dict:
+    """Run the game's OWN Ren'Py engine `lint` over the project (including our
+    injected tl/<lang>/ files) and report findings split into ours/actionable vs
+    pre-existing. Degrades gracefully (available=False) if the engine exe isn't
+    present on the machine."""
+    try:
+        from parsers.renpy import lint_with_engine
+        return lint_with_engine(req.root, req.lang, timeout=req.timeout)
+    except Exception as e:  # never 500
+        return {"available": False, "ours": [], "ours_count": 0,
+                "actionable_count": 0, "other_count": 0,
+                "reason": f"lint failed: {e}"}
+
+
 @app.post("/detect_mods")
 def detect_mods(req: DetectModsReq) -> dict:
     import os

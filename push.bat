@@ -71,7 +71,49 @@ echo  Pushing to origin/!BRANCH!...
 git push -u origin "!BRANCH!"
 
 echo.
-echo  Done!
+echo  Bumping version and tagging...
+
+:: Read current version from package.json
+for /f tokens^=2^ delims^=^" %%V in ('findstr /r "\"version\":.*\"[0-9]" package.json') do set "CURVER=%%V"
+if "!CURVER!"=="" (
+    echo  [WARN] Could not read version from package.json, skipping tag.
+    echo.
+    echo  Done!
+    echo.
+    pause
+    endlocal
+    exit /b 0
+)
+
+:: Parse MAJOR.MINOR.PATCH
+for /f "tokens=1-3 delims=." %%A in ("!CURVER!") do (
+    set "MAJ=%%A"
+    set "MIN=%%B"
+    set "PAT=%%C"
+)
+if "!PAT!"=="" set "PAT=0"
+set /a "NEWPAT=!PAT!+1"
+set "NEWVER=!MAJ!.!MIN!.!NEWPAT!"
+set "NEWTAG=v!NEWVER!"
+
+echo  !CURVER! --^> !NEWVER!
+
+:: Update package.json version (first occurrence)
+powershell -Command "(Get-Content 'package.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'package.json' -NoNewline"
+
+:: Update tauri.conf.json version
+powershell -Command "(Get-Content 'src-tauri\tauri.conf.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'src-tauri\tauri.conf.json' -NoNewline"
+
+:: Commit version bump
+git add package.json src-tauri/tauri.conf.json
+git commit -m "v!NEWVER!"
+
+:: Tag and push
+git tag !NEWTAG!
+git push origin !NEWTAG!
+
+echo.
+echo  Done! Tagged !NEWTAG!
 echo.
 pause
 endlocal

@@ -431,3 +431,42 @@ export async function autofixTranslation(
   const res = await callPython("autofix", { engine, root, api_key: apiKey, model, base_url: baseUrl, target_lang: targetLang ?? "" });
   return res as any;
 }
+
+// --- Ren'Py text-overflow risk + engine-lint (measure, don't guess) ----------
+
+export interface RenpyRiskReport {
+  dialogue_overflow_risk: "none" | "low" | "high" | "unknown";
+  dialogue_reason: string;
+  say_lines: number;
+  long_say_lines: number;
+  longest_say_chars: number;
+  textbox_height: string;
+  textbox_height_fixed: boolean;
+  auto_height_dialogue: boolean;
+  has_dialogue_scroll: boolean;
+}
+
+/** Static (no engine run) overflow-risk report for a Ren'Py game. */
+export function renpyRisk(root: string): Promise<RenpyRiskReport> {
+  return callPython("renpy/risk", { root }) as Promise<RenpyRiskReport>;
+}
+
+export interface RenpyLintFinding {
+  file: string;
+  line: number;
+  message: string;
+  actionable: boolean;
+}
+export interface RenpyLintResult {
+  available: boolean;
+  ours: RenpyLintFinding[];
+  ours_count: number;
+  actionable_count: number;
+  other_count: number;
+  reason: string;
+}
+
+/** Run the game's own Ren'Py engine `lint` over our injected tl/ files. */
+export function renpyLint(root: string, lang?: string): Promise<RenpyLintResult> {
+  return callPython("renpy/lint", { root, lang: lang ?? null }) as Promise<RenpyLintResult>;
+}

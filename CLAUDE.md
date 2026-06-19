@@ -118,6 +118,80 @@ are only a hint we hand the model.
   font loaded), pixel ground-truth (wide translation measures wider, short fits),
   tags excluded from both measure sides, empty/unknown inputs degrade.
 
+## Text fitting: shrink the FONT, NEVER abbreviate a word (Ren'Py)
+
+**Load-bearing user rule:** a translated word must never be butchered to fit a box —
+"Сохранение" must stay "Сохранение", not become "Сох". We fit by shrinking the
+FONT and keeping the word whole. Two mechanisms, both preserve the full text:
+
+1. **Buttons / menu captions** (`scheduler.py::_enforce_char_limits`): a word-count
+   gate `_MAX_WORDS_FONT_FIT = 2`. A translation of **≤2 words is NEVER re-asked
+   "shorter"** (re-asking only yields "Сох") — instead `_record_font_shrink` records
+   a shrink factor into `size_overrides` (floor `_FONT_SHRINK_FLOOR = 0.6`), consumed
+   by inject as a `choice_button` style shrink. Only **3+ word** captions may be
+   re-asked (a synonym can shorten honestly). The prompt (`providers/base.py`) also
+   forbids abbreviating a single word and permits rephrasing only for 3+ words.
+   The earlier blanket "REPHRASE shorter / abbreviate" prompt was the "Сох" cause.
+
+2. **Dialogue (say lines)** (`parsers/renpy.py::_fit_dialogue` + `fit_scale_for_box`):
+   if `gui.rpy` declares a **FIXED** box (`dialogue_width` AND `textbox_height` both
+   present as numbers — read via `parse_gui_rpy`, **last-wins** like the engine: Watch
+   the Road redefines `textbox_height` 278→360, both we and the engine take 360) and
+   the full translation would overflow it (greedy word-wrap height measure,
+   `_wrapped_line_count`, line-height `_LINE_HEIGHT_MULT`), wrap the text in the
+   engine-native `{size=*scale}…{/size}` so Ren'Py renders the WHOLE text smaller.
+   Floor `_FIT_FONT_FLOOR = 0.6`. **CONTRACT: where the box is UNKNOWN (no gui
+   numbers — chat/scroll/auto-grow windows like Killer Chat), DON'T TOUCH the text** —
+   long messages there are normal. The `{size=*}` tag goes only in displayed text
+   (`new`/say body), never in `old`/identifier, so it can't affect hashes or
+   code comparisons.
+
+Most dialogue boxes auto-grow or scroll, so a true fixed-box overflow is rare — a
+runtime per-frame auto-fit was considered and **rejected** as too risky for too
+little gain; the offline `{size=*}` approach covers the real cases with zero
+runtime cost. Verified end-to-end: real inject on Watch the Road (box 1650×360) wraps
+a 750-char RU line in `{size=*0.65}` (full text intact), leaves a 292-char line
+untouched; Killer Chat (no gui box) → fit OFF. Offline guards: `check_renpy`
+dialogue-auto-fit case + scheduler 1-word-no-reask case in `selftest.py`.
+
+## Engine-oracle lint — validate our `tl/` with the game's OWN Ren'Py
+
+Every shipped Ren'Py game bundles its engine + a launcher exe. `<Game>.exe <basedir>
+lint` makes the ENGINE validate the WHOLE project INCLUDING our injected
+`tl/<lang>/` — same "engine oracle" stance as translate-id verification. Turns "will
+our injection break the game?" into a measured fact, catching defects static
+validators miss. `parsers/renpy.py::lint_with_engine` (endpoint `/renpy/lint`, step 5
+of `handleTranslate`, renpy non-mods; surfaced in the UI when `actionable_count > 0`):
+
+- `_find_engine_exe`: the `<Name>.exe` with a paired `<Name>.py` bootstrap.
+- lint **exits 0 even with findings** → parse stdout/`lint.txt`, never the exit code.
+- Splits OURS (`tl/<lang>/`, normalized via `_lang_dir`) from pre-existing game
+  findings; `_lint_is_actionable` filters benign tl/-lint noise ("Could not evaluate
+  X in the who part" = runtime var) from REAL hazards (text-tag mismatch, %-format
+  error, dup key). On Killer Chat: 81 ours → only 3 actionable.
+- Degrades gracefully (`available=False`) without the bundled SDK.
+
+This is how we found the **%-format bug**: Ren'Py runs displayed text through
+`%`-substitution (`config.old_substitutions`, default ON), so `%s`/`%(name)s` are
+format specs and a literal `%` must be `%%`. The LLM drops the escaping
+(`100%% ASSIGNMENT` → `НА 100%`) → "Unterminated string format code", a crash-class
+error. Fixed deterministically (no API) by `_escape_bad_percent` (mirrors the engine's
+`lint.py` state machine: escapes only a `%` beginning an invalid/unterminated spec,
+leaves valid specs and `%%` byte-verbatim, idempotent), applied at inject to `tr` AND
+to inline-Python `new` strings (never `old`). Verified: engine lint 3→0 actionable on
+Killer Chat; `check_renpy` %-format case in `selftest.py`.
+
+## Overflow risk analyzer (`parsers/renpy_risk.py`, endpoint `/renpy/risk`)
+
+Data-driven verdict (READ-ONLY, no engine run) on whether a game can overflow:
+reads say-line lengths + `{p}/{w}/{nw}`, custom-vs-stock say screen, fixed vs
+None/expr `textbox_height`, `calculate_dialogue_height`-style auto-height, and
+viewport/vpgrid **scoped to the say-screen body** (a viewport in another screen ≠
+dialogue scroll). Verdict `dialogue_overflow_risk: none|low|high`. Surfaced in the
+UI (banner) only for high/low (silent on none). Key finding: overflow is mostly a
+non-problem — Killer Chat → none (auto-grows), Watch the Road → high (fixed 278/360 +
+97 long lines). Verified `check_renpy_risk` in `selftest.py` + both real games.
+
 ## Parallel translation scheduler (`python-core/scheduler.py`)
 
 `TranslationScheduler` is the worker pool behind one `/translate` run (the old
@@ -679,6 +753,23 @@ To prevent crashes, infinite recursion, or issues in game/test environments:
   ```
 - **Closure Default Argument Binding**: Capture the original function as a default parameter in the wrapper signature (e.g., `def _patched_fn(text, _orig=_orig_fn):`). This stores the reference at definition time, preventing infinite recursion or `NameError`/`RecursionError` when the code is executed multiple times or inside Python `exec()` blocks.
 - **Skip during Lint/Prediction**: Check `not (renpy.game.lint or renpy.predicting())` inside wrappers to prevent unnecessary evaluation or potential crashes during game linting/saving/loading.
+- **NEVER REBIND a `store` function name — patch it IN PLACE (`__code__` swap).** Ren'Py pickles `store` functions BY REFERENCE on save and verifies identity (`store.<name>` must be the SAME object as the one captured in the save graph). If you do `globals()['fn'] = wrapper` (a NEW object), every save raises `PicklingError: Can't pickle <function fn>: it's not the same object as store.fn` and the player loses ALL progress — saving is impossible. This was a real shipped bug (Killer Chat 1.4.1, `add_ping_hyperlinks`). The fix: keep the SAME function object and swap its behaviour —
+  ```python
+  import types
+  fn = globals()['fn']
+  if not getattr(fn, '_patched_by_interprex', False):
+      try:
+          orig = types.FunctionType(fn.__code__, fn.__globals__, fn.__name__,
+                                    fn.__defaults__, fn.__closure__)  # clone original
+          def _wrap(arg, _orig=orig, _renpy=renpy):  # zero freevars (defaults only)
+              ...  # call _orig(arg)
+          fn.__code__ = _wrap.__code__            # SAME object, new behaviour
+          fn.__defaults__ = _wrap.__defaults__
+          fn._patched_by_interprex = True
+      except Exception:
+          pass   # function has free variables -> swap impossible -> skip, NEVER crash
+  ```
+  The wrapper must have NO closure free variables (capture everything via default args), or `__code__` assignment fails. Rebinding a `renpy.*` MODULE attribute (e.g. `renpy.translation.translate_string`) is fine — engine modules aren't pickled into saves; only the `store` namespace + log are. Verified by `check_renpy_font` (asserts the patched function `is` the original object).
 
 ### Testing Monkey-Patches
 All runtime code injected into `_interprex_font.rpy` must be verified via automated self-tests:

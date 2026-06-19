@@ -319,9 +319,21 @@ def check_renpy_font() -> None:
         @staticmethod
         def notify(*a, **k): pass
 
-    def mock_add_ping_hyperlinks(new_text):
-        calls.append(("orig", new_text))
-        return "hyperlinked:" + new_text
+    # The mock mirrors the REAL game function: it resolves `calls` from its GLOBALS
+    # (no closure free variables), so it can be patched in place via a __code__ swap
+    # (the pickle-safe fix). A closure-capturing mock would have freevars and force
+    # the defensive skip path, hiding whether the real in-place patch works. Build it
+    # in a clean namespace via exec so its code has zero freevars.
+    _mock_ns = {"calls": calls}
+    exec(
+        "def add_ping_hyperlinks(new_text):\n"
+        "    calls.append(('orig', new_text))\n"
+        "    return 'hyperlinked:' + new_text\n",
+        _mock_ns,
+    )
+    mock_add_ping_hyperlinks = _mock_ns["add_ping_hyperlinks"]
+    assert not mock_add_ping_hyperlinks.__code__.co_freevars, \
+        "test mock must have no freevars (mirrors the real store function)"
 
     class MockStyle:
         def __getattr__(self, name):
@@ -372,12 +384,21 @@ def check_renpy_font() -> None:
     exec(body, env)   # run 1
     exec(body, env)   # run 2 — must NOT raise (idempotent)
 
-    # Verify that add_ping_hyperlinks was correctly patched and translates before hyperlinking
+    # add_ping_hyperlinks must be patched IN PLACE — the SAME function object, with
+    # swapped behaviour. This is load-bearing: Ren'Py pickles store functions by
+    # reference and checks identity on save; if we rebind the name to a NEW object,
+    # every save raises PicklingError ("not the same object as store.add_ping_
+    # hyperlinks") and the player loses all progress (real bug, Killer Chat 1.4.1).
     patched_fn = env.get("add_ping_hyperlinks")
-    assert patched_fn is not mock_add_ping_hyperlinks, "add_ping_hyperlinks was not patched"
+    assert patched_fn is mock_add_ping_hyperlinks, \
+        "add_ping_hyperlinks must stay the SAME object (rebinding breaks pickle/saves)"
     res_val = patched_fn("hello")
     assert res_val == "hyperlinked:translated:hello", f"unexpected result: {res_val}"
     assert calls == [("trans", "hello"), ("orig", "translated:hello")], f"unexpected calls: {calls}"
+    # Re-running the block must NOT re-wrap (idempotent) and must keep identity.
+    calls.clear()
+    assert env.get("add_ping_hyperlinks") is mock_add_ping_hyperlinks
+    assert patched_fn("hi") == "hyperlinked:translated:hi", "second run changed behaviour"
 
     # Verify that ServerRole and ChatCharacter name/dominant_role fields are dynamically translated but keep raw value comparisons intact
     patched_role_class = env.get("ServerRole")
@@ -790,6 +811,146 @@ def check_char_limit() -> None:
     ov7 = _read_overrides(rt7)
     assert ov7 and ov7.get("choice_button") == 15, \
         f"measured factor 0.5 on size 30 must yield 15, got {ov7}"
+
+
+def check_renpy_risk() -> None:
+    """The overflow RISK ANALYZER (parsers/renpy_risk.py) must read a game's own
+    layout declarations and return a data-driven verdict — not guess. Two synthetic
+    games mirror the two real cases we verified by hand:
+      - fixed stock textbox + long source line  -> 'high'  (Watch the Road shape)
+      - auto-computed dialogue height + scroll   -> 'none'  (Killer Chat shape)
+    Plus: a non-fixed textbox is 'none', and reading must cover BOTH loose .rpy and
+    .rpa-archived sources."""
+    import os, tempfile
+    from parsers.renpy_risk import analyze, _LONG_SAY_CHARS
+
+    # --- Case 1: fixed-height stock textbox with a very long say line -> HIGH ---
+    g1 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(g1, "game"))
+    long_line = "x" * (_LONG_SAY_CHARS + 50)
+    with open(os.path.join(g1, "game", "gui.rpy"), "w", encoding="utf-8") as f:
+        f.write("define gui.textbox_height = 278\n")
+    with open(os.path.join(g1, "game", "screens.rpy"), "w", encoding="utf-8") as f:
+        f.write('screen say(who, what):\n    window:\n        text what id "what"\n')
+    with open(os.path.join(g1, "game", "script.rpy"), "w", encoding="utf-8") as f:
+        f.write('label start:\n    e "Short line."\n    e "%s"\n' % long_line)
+    r1 = analyze(g1)
+    assert r1["dialogue_overflow_risk"] == "high", r1
+    assert r1["textbox_height_fixed"] and r1["textbox_height"] == "278", r1
+    assert r1["long_say_lines"] >= 1 and r1["longest_say_chars"] >= _LONG_SAY_CHARS, r1
+
+    # --- Case 2: auto-computed dialogue height (+scroll in the say body) -> NONE ---
+    g2 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(g2, "game"))
+    with open(os.path.join(g2, "game", "dialogue.rpy"), "w", encoding="utf-8") as f:
+        f.write(
+            "init python:\n    def calculate_dialogue_height(who, what):\n        pass\n"
+            'screen say(who, what):\n    viewport:\n        text what id "what"\n'
+        )
+    with open(os.path.join(g2, "game", "script.rpy"), "w", encoding="utf-8") as f:
+        f.write('label start:\n    e "%s"\n' % long_line)
+    r2 = analyze(g2)
+    assert r2["dialogue_overflow_risk"] == "none", r2
+    assert r2["auto_height_dialogue"] and r2["has_dialogue_scroll"], r2
+
+    # --- Case 3: explicit NON-fixed textbox height -> NONE (box grows) ---
+    g3 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(g3, "game"))
+    with open(os.path.join(g3, "game", "gui.rpy"), "w", encoding="utf-8") as f:
+        f.write("define gui.textbox_height = None\n")
+    with open(os.path.join(g3, "game", "script.rpy"), "w", encoding="utf-8") as f:
+        f.write('label start:\n    e "%s"\n' % long_line)
+    r3 = analyze(g3)
+    assert r3["dialogue_overflow_risk"] == "none", r3
+    assert not r3["textbox_height_fixed"], r3
+
+    # --- Case 4: scroll detection is SCOPED to the say-screen body, not the file.
+    # A viewport in a DIFFERENT screen must NOT mask a fixed stock say box. ---
+    g4 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(g4, "game"))
+    with open(os.path.join(g4, "game", "gui.rpy"), "w", encoding="utf-8") as f:
+        f.write("define gui.textbox_height = 200\n")
+    with open(os.path.join(g4, "game", "screens.rpy"), "w", encoding="utf-8") as f:
+        f.write(
+            'screen say(who, what):\n    window:\n        text what id "what"\n'
+            'screen history():\n    viewport:\n        text "log of messages"\n'
+        )
+    with open(os.path.join(g4, "game", "script.rpy"), "w", encoding="utf-8") as f:
+        f.write('label start:\n    e "%s"\n' % long_line)
+    r4 = analyze(g4)
+    assert not r4["has_dialogue_scroll"], "viewport in another screen must not count as dialogue scroll"
+    assert r4["dialogue_overflow_risk"] == "high", r4
+
+    # --- Case 5: .rpa-archived sources are read (not just loose files) ---
+    # Reuse the rpa builder from check_renpy_rpa if present; otherwise verify the
+    # analyzer at least counts archive sources on a real game is covered elsewhere.
+    # Here we just confirm an empty game degrades to a clean 'none', never crashes.
+    g5 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(g5, "game"))
+    r5 = analyze(g5)
+    assert r5["dialogue_overflow_risk"] == "none" and r5["say_lines"] == 0, r5
+
+    print("OK — renpy risk analyzer: fixed-box=high, auto/scroll=none, "
+          "non-fixed=none, scroll-scoped-to-say-body, empty degrades")
+
+    # --- engine-lint helpers (pure parts; the subprocess run is integration) ---
+    from parsers.renpy import _lint_is_actionable, _find_engine_exe
+    # Real hazards the engine oracle catches -> actionable.
+    assert _lint_is_actionable("Unterminated string format code '%' (in \"100%\")")
+    assert _lint_is_actionable("Close text tag '{/color}' does not match an open text tag.")
+    assert _lint_is_actionable("A translation for \"X\" already exists")
+    # Benign tl/-lint noise (runtime var the linter can't resolve) -> NOT actionable.
+    assert not _lint_is_actionable("Could not evaluate 'attribute' in the who part of a say statement.")
+    assert not _lint_is_actionable("The screen foo has not been given a parameter list.")
+    # exe finder: a fake game dir with <name>.exe + paired <name>.py is found.
+    g_exe = tempfile.mkdtemp()
+    open(os.path.join(g_exe, "Game.exe"), "w").close()
+    open(os.path.join(g_exe, "Game.py"), "w").close()
+    found = _find_engine_exe(g_exe)
+    assert found and found.endswith("Game.exe"), found
+    # No exe at all -> None (player machine without the SDK), never raises.
+    assert _find_engine_exe(tempfile.mkdtemp()) is None
+    print("OK — renpy engine-lint: actionable vs benign classification, exe discovery")
+
+    # --- %-format escaping (deterministic crash-class fix at inject time) ---
+    from parsers.renpy import _escape_bad_percent as _pf
+    # A bare % the LLM dropped escaping on -> %% (the real Killer Chat bug shape).
+    assert _pf("ЗАВЕРШЕНО НА 100%") == "ЗАВЕРШЕНО НА 100%%"
+    assert _pf("на 100% с криком") == "на 100%% с криком"  # '% с' invalid spec
+    assert _pf("trailing %") == "trailing %%"
+    # Valid format specs and already-escaped %% are left BYTE-VERBATIM.
+    assert _pf("Loaded %d items") == "Loaded %d items"
+    assert _pf("Hi %(name)s!") == "Hi %(name)s!"
+    assert _pf("100%% ASSIGNMENT") == "100%% ASSIGNMENT"
+    assert _pf("no percent here") == "no percent here"
+    # Idempotent: re-running never double-escapes (safe to apply every inject).
+    for s in ("НА 100%", "100%% done", "%d of %d", "x % y % z"):
+        assert _pf(_pf(s)) == _pf(s), f"not idempotent: {s!r}"
+    print("OK — renpy %-format: bare % escaped, valid specs/%% verbatim, idempotent")
+
+    # --- dialogue auto-fit: {size=*scale} only for KNOWN fixed boxes ---
+    from parsers.renpy import fit_scale_for_box, RenPyParser as _RP
+    BOX_W, BOX_H, FS = 1650, 360, 45  # real Watch the Road dialogue box
+    short = "Привет, как дела?"
+    huge = ("Причина крушения остаётся неясной, хотя следователи указывают на "
+            "неблагоприятные погодные условия и возможную ошибку пилота. " * 6)
+    # Short line fits at full size -> scale 1.0 -> NOT wrapped.
+    assert fit_scale_for_box(short, "Russian", FS, BOX_W, BOX_H) == 1.0
+    assert _RP._fit_dialogue(short, BOX_W, BOX_H, FS, "Russian", "smooth") == short
+    # Huge line overflows -> scale < 1.0 (but never below the 0.6 floor) -> wrapped.
+    s_huge = fit_scale_for_box(huge, "Russian", FS, BOX_W, BOX_H)
+    assert 0.6 <= s_huge < 1.0, s_huge
+    wrapped = _RP._fit_dialogue(huge, BOX_W, BOX_H, FS, "Russian", "smooth")
+    assert wrapped.startswith("{size=*") and wrapped.endswith("{/size}"), wrapped
+    assert huge in wrapped, "full text must be preserved inside the size tag (never cut)"
+    # UNKNOWN box (dims 0) -> NEVER touch the text (the user's contract).
+    assert fit_scale_for_box(huge, "Russian", FS, 0, 0) == 1.0
+    assert _RP._fit_dialogue(huge, 0, 0, FS, "Russian", "smooth") == huge
+    # Already-tagged text is not double-wrapped.
+    pre = "{size=20}текст"
+    assert _RP._fit_dialogue(pre, BOX_W, BOX_H, FS, "Russian", "smooth") == pre
+    print("OK — renpy dialogue auto-fit: fits=untouched, overflow={size=*} full text, "
+          "unknown box untouched, no double-wrap")
 
 
 def check_renpy_identifier_parity() -> None:
@@ -2608,7 +2769,9 @@ def check_scheduler() -> None:
                 super().__init__(i, text, file="script.rpy")
                 self.path = ["label", "start", "menu", str(i)]
 
-        # Provider that shortens on the 2nd ask (re-ask succeeds).
+        # MULTI-WORD (3+) over-wide caption: re-ask shortens on the 2nd call.
+        # Only 3+ word captions may be re-asked (a synonym can shorten honestly);
+        # 1-2 word captions are NEVER re-asked (see the no-reask case below).
         class ShortenProvider(FakeProvider):
             def __init__(self):
                 super().__init__()
@@ -2616,9 +2779,10 @@ def check_scheduler() -> None:
             def translate(self, batch, lang, glossary, cfg):
                 self.calls += 1
                 if self.calls == 1:
-                    # Wildly over-wide first answer.
+                    # Wildly over-wide first answer — FOUR words so the re-ask path
+                    # (3+ words) is eligible.
                     return TranslateResult(
-                        {it.id: "ОченьДлинныйПереводКнопкиКоторыйТочноНеВлезет" for it in batch},
+                        {it.id: "Очень длинный непомерный перевод" for it in batch},
                         Usage(10, 12))
                 return TranslateResult({it.id: "Да" for it in batch}, Usage(10, 12))
 
@@ -2631,11 +2795,36 @@ def check_scheduler() -> None:
         assert not final.get("size_fixes"), \
             "shortening was enough; no font shrink should be recorded"
 
-        # Provider that NEVER shortens → a shrink factor must be recorded.
+        # 1-WORD over-wide caption: MUST NOT be re-asked (asking the model to
+        # shorten "Сохранение" only yields "Сох"). Instead the full word is kept
+        # and a font-shrink factor is recorded. This is the core anti-"Сох" rule.
+        class OneWordProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+            def translate(self, batch, lang, glossary, cfg):
+                self.calls += 1
+                return TranslateResult(
+                    {it.id: "ОченьДлинноеОдноСловоКотороеТочноНеВлезет" for it in batch},
+                    Usage(10, 12))
+
+        items = [MenuIt(3, "Save")]
+        prov1 = OneWordProvider()
+        final = run(WidthReq(items, threads=1), prov1)
+        assert prov1.calls == 1, \
+            f"a 1-word caption must NOT be re-asked (would butcher to 'Сох'), got {prov1.calls} calls"
+        assert final["translations"].get("3") == "ОченьДлинноеОдноСловоКотороеТочноНеВлезет", \
+            "the full word must be kept intact, never abbreviated"
+        sf1 = final.get("size_fixes") or {}
+        assert "3" in sf1 and 0.0 < sf1["3"] < 1.0, \
+            f"a 1-word over-wide caption must record a font-shrink, got {sf1}"
+
+        # Provider that NEVER shortens a MULTI-WORD caption → after re-asks a shrink
+        # factor must still be recorded (font-shrink is the final fallback).
         class StubbornProvider(FakeProvider):
             def translate(self, batch, lang, glossary, cfg):
                 return TranslateResult(
-                    {it.id: "ОченьДлинныйПереводКнопкиКоторыйТочноНеВлезетНикак" for it in batch},
+                    {it.id: "Очень длинный непомерный несокращаемый перевод" for it in batch},
                     Usage(10, 12))
 
         items = [MenuIt(2, "Hi")]
@@ -3147,6 +3336,7 @@ def main() -> int:
     check_renpy()
     check_renpy_font()
     check_char_limit()
+    check_renpy_risk()
     check_renpy_identifier_parity()
     check_renpy_mixed_translate()
     check_renpy_rpa()

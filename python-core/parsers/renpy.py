@@ -661,6 +661,48 @@ def _unescape_translation(s: str) -> str:
     return _ESCAPE_RE.sub(replace, s)
 
 
+def _escape_bad_percent(s: str) -> str:
+    """Escape a `%` that Ren'Py would treat as a BROKEN string-format code -> `%%`.
+
+    With `config.old_substitutions` (ON by default), the engine runs displayed
+    text through `%`-substitution: `%s`/`%d`/`%(name)s` are format specs and a lone
+    `%` must be written `%%`. The LLM routinely drops the escaping when translating
+    (e.g. source `100%% ASSIGNMENT` -> translation `НА 100%`), which the engine then
+    flags as "Unterminated/Unknown string format code" and can crash at render. We
+    fix it deterministically at write-time — NO API call, can't be fragile.
+
+    Mirrors EXACTLY the state machine in the engine's lint.py (text_checks): only a
+    `%` that begins an invalid or unterminated spec is escaped; valid specs and an
+    already-doubled `%%` are left byte-verbatim, so this is idempotent and never
+    touches legitimate format strings. Verified by check_renpy_percent (selftest)."""
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c != "%":
+            out.append(c)
+            i += 1
+            continue
+        j = i + 1
+        # Mapping key: %(name)...
+        if j < n and s[j] == "(":
+            k = s.find(")", j)
+            if k == -1:                       # unterminated mapping -> bare %
+                out.append("%%")
+                i += 1
+                continue
+            j = k + 1
+        # Conversion flags / width / length modifiers.
+        while j < n and s[j] in "#0123456780- +hlL":
+            j += 1
+        if j < n and s[j] in "diouxXeEfFgGcrs%":
+            out.append(s[i:j + 1])            # valid spec (incl. %%) -> verbatim
+            i = j + 1
+            continue
+        out.append("%%")                      # invalid/unterminated -> escape
+        i += 1
+    return "".join(out)
+
 
 def iter_logical_lines(text: str):
     lines = text.split("\n")
@@ -1511,6 +1553,28 @@ class RenPyParser(BaseParser):
             lang = self._lang_dir(target_lang)
             written = 0
             detected_font: str | None = None
+
+            # --- dialogue auto-fit budget (safety net) --------------------------
+            # If the game declares a FIXED dialogue box in gui.rpy, an over-long
+            # translation can clip. We DON'T abbreviate it — we wrap it in a native
+            # {size=*scale} so the engine renders the FULL text smaller. We only do
+            # this when we KNOW the real box (dialogue_width + textbox_height present
+            # as numbers); otherwise we leave the text untouched (user contract:
+            # "where the box is unknown, don't touch it"). parse_gui_rpy is
+            # last-wins, matching the engine (Watch the Road redefines textbox_height
+            # 278 -> 360; the engine and we both take 360).
+            fit_box_w = fit_box_h = 0
+            fit_font_size = 32
+            fit_src_lang = target_lang
+            try:
+                _gui_strs, _gui_ints = parse_gui_rpy(root)
+                _w = _gui_ints.get("dialogue_width")
+                _h = _gui_ints.get("textbox_height")
+                if isinstance(_w, int) and isinstance(_h, int) and _w > 0 and _h > 0:
+                    fit_box_w, fit_box_h = _w, _h
+                    fit_font_size = _gui_ints.get("text_size") or 32
+            except Exception as e_fit:
+                logger.warning("dialogue auto-fit budget unavailable: %s", e_fit)
             # Every font FILE the game references by name (e.g. font "TinyUnicode.ttf",
             # gui.bsod_text_font = "AnalogueOS-Regular.ttf"). The engine resolves ANY
             # font name through config.font_name_map.get(name, name) (renpy/text/text.py),
@@ -1604,6 +1668,10 @@ class RenPyParser(BaseParser):
                     if tr_val is None:
                         continue
                     tr = _unescape_translation(tr_val)
+                    # Restore %-escaping the LLM tends to drop (100%% -> 100%): the
+                    # engine treats displayed text as a format string by default, so
+                    # a bare % is a crash-class lint error. Deterministic, no API.
+                    tr = _escape_bad_percent(tr)
 
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],
@@ -1612,8 +1680,15 @@ class RenPyParser(BaseParser):
                         prefix = rec.get("block_prefix") or []
                         block_codes = [c for c, _ in prefix] + [code]
                         ident = _compute_identifier(rec["label"], _block_digest(block_codes), seen_ids)
+                        # Dialogue safety-net: if a FIXED textbox is known and the
+                        # full translation would overflow it, wrap in {size=*scale}
+                        # so the engine renders the WHOLE text smaller (never cut).
+                        say_tr = self._fit_dialogue(
+                            tr, fit_box_w, fit_box_h, fit_font_size, fit_src_lang,
+                            font_style,
+                        )
                         say_blocks.setdefault(tl_rel, []).append(
-                            self._format_say_block(file_rel, rec, lang, ident, code, tr))
+                            self._format_say_block(file_rel, rec, lang, ident, code, say_tr))
                     else:
                         # `menu_choice` text is read by the engine's string LEXER
                         # (whitespace collapsed) → match with `_lexer_decode`.
@@ -1647,6 +1722,24 @@ class RenPyParser(BaseParser):
             return written
         finally:
             self._cleanup_decompile_temp()
+
+    @staticmethod
+    def _fit_dialogue(tr: str, box_w: int, box_h: int, font_size: int,
+                      target_lang: str, font_style: str) -> str:
+        """Wrap an overflowing say-line in {size=*scale} so the engine renders the
+        FULL translation small enough to fit a known fixed textbox. Returns `tr`
+        unchanged when the box is unknown (box_w/h == 0), the text already fits, or
+        it already carries a leading {size=...} (don't double-wrap). The word/
+        sentence is NEVER cut — only the font scales, exactly per the user's rule."""
+        if box_w <= 0 or box_h <= 0:
+            return tr
+        # Respect an existing author/our size tag at the very start.
+        if tr.lstrip().startswith("{size="):
+            return tr
+        scale = fit_scale_for_box(tr, target_lang, font_size, box_w, box_h, font_style)
+        if scale >= 0.999:
+            return tr
+        return "{size=*%s}%s{/size}" % (scale, tr)
 
     def finalize_backups(self, root: str) -> None:
         """Delete files marked as ``type=created`` in backup metadata, except
@@ -1882,16 +1975,34 @@ class RenPyParser(BaseParser):
             f"    style.choice_button.ysize = None\n"
             f"    style.choice_button_text.layout = 'subtitle'\n"
             f"\n"
-            f"    # Patch for Killer Chat! to translate dynamic pings in chat messages before substitution\n"
+            f"    # Translate dynamic @ping chat messages BEFORE substitution (Killer\n"
+            f"    # Chat!). CRITICAL: we patch add_ping_hyperlinks IN PLACE (swap its\n"
+            f"    # __code__) instead of REBINDING the store name. Ren'Py pickles store\n"
+            f"    # functions BY REFERENCE and verifies identity on save; rebinding the\n"
+            f"    # name makes the saved object != store.add_ping_hyperlinks ->\n"
+            f"    # PicklingError -> EVERY save crashes (real player bug, 0 progress).\n"
+            f"    # In-place keeps the SAME function object, so saves stay valid. The\n"
+            f"    # original behaviour is preserved via a clone; renpy is captured as a\n"
+            f"    # default arg so the swapped code needs no globals. Defensive: if the\n"
+            f"    # function carries free variables the __code__ swap is impossible, so\n"
+            f"    # we skip it (ping-translation off) rather than ever crash.\n"
             f"    if 'add_ping_hyperlinks' in globals():\n"
-            f"        _orig_add_ping_hyperlinks = globals().get('add_ping_hyperlinks')\n"
-            f"        if not hasattr(_orig_add_ping_hyperlinks, '_patched_by_interprex'):\n"
-            f"            def _patched_add_ping_hyperlinks(new_text, _orig=_orig_add_ping_hyperlinks):\n"
-            f"                if not (renpy.game.lint or renpy.predicting()):\n"
-            f"                    new_text = renpy.translation.translate_string(new_text)\n"
-            f"                return _orig(new_text)\n"
-            f"            _patched_add_ping_hyperlinks._patched_by_interprex = True\n"
-            f"            globals()['add_ping_hyperlinks'] = _patched_add_ping_hyperlinks\n"
+            f"        import types as _ix_types\n"
+            f"        _ix_aph = globals()['add_ping_hyperlinks']\n"
+            f"        if not getattr(_ix_aph, '_patched_by_interprex', False):\n"
+            f"            try:\n"
+            f"                _ix_old_aph = _ix_types.FunctionType(\n"
+            f"                    _ix_aph.__code__, _ix_aph.__globals__, _ix_aph.__name__,\n"
+            f"                    _ix_aph.__defaults__, _ix_aph.__closure__)\n"
+            f"                def _ix_aph_wrapper(new_text, _orig=_ix_old_aph, _renpy=renpy):\n"
+            f"                    if not (_renpy.game.lint or _renpy.predicting()):\n"
+            f"                        new_text = _renpy.translation.translate_string(new_text)\n"
+            f"                    return _orig(new_text)\n"
+            f"                _ix_aph.__code__ = _ix_aph_wrapper.__code__\n"
+            f"                _ix_aph.__defaults__ = _ix_aph_wrapper.__defaults__\n"
+            f"                _ix_aph._patched_by_interprex = True\n"
+            f"            except Exception:\n"
+            f"                pass\n"
             f"\n"
             f"    # Patch to dynamically translate ServerRole names and ChatCharacter dominant_roles (for profile traits)\n"
             f"    if 'ServerRole' in globals() or 'ChatCharacter' in globals():\n"
@@ -2567,6 +2678,68 @@ def measure_translation_px(translation: str, target_lang: str, font_size: int, f
     return _max_line_px(translation, _target_font(target_lang, font_size, font_style), font_size)
 
 
+# Approximate line-height multiple Ren'Py uses (font size * this ≈ line box). A
+# hair generous so we never under-estimate height and let text clip.
+_LINE_HEIGHT_MULT = 1.25
+# Never shrink dialogue/caption font below this fraction of the game's own size —
+# below it text is unreadable; better to ride a hair tall than render ants.
+_FIT_FONT_FLOOR = 0.6
+
+
+def _wrapped_line_count(plain_text: str, font, box_width: float) -> int:
+    """Visual line count of `plain_text` (tags already stripped) greedily word-
+    wrapped to `box_width` in `font`. Honors explicit \\n. Pure measurement."""
+    total = 0
+    for para in plain_text.split("\n"):
+        words = para.split(" ")
+        if not words:
+            total += 1
+            continue
+        line = ""
+        lines = 1
+        for w in words:
+            trial = w if not line else line + " " + w
+            try:
+                fits = font.getlength(trial) <= box_width
+            except Exception:
+                fits = len(trial) * 0.6 * font.size <= box_width if hasattr(font, "size") else True
+            if fits or not line:
+                line = trial
+            else:
+                lines += 1
+                line = w
+        total += lines
+    return total
+
+
+def fit_scale_for_box(translation: str, target_lang: str, font_size: int,
+                      box_width: float, box_height: float,
+                      font_style: str = "smooth") -> float:
+    """Largest font-scale in [_FIT_FONT_FLOOR, 1.0] at which `translation`, word-
+    wrapped to `box_width`, fits within `box_height`. Returns 1.0 if it already
+    fits (no shrink needed) or if box dims are unknown/non-positive (we never
+    shrink when we don't truly know the box — caller guarantees that contract).
+
+    This drives the dialogue safety-net: inject wraps an overflowing say line in
+    a native `{size=*scale}` tag so the ENGINE itself renders the FULL, unabridged
+    translation smaller — the word/sentence is never cut. Mirrors the engine's own
+    `{size=*}` semantics (text.py)."""
+    if box_width <= 0 or box_height <= 0:
+        return 1.0
+    plain = _strip_tags(translation)
+    if not plain.strip():
+        return 1.0
+    s = 1.0
+    while s >= _FIT_FONT_FLOOR - 1e-9:
+        fs = max(1, int(round(font_size * s)))
+        font = _target_font(target_lang, fs, font_style)
+        lines = _wrapped_line_count(plain, font, box_width)
+        if lines * fs * _LINE_HEIGHT_MULT <= box_height:
+            return round(s, 3)
+        s -= 0.05
+    return round(_FIT_FONT_FLOOR, 3)
+
+
 def _avg_char_width(target_lang: str, font_size: int, font_style: str = "smooth") -> float:
     """Frequency-weighted mean glyph width for the target script: letters share
     one weight, the (narrow) space is blended in at its real prose frequency.
@@ -2595,3 +2768,137 @@ def get_char_limit(original_text: str, source_font_path: str, target_lang: str, 
     original_px = measure_original_px(original_text, source_font_path, font_size)
     avg_width = _avg_char_width(target_lang, font_size, font_style)
     return max(5, int(original_px / avg_width))
+
+
+# --- Engine-oracle lint -----------------------------------------------------
+# The game ships its own Ren'Py runtime + a launcher exe. Running
+# `<exe> <basedir> lint` makes the ENGINE ITSELF validate the WHOLE project,
+# INCLUDING our injected tl/<lang>/ files — the same "engine oracle" stance the
+# project already uses for translate-id verification. This turns "will our
+# injection break the game?" from a guess into a measured fact, and catches
+# defects our static validators can't (verified: it flagged a translated "100%"
+# as an unterminated string-format code — a real runtime hazard).
+#
+# Findings reference file paths, so we split OURS (tl/<lang>/) from pre-existing
+# game issues. lint exits 0 even WITH findings, so we parse text, never the code.
+
+def _find_engine_exe(root: str) -> str | None:
+    """Locate the game's Ren'Py launcher exe next to its basedir.
+
+    A shipped game has `<Name>.exe` (+ `<Name>.py`, `<Name>.sh`) in its basedir
+    alongside `lib/` and `renpy/`. We pick the .exe whose stem also has a paired
+    .py launcher (the Ren'Py bootstrap), which avoids matching unrelated exes.
+    Returns None if nothing suitable is found (player machine without the SDK)."""
+    import glob
+
+    try:
+        candidates = glob.glob(os.path.join(root, "*.exe"))
+    except OSError:
+        return None
+    for exe in candidates:
+        stem = os.path.splitext(exe)[0]
+        # The Ren'Py launcher always ships a same-named .py bootstrap.
+        if os.path.exists(stem + ".py"):
+            return exe
+    # Fallback: any .exe if the basedir clearly looks like a Ren'Py game.
+    if candidates and os.path.isdir(os.path.join(root, "renpy")):
+        return candidates[0]
+    return None
+
+
+def lint_with_engine(root: str, lang: str | None = None,
+                     timeout: int = 240) -> dict:
+    """Run the game engine's own `lint` over the project and report findings.
+
+    Returns a dict (JSON-serializable):
+      {
+        available: bool,          # engine exe found + ran
+        ours: [ {file, line, message}, ... ],   # findings in OUR tl/<lang>/
+        ours_count: int,
+        other_count: int,         # pre-existing game findings (not ours)
+        reason: str,              # human note when unavailable
+      }
+    DEGRADES GRACEFULLY: if the engine exe isn't present (a Steam player without
+    the SDK) or the run fails/times out, returns available=False and never raises
+    — exactly like the translate-id oracle, which is optional too."""
+    import subprocess
+
+    result = {"available": False, "ours": [], "ours_count": 0,
+              "other_count": 0, "reason": ""}
+
+    exe = _find_engine_exe(root)
+    if not exe:
+        result["reason"] = "engine exe not found (game has no bundled SDK)"
+        return result
+
+    # Normalize the language to the engine's tl/ directory name (e.g. a UI display
+    # name "Russian" or code "ru" -> "russian"), so findings under our output tree
+    # are classified as OURS, not "other". Same map inject uses (_lang_dir).
+    if lang:
+        lang = RenPyParser._lang_dir(lang)
+
+    try:
+        proc = subprocess.run(
+            [exe, root, "lint"],
+            capture_output=True, text=True, timeout=timeout,
+            cwd=root, encoding="utf-8", errors="replace",
+        )
+        out = proc.stdout or ""
+    except subprocess.TimeoutExpired:
+        result["reason"] = f"engine lint timed out after {timeout}s"
+        return result
+    except Exception as e:  # noqa: BLE001 — never raise to the caller
+        result["reason"] = f"engine lint failed: {e}"
+        return result
+
+    # If lint also wrote lint.txt, prefer the on-disk copy (full, un-truncated).
+    lint_txt = os.path.join(root, "lint.txt")
+    if os.path.exists(lint_txt):
+        try:
+            with open(lint_txt, encoding="utf-8", errors="replace") as f:
+                out = f.read()
+        except OSError:
+            pass
+
+    result["available"] = True
+
+    # Each finding starts with `game/...:<line> <message>`. Split ours vs others
+    # by whether the path is under our tl/<lang>/ output tree.
+    finding_re = re.compile(r"^(game/[^\s:]+):(\d+)\s+(.*)$")
+    tl_marker = f"/tl/{lang}/".lower() if lang else "/tl/"
+    ours, other = [], 0
+    for line in out.splitlines():
+        m = finding_re.match(line.strip())
+        if not m:
+            continue
+        fpath, lineno, msg = m.group(1), int(m.group(2)), m.group(3)
+        norm = "/" + fpath.lower()
+        if (tl_marker in norm) or norm.startswith("/game/tl/" + (lang.lower() + "/" if lang else "")):
+            ours.append({"file": fpath, "line": lineno, "message": msg,
+                         "actionable": _lint_is_actionable(msg)})
+        else:
+            other += 1
+    result["ours"] = ours
+    result["ours_count"] = len(ours)
+    result["actionable_count"] = sum(1 for f in ours if f["actionable"])
+    result["other_count"] = other
+    return result
+
+
+# Lint findings inside tl/ files that are BENIGN artifacts of linting translation
+# files in isolation (the `who`/attribute is a runtime variable the linter can't
+# resolve) — NOT defects we introduced. Everything else (text-tag mismatches,
+# string-format-code errors, duplicate translation keys) is a REAL hazard our
+# injection may have caused, and is what the UI should surface.
+_LINT_BENIGN_RE = re.compile(
+    r"Could not evaluate .* in the who part|"
+    r"has not been given a parameter list|"
+    r"is not used|may not be reachable",
+    re.I,
+)
+
+
+def _lint_is_actionable(message: str) -> bool:
+    """True if a tl/ lint finding is a genuine hazard worth surfacing (vs benign
+    translation-file lint noise)."""
+    return not _LINT_BENIGN_RE.search(message)

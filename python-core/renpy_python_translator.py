@@ -1456,7 +1456,7 @@ def _write_inline_strings_file(game_path: Path, lang: str,
     `[var]`). Deduped by `old` (the dict is global per language; duplicate keys
     warn and only the last wins). Written as ONE file, registered as a `created`
     backup so restore just deletes it. Returns the number of pairs written."""
-    from parsers.renpy import _string_quote
+    from parsers.renpy import _string_quote, _escape_bad_percent
 
     # Seed with keys ALREADY in the dialogue tl/ tree: Ren'Py crashes on a
     # duplicate `old` key per language. Pre-loading them here makes the dedup
@@ -1477,19 +1477,24 @@ def _write_inline_strings_file(game_path: Path, lang: str,
             skipped_dupe += 1
             continue
         seen.add(original)
+        # `new` is DISPLAYED text → runs through the engine's %-substitution, so a
+        # bare % the LLM left unescaped is a crash-class lint error. Fix it
+        # deterministically (same engine-accurate rule as the dialogue path). The
+        # `old` KEY is the exact runtime lookup string and must stay byte-verbatim.
+        new_val = _escape_bad_percent(translated)
         # Also cover a .lower()/.upper() display transform (e.g. status text shown
         # as `text mc.status.lower()`): add the cased key too so the dict still
         # hits after the in-code transform. Harmless if never used.
         lines.append("")
         lines.append(f"    old {_string_quote(original)}")
-        lines.append(f"    new {_string_quote(translated)}")
+        lines.append(f"    new {_string_quote(new_val)}")
         written += 1
         for variant in (original.lower(), original.upper()):
             if variant != original and variant not in seen:
                 seen.add(variant)
                 lines.append("")
                 lines.append(f"    old {_string_quote(variant)}")
-                lines.append(f"    new {_string_quote(translated)}")
+                lines.append(f"    new {_string_quote(new_val)}")
 
     if written == 0:
         return 0

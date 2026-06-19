@@ -181,8 +181,19 @@ class TranslationScheduler:
         for c in reps:
             context = c.context
             is_menu = "menu" in c.path
+            # A screen widget's path is ["screen", name, kind, idx] (see
+            # parsers/renpy.py). Only `textbutton`/`label` are genuine clickable
+            # captions that live in a fixed-width box; a freestanding `text` or
+            # `tooltip` usually has room and is exactly what the old blanket
+            # `len(text) < 50` rule was wrongly crushing (e.g. a short status line
+            # squeezed as if it were a button). So scope the width budget to button
+            # kinds. NOTE: this is still a HEURISTIC fallback used when we can't ask
+            # the engine itself — the authoritative path is the runtime auto-fit /
+            # risk analyzer that inherits the real box geometry.
             is_screen_button = (
-                c.path and c.path[0] == "screen"
+                len(c.path) >= 3
+                and c.path[0] == "screen"
+                and c.path[2] in ("textbutton", "label")
                 and len(c.text) < 50
             )
             # Per-item fixed-width budget. The char limit is passed to the model
@@ -195,17 +206,38 @@ class TranslationScheduler:
             max_pixels = 0
             if (is_menu or is_screen_button) and self.is_renpy and req.root and self.source_font_path:
                 try:
-                    from parsers.renpy import get_char_limit, measure_original_px
-
-                    max_chars = get_char_limit(
-                        c.text, self.source_font_path, req.target_lang,
-                        self.font_size, self._font_style,
+                    from parsers.renpy import (
+                        get_char_limit, measure_original_px, _avg_char_width,
                     )
+
                     orig_px = measure_original_px(
                         c.text, self.source_font_path, self.font_size
                     )
-                    self.item_orig_px[c.id] = orig_px
-                    max_pixels = int(orig_px)
+                    # The ORIGINAL word's width is a POOR estimate of the box it
+                    # lives in: buttons have padding, and menu choices wrap (we set
+                    # choice_button ysize=None + 'subtitle' layout in
+                    # _interprex_font.rpy). So a short source like "Save" must NOT
+                    # crush "Сохранение" down to "Сох". Widen the budget by a slack
+                    # factor and never let it fall below MIN_CAPTION_CHARS worth of
+                    # width, so standard menu words (Сохранение / Настройки /
+                    # Продолжить, ~10 chars) always fit. This relaxed budget is the
+                    # ONE ground truth used both for the prompt hint AND the overflow
+                    # re-ask check (item_orig_px), so the two stay consistent.
+                    avg_w = _avg_char_width(
+                        req.target_lang, self.font_size, self._font_style
+                    )
+                    floor_px = self._MIN_CAPTION_CHARS * avg_w
+                    budget_px = max(orig_px * self._UI_WIDTH_SLACK, floor_px)
+                    max_chars = max(
+                        get_char_limit(
+                            c.text, self.source_font_path, req.target_lang,
+                            self.font_size, self._font_style,
+                        ),
+                        int(budget_px / avg_w) if avg_w > 0 else self._MIN_CAPTION_CHARS,
+                        self._MIN_CAPTION_CHARS,
+                    )
+                    self.item_orig_px[c.id] = budget_px
+                    max_pixels = int(budget_px)
 
                     if not is_menu:
                         line_count = c.text.count("\\n") + 1
@@ -691,6 +723,19 @@ class TranslationScheduler:
     # approximation; with a true pixel measurement that error is gone, so the
     # tolerance shrinks to a small, physically-meaningful margin.
     _PX_TOLERANCE = 1.03
+    # HEURISTIC FALLBACK (used when we can't read the real box from the engine).
+    # Slack on top of the original caption's measured width when computing a UI
+    # button/menu budget. The source word is rarely the box: buttons have padding
+    # and our menu choices wrap (choice_button ysize=None + 'subtitle' layout in
+    # _interprex_font.rpy), so the translation has more room than the bare original
+    # width. Without this, "Save" (4 chars) crushes "Сохранение" (10) to "Сох".
+    # The authoritative fit is the runtime auto-fit, which inherits the true box
+    # from Text.render — this number only guards the no-engine path.
+    _UI_WIDTH_SLACK = 1.6
+    # Floor (in target-script chars) every UI caption budget is raised to, so a
+    # standard menu word — Сохранение / Настройки / Продолжить / Загрузить — always
+    # fits regardless of how short the English source is.
+    _MIN_CAPTION_CHARS = 12
     # How many times we re-ask the model to shorten a still-overflowing caption
     # before giving up and recording a font-shrink factor for inject. Each round
     # costs a request, so keep it small; 2 catches almost everything.
@@ -725,23 +770,52 @@ class TranslationScheduler:
         limit = self.item_limits.get(item_id)
         return limit is not None and len(translation) > limit * 1.1
 
+    # A translation with this many words OR FEWER is never re-asked "shorter":
+    # asking the model to shrink "Сохранение" (1 word) only yields a butchered
+    # abbreviation ("Сох"). Instead we keep the FULL word and shrink the font
+    # (size_overrides). Only multi-word captions (3+), where a synonym/rephrase can
+    # genuinely shorten without mangling, go through the re-ask. User rule:
+    # "≤2 words → full word + font shrink; 3+ words → may re-ask shorter".
+    _MAX_WORDS_FONT_FIT = 2
+
     def _enforce_char_limits(self, batch, batch_tr, cfg) -> None:
-        """Re-ask the model for any translation that overran its Ren'Py per-line
-        width budget. We re-translate (with a tighter, MEASURED instruction) up to
-        _MAX_REASKS times, NEVER cutting the string — the final text always comes
-        from the model. Whatever STILL overflows after the last round is recorded
-        in self.size_overrides as a shrink factor (<1.0) so inject can reduce that
-        style's font size by the exact measured amount (the hybrid fit: shorten
-        first, shrink the font only as a last resort)."""
-        oversized = [
+        """Make any translation that overran its Ren'Py per-line width budget fit —
+        WITHOUT ever butchering a word into an abbreviation. Two paths by word count:
+
+        - 1–2 words (e.g. "Сохранение"): keep the word WHOLE, record a font-shrink
+          factor (size_overrides) so inject renders it smaller but intact. No re-ask.
+        - 3+ words: re-ask the model for a shorter rephrase up to _MAX_REASKS times
+          (a synonym can shorten honestly here), then font-shrink whatever still
+          overflows.
+
+        Either way the final text is the model's own — never cut — and a short
+        caption never degrades to "Сох"."""
+        all_oversized = [
             it for it in batch
             if it.id in batch_tr and self._overflows(it.id, batch_tr[it.id])
         ]
+        if not all_oversized:
+            return
+
+        # Partition: short captions skip the re-ask entirely (font-shrink only).
+        def _word_count(s: str) -> int:
+            return len(s.split())
+
+        short_fit = [it for it in all_oversized
+                     if _word_count(batch_tr[it.id]) <= self._MAX_WORDS_FONT_FIT]
+        oversized = [it for it in all_oversized
+                     if _word_count(batch_tr[it.id]) > self._MAX_WORDS_FONT_FIT]
+
+        # Record font-shrink for the short ones right away — full word preserved.
+        for it in short_fit:
+            self._record_font_shrink(it.id, batch_tr[it.id])
+
         if not oversized:
             return
         logger.info(
-            "Detected %d translations exceeding width budget. Re-asking shorter...",
-            len(oversized),
+            "Detected %d multi-word translations exceeding width budget. "
+            "Re-asking shorter (%d short captions font-shrunk, word kept whole)...",
+            len(oversized), len(short_fit),
         )
 
         for round_no in range(self._MAX_REASKS):
@@ -779,20 +853,30 @@ class TranslationScheduler:
             if not oversized:
                 return
 
-        # Still overflowing after the last re-ask: record a measured shrink factor
-        # so inject reduces the font for exactly these strings' styles.
+        # Still overflowing after the last re-ask: font-shrink the remainder.
         for it in oversized:
-            ratio = self._overflow_ratio(it.id, batch_tr[it.id])
-            if ratio > self._PX_TOLERANCE:
-                factor = (1.0 / ratio) * self._PX_TOLERANCE  # <1.0
-                with self.cond:
-                    prev = self.size_overrides.get(it.id, 1.0)
-                    self.size_overrides[it.id] = min(prev, factor)
-                logger.info(
-                    "Caption id '%s' still too wide after %d re-asks; font shrink "
-                    "factor %.3f recorded for inject.",
-                    it.id, self._MAX_REASKS, factor,
-                )
+            self._record_font_shrink(it.id, batch_tr[it.id])
+
+    # Font-shrink floor: never make a caption smaller than this fraction of the
+    # game's own size — below it text is unreadable, better to let it ride a hair
+    # wide than render 8px ants. Mirrors the inject-side floor.
+    _FONT_SHRINK_FLOOR = 0.6
+
+    def _record_font_shrink(self, item_id: str, translation: str) -> None:
+        """Record a measured font-shrink factor (<1.0) for `item_id` so inject
+        renders that caption's style smaller — keeping the FULL word intact. Clamped
+        to _FONT_SHRINK_FLOOR for readability."""
+        ratio = self._overflow_ratio(item_id, translation)
+        if ratio <= self._PX_TOLERANCE:
+            return
+        factor = max(self._FONT_SHRINK_FLOOR, (1.0 / ratio) * self._PX_TOLERANCE)
+        with self.cond:
+            prev = self.size_overrides.get(item_id, 1.0)
+            self.size_overrides[item_id] = min(prev, factor)
+        logger.info(
+            "Caption id '%s' too wide; font shrink factor %.3f recorded "
+            "(word kept whole, not abbreviated).", item_id, factor,
+        )
 
     # -- pause / pacing helpers -------------------------------------------------
 
