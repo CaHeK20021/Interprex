@@ -414,6 +414,17 @@ class BaseParser(ABC):
                 os.remove(temp_path)
             raise
 
+    def engine_prompt_addon(self) -> str:
+        """Engine-specific instructions appended to the core system prompt.
+
+        Override in a subclass to add rules the model should follow for THIS
+        engine only (control codes, tone, format specifiers, etc.). The returned
+        string is appended after the core prompt and before the glossary/payload,
+        so it can be a plain paragraph or a bullet list — whatever is clearest.
+
+        Return "" (the default) for engines that need no extra instructions."""
+        return ""
+
     @staticmethod
     @abstractmethod
     def detect(root: str) -> bool:

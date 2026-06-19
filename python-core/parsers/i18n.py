@@ -108,6 +108,16 @@ def set_by_path(d: dict, path: list[str], value: str) -> None:
 class I18nParser(BaseParser):
     engine = "i18n"
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "LOCALIZATION FILE STRINGS: these strings come from a JSON/INI locale file "
+            "and are displayed in menus, HUD, or system messages.\n"
+            "FORMAT SPECIFIERS: preserve {0}, {1}, {player}, %s, %d and similar "
+            "patterns EXACTLY — they are filled in at runtime.\n"
+            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
+            "TONE: use a neutral, professional register. Avoid overly literary style."
+        )
+
     @staticmethod
     def detect(root: str) -> bool:
         # 1. Stardew Valley i18n

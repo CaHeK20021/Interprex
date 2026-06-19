@@ -550,6 +550,18 @@ def parse_file(content: str) -> list[UnrealElement]:
 class UnrealParser(BaseParser):
     engine = "unreal"
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "TECHNICAL STRINGS (UI / SUBTITLES): these strings come from a game's "
+            "localization files and may contain format specifiers or markup.\n"
+            "FORMAT SPECIFIERS: preserve %s, %d, %f, %i, {0}, {1}, {UserName}, "
+            "{value} and similar patterns EXACTLY — they are filled in at runtime.\n"
+            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is; do NOT convert them "
+            "into real newlines or tabs inside the JSON string.\n"
+            "TONE: use a neutral, professional register suitable for UI labels, "
+            "subtitles, and system messages. Avoid overly literary or conversational style."
+        )
+
     @staticmethod
     def detect(root: str) -> bool:
         """True if the directory contains Unreal Engine 3 localization files."""

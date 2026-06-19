@@ -809,6 +809,45 @@ class RenPyParser(BaseParser):
         super().__init__()
         self._decompile_temp_dirs: list[str] = []
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "REN'PY SYNTAX RULES:\n"
+            "VARIABLES & INTERPOLATION: text may contain [variable_name] or [expr] "
+            "sequences \u2014 these are runtime interpolations. Copy them VERBATIM into the "
+            "translation; never translate the name inside the brackets.\n"
+            "STYLE TAGS: sequences like {b}, {i}, {u}, {s}, {color=#fff}, {size=*0.8}, "
+            "{alpha=*0.5}, {p}, {w}, {nw}, {fast}, {cps=N} are Ren'Py display tags. "
+            "Preserve all opening and closing tags exactly as they appear.\n"
+            "SCENE / TONE: the 'context' field often contains the label name (e.g. "
+            "'label: romance', 'label: dm', 'label: office'). Use it to set the right "
+            "register \u2014 romantic scenes \u2192 informal '\u0442\u044b'; business scenes \u2192 formal '\u0432\u044b'; "
+            "chat/DM scenes \u2192 casual chat style. If the label is absent or unclear, "
+            "translate naturally.\n"
+            "DIALOGUE NATURALNESS: these are spoken lines of a visual novel. The "
+            "translation should sound like a real person talking, not a subtitle or a "
+            "technical manual.\n"
+            "FIXED-WIDTH CAPTIONS: some items carry a fixed_width flag and constraints "
+            "like max_chars and/or max_pixels. These render inside a fixed-size UI box "
+            "(a Ren'Py menu choice or screen button). Prefer a translation that fits the "
+            "limits. If max_pixels is specified, estimate the visual width (Cyrillic "
+            "glyphs are ~10-20% wider than Latin) and try to stay within it.\n"
+            "CRITICAL \u2014 NEVER ABBREVIATE OR TRUNCATE A WORD: do NOT write "
+            "'\u0421\u043e\u0445' for '\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435', "
+            "'\u041d\u0430\u0441\u0442\u0440.' for '\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438', "
+            "'\u041f\u0440\u043e\u0434.' for '\u041f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c'. "
+            "A single word MUST always be spelled out in full, even if it would exceed "
+            "the limit \u2014 the app shrinks the font to make a whole word fit, so a full "
+            "word that is slightly too long is CORRECT and a clipped/abbreviated word is "
+            "WRONG. Only when the caption is THREE OR MORE words may you shorten it, and "
+            "only by rephrasing with a shorter synonym or dropping filler \u2014 never by "
+            "abbreviating. Example: 'Start a New Game' (3+ words) -> "
+            "'\u041d\u043e\u0432\u0430\u044f \u0438\u0433\u0440\u0430' (rephrased, fine). "
+            "Example: 'Save' (1 word) -> '\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435' in full "
+            "(NOT '\u0421\u043e\u0445\u0440.' or '\u0421\u043e\u0445'), even if longer than the box. "
+            "These limits are constraints to RESPECT, never text to translate."
+        )
+
+
     # --- detection --------------------------------------------------------
     @staticmethod
     def detect(root: str) -> bool:

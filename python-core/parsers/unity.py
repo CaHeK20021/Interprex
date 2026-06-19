@@ -249,6 +249,16 @@ class UnityParser(BaseParser):
         self._generator_cache: dict[str, Any] = {}
         self._font_bytes_cache: dict[str, bytes | None] = {}
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "TECHNICAL STRINGS (UI / GAME INTERFACE): these strings come from a Unity "
+            "game and are used in menus, HUD, and system messages.\n"
+            "FORMAT SPECIFIERS: preserve {0}, {1}, {UserName}, %s, %d and similar "
+            "patterns EXACTLY — they are filled in at runtime.\n"
+            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
+            "TONE: use a neutral, professional register. Avoid overly literary style."
+        )
+
     def _run_editor(self, args: list[str]) -> str:
         editor_path = self._get_editor_path()
         if not os.path.exists(editor_path):

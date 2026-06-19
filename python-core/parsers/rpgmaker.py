@@ -61,6 +61,22 @@ _DB_FILES: list[tuple[str, list[tuple[str, str]]]] = [
 class RpgMakerParser(BaseParser):
     engine = "rpgmaker"
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "RPG MAKER CONTROL CODES: the following sequences are engine commands — "
+            "copy them into the translation EXACTLY, never translate or remove them:\n"
+            "  \\V[n]  — variable value (a number supplied at runtime)\n"
+            "  \\N[n]  — actor name\n"
+            "  \\P[n]  — party member name\n"
+            "  \\G     — currency symbol\n"
+            "  \\C[n]  — text colour change\n"
+            "  \\I[n]  — item icon\n"
+            "  \\{    \\}  — font size increase / decrease\n"
+            "  \\!  \\>  \\<  \\^  \\|  \\. — wait / instant / pause codes\n"
+            "STYLE: item names, skill names, and status labels must be SHORT and punchy "
+            "(they render in fixed table cells). Prefer a crisp noun over a verbose phrase."
+        )
+
     # --- detection --------------------------------------------------------
     @staticmethod
     def detect(root: str) -> bool:

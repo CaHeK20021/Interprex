@@ -51,7 +51,7 @@ from providers import (
     get_provider,
     list_providers,
 )
-from providers.base import build_prompt
+from providers.base import build_prompt  # noqa: F401 — kept for sidecar test tooling
 
 PORT = 8723  # mirror SIDECAR_PORT in src/lib/ipc.ts
 _should_pause = False

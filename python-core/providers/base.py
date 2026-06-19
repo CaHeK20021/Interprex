@@ -76,37 +76,25 @@ class TranslateResult:
     usage: Usage
 
 
-SYSTEM_INSTRUCTION = (
+# Core system prompt — sent for EVERY engine. Contains only universal rules:
+# JSON contract, casing, gender-neutral wording, escape sequences.
+# Engine-specific rules (fixed-width captions, control codes, tone, format
+# specifiers) are added per-engine via BaseParser.engine_prompt_addon().
+_SYSTEM_CORE = (
     "You are a professional game-localization translator. Translate each source string into {lang}.\n"
     "Input is a JSON object mapping ids to objects with a 'text' field and an optional 'context' field.\n"
     "The 'context' field provides metadata (e.g. speaker name, UI location) to help determine the correct "
     "gender, grammatical forms, and tone. Do NOT translate the context itself.\n"
-    "Label in context is the current scene name (e.g. 'romance' -> use close tone / 'ты'; 'dm' -> use chat slang). "
-    "Adjust tone to match the scene. If the scene is unclear, translate normally.\n"
-    "Preserve all in-game control codes, escape sequences, and placeholders EXACTLY as they appear "
-    "(e.g. \\n, \\., \\C[1], %1, {{name}}, <i>). Do not translate text inside such codes. Keep the tone "
-    "natural for a player.\n"
     "CRITICAL: Strictly match the letter casing and capitalization of the source text (capitalized words, UPPERCASE terms). Never change capitalization.\n"
     "Do not resolve escape characters; if the source contains a literal '\\n', keep exactly '\\n' in the translation "
     "instead of inserting a real newline.\n"
     "UNKNOWN GENDER: when the target language marks gender on past-tense verbs or adjectives (Russian, Spanish, "
-    "French, German, Portuguese, …) and the source text does NOT make the subject's gender clear (e.g. a reusable "
+    "French, German, Portuguese, \u2026) and the source text does NOT make the subject's gender clear (e.g. a reusable "
     "line like 'HAS BEEN EXECUTED' shown for different characters, or referring to the player), choose a "
-    "GENDER-NEUTRAL wording instead of writing clumsy dual forms like 'казнён(а)' or 'executed/a'. Rephrase with a "
-    "noun or impersonal construction that carries no gender. Example: 'HAS BEEN EXECUTED' -> 'КАЗНЬ СВЕРШЕНА' or "
-    "'ПРИГОВОР ПРИВЕДЁН В ИСПОЛНЕНИЕ' (never 'КАЗНЁН(А)'). Only use a specific gendered form when the context "
+    "GENDER-NEUTRAL wording instead of writing clumsy dual forms like '\u043a\u0430\u0437\u043d\u0451\u043d(\u0430)' or 'executed/a'. Rephrase with a "
+    "noun or impersonal construction that carries no gender. Example: 'HAS BEEN EXECUTED' -> '\u041a\u0410\u0417\u041d\u042c \u0421\u0412\u0415\u0420\u0428\u0415\u041d\u0410' or "
+    "'\u041f\u0420\u0418\u0413\u041e\u0412\u041e\u0420 \u041f\u0420\u0418\u0412\u0415\u0414\u0401\u041d \u0412 \u0418\u0421\u041f\u041e\u041b\u041d\u0415\u041d\u0418\u0415' (never '\u041a\u0410\u0417\u041d\u0401\u041d(\u0410)'). Only use a specific gendered form when the context "
     "field or the text itself makes the gender certain.\n"
-    "FIXED-WIDTH CAPTIONS: some items carry a fixed_width flag and constraints like max_chars and/or max_pixels. "
-    "These render inside a fixed-size UI box (a button or menu choice). Prefer a translation that fits the limits. "
-    "If max_pixels is specified, estimate the visual width (Cyrillic glyphs are ~10-20% wider than Latin) and try to stay within it. "
-    "CRITICAL — NEVER ABBREVIATE OR TRUNCATE A WORD: do NOT write 'Сох' for 'Сохранение', 'Настр.' for 'Настройки', "
-    "'Прод.' for 'Продолжить'. A single word MUST always be spelled out in full, even if it would exceed the limit — the "
-    "app shrinks the font to make a whole word fit, so a full word that is slightly too long is CORRECT and a clipped/"
-    "abbreviated word is WRONG. Only when the caption is THREE OR MORE words may you shorten it, and only by rephrasing "
-    "with a shorter synonym or dropping filler — never by abbreviating. "
-    "Example: 'Start a New Game' (3+ words) -> 'Новая игра' (rephrased, fine). "
-    "Example: 'Save' (1 word) -> 'Сохранение' in full (NOT 'Сохр.' or 'Сох'), even if longer than the box. "
-    "These limits are constraints to RESPECT, never text to translate.\n"
     "Return ONLY a JSON object containing an 'items' array, where each item has 'id' (from the input) "
     "and 'translated' (the translated string). Example:\n"
     "{{\n"
@@ -117,12 +105,35 @@ SYSTEM_INSTRUCTION = (
     "Do NOT wrap the JSON in markdown code blocks (e.g., ```json) and do not write any explanations."
 )
 
+# Backward-compat alias — selftest.py imports SYSTEM_INSTRUCTION by name and
+# checks that "GENDER-NEUTRAL" is present in it. That rule lives in _SYSTEM_CORE.
+# fixed_width / max_chars rules were moved to renpy.py engine_prompt_addon().
+SYSTEM_INSTRUCTION = _SYSTEM_CORE
+
 
 def build_prompt(items: list[TranslateItem], lang: str,
-                 glossary: dict[str, str]) -> str:
+                 glossary: dict[str, str], engine: str = "") -> str:
     """One prompt for a whole batch. Keyed by id both ways so the mapping back
-    is unambiguous regardless of order or reworded output."""
-    lines = [SYSTEM_INSTRUCTION.format(lang=lang), ""]
+    is unambiguous regardless of order or reworded output.
+
+    `engine` — when non-empty, the matching parser's engine_prompt_addon() is
+    appended after the core instructions. Unknown or empty engine degrades
+    gracefully to the core-only prompt (no crash)."""
+    lines = [_SYSTEM_CORE.format(lang=lang), ""]
+
+    # Engine-specific instructions: load the parser's addon and insert it after
+    # the core. The import is local to avoid a circular dependency at module load
+    # (providers imports nothing from parsers at the top level).
+    if engine:
+        try:
+            from parsers import get_parser
+            addon = get_parser(engine).engine_prompt_addon()
+            if addon:
+                lines.append(addon)
+                lines.append("")
+        except Exception:
+            pass  # unknown engine or import error — degrade to core-only
+
     if glossary:
         lines.append("Glossary (use these translations consistently):")
         for src, dst in glossary.items():
@@ -371,12 +382,23 @@ class BaseProvider(ABC):
         local user usually doesn't have to pick. Must never raise."""
         return ""
 
-    def translate(self, items: list[TranslateItem], lang: str,
-                  glossary: dict[str, str],
-                  cfg: ProviderConfig) -> TranslateResult:
-        if not items:
-            return TranslateResult({}, Usage())
-        prompt = build_prompt(items, lang, glossary)
+    def complete_prompt(self, prompt: str, items: list[TranslateItem],
+                        cfg: ProviderConfig) -> TranslateResult:
+        """Send a pre-built prompt string and parse the reply. Used by the
+        scheduler (Variant A): the scheduler builds the prompt with the engine
+        addon, then hands us only the raw string. The provider stays stateless
+        and engine-agnostic."""
         res = self._complete(prompt, cfg)
         translations = parse_reply(res.text, [it.id for it in items])
         return TranslateResult(translations, res.usage)
+
+    def translate(self, items: list[TranslateItem], lang: str,
+                  glossary: dict[str, str],
+                  cfg: ProviderConfig, engine: str = "") -> TranslateResult:
+        """Convenience wrapper that builds the prompt internally. Kept for
+        callers outside the scheduler (e.g. renpy_python_translator). Pass
+        engine to get engine-specific prompt instructions."""
+        if not items:
+            return TranslateResult({}, Usage())
+        prompt = build_prompt(items, lang, glossary, engine)
+        return self.complete_prompt(prompt, items, cfg)

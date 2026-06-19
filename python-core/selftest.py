@@ -2518,16 +2518,58 @@ def check_prompt_width() -> None:
     assert '"fixed_width":' not in plain, "plain item leaked a fixed_width value"
     assert TranslateItem("c", "x").max_chars == 0, "default max_chars must be 0"
 
-    # The system prompt must define the fixed-width task class by name, or the
-    # field is meaningless to the model.
-    assert "fixed_width" in SYSTEM_INSTRUCTION, "system prompt omits fixed_width"
-    assert "max_chars" in SYSTEM_INSTRUCTION, "system prompt omits max_chars"
+    # fixed_width / max_chars rules live in the Ren'Py engine addon (they only
+    # apply to Ren'Py menu choices / screen buttons, never to other engines).
+    renpy_core_prompt = build_prompt(
+        [TranslateItem("fw", "Save", max_chars=8)], "Russian", {}, engine="renpy"
+    )
+    assert "fixed_width" in renpy_core_prompt, \
+        "renpy prompt omits fixed_width rule (moved from core to renpy addon)"
+    assert "max_chars" in renpy_core_prompt, \
+        "renpy prompt omits max_chars rule (moved from core to renpy addon)"
+    # Confirm the core alone does NOT expose the fixed-width section.
+    assert "fixed_width" not in SYSTEM_INSTRUCTION, \
+        "FIXED-WIDTH was moved to renpy addon; core must not contain it"
 
     # Unknown-gender rule: the prompt must tell the model to use gender-neutral
     # wording when the subject's gender is unknown (the 'казнён(а)' problem) — for
     # any gendered target language, not just Russian.
     assert "GENDER-NEUTRAL" in SYSTEM_INSTRUCTION or "gender-neutral" in SYSTEM_INSTRUCTION, \
         "system prompt omits the unknown-gender / neutral-wording rule"
+
+    # SYSTEM_INSTRUCTION is a backward-compat alias for _SYSTEM_CORE — both must
+    # still be importable and point to the same text.
+    from providers.base import _SYSTEM_CORE
+    assert SYSTEM_INSTRUCTION is _SYSTEM_CORE, \
+        "SYSTEM_INSTRUCTION alias must equal _SYSTEM_CORE"
+
+    # Engine addon: build_prompt with engine="renpy" must include Ren'Py-specific
+    # instructions (interpolation, style tags) BEYOND the core prompt.
+    renpy_prompt = build_prompt([TranslateItem("r", "Hi [name]")], "Russian", {},
+                                engine="renpy")
+    assert "[variable_name]" in renpy_prompt or "VERBATIM" in renpy_prompt, \
+        "renpy addon not injected into prompt"
+    assert len(renpy_prompt) > len(plain), \
+        "renpy prompt should be longer than core-only prompt"
+
+    # Engine addon: rpgmaker must include control-code instructions.
+    rpg_prompt = build_prompt([TranslateItem("g", "Attack")], "Russian", {},
+                              engine="rpgmaker")
+    assert "\\V[n]" in rpg_prompt or "RPG MAKER" in rpg_prompt, \
+        "rpgmaker addon not injected into prompt"
+
+    # Graceful degradation: unknown engine and empty engine must not raise and
+    # must return the core-only prompt without an addon block.
+    base_hello = build_prompt([TranslateItem("z", "Hello")], "Russian", {})
+    empty_engine_prompt = build_prompt([TranslateItem("z", "Hello")], "Russian", {},
+                                       engine="")
+    unknown_engine_prompt = build_prompt([TranslateItem("z", "Hello")], "Russian", {},
+                                         engine="__nonexistent_engine__")
+    assert empty_engine_prompt == base_hello, \
+        "empty engine should produce same prompt as no-engine call"
+    assert unknown_engine_prompt == base_hello, \
+        "unknown engine should degrade to core-only prompt without crashing"
+
 
 
 def check_providers() -> None:
@@ -2628,7 +2670,7 @@ def check_scheduler() -> None:
         def count_tokens(self, text, cfg):
             return None
 
-        def translate(self, batch, lang, glossary, cfg):
+        def translate(self, batch, lang, glossary, cfg, engine=""):
             if self.delay:
                 time.sleep(self.delay)
             k = cfg.api_key
@@ -2639,6 +2681,11 @@ def check_scheduler() -> None:
                 raise RuntimeError("429 Too Many Requests: rate limit exceeded")
             return TranslateResult({it.id: it.text + "_" + lang for it in batch},
                                    Usage(10, 12))
+
+        def complete_prompt(self, prompt, batch, cfg):
+            """Scheduler (Variant A) path: prompt is pre-built, delegate to
+            translate() so subclass overrides (ShortenProvider, etc.) still work."""
+            return self.translate(batch, "fake", {}, cfg)
 
     class Req:
         target_lang = "russian"

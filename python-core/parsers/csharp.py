@@ -258,6 +258,17 @@ class CSharpParser(BaseParser):
     """Parser for C# source code files (*.cs)."""
     engine = "csharp"
 
+    def engine_prompt_addon(self) -> str:
+        return (
+            "TECHNICAL STRINGS (C# / .NET APPLICATION): these strings come from a "
+            "compiled C# game or application.\n"
+            "FORMAT SPECIFIERS: preserve {0}, {1}, {name}, %s, %d and similar "
+            "patterns EXACTLY — they are filled in at runtime.\n"
+            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
+            "TONE: use a neutral, professional register suitable for UI labels and "
+            "system messages. Avoid overly literary or conversational style."
+        )
+
     @staticmethod
     def detect(root: str) -> bool:
         """True if any .cs files are present in the directory structure."""

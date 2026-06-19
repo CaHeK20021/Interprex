@@ -493,7 +493,8 @@ class TranslationScheduler:
             num_ctx=self.req.max_context_tokens,
         )
         exact = self.provider.count_tokens(
-            build_prompt(batch, self.req.target_lang, self.req.glossary), cfg
+            build_prompt(batch, self.req.target_lang, self.req.glossary,
+                         self.req.engine), cfg
         )
         if exact is None:
             return False
@@ -534,9 +535,11 @@ class TranslationScheduler:
 
         def sub_worker():
             try:
-                tr_res = self.provider.translate(
-                    batch, self.req.target_lang, self.req.glossary, cfg
+                prompt = build_prompt(
+                    batch, self.req.target_lang, self.req.glossary,
+                    self.req.engine,
                 )
+                tr_res = self.provider.complete_prompt(prompt, batch, cfg)
                 res_queue.put((True, tr_res))
             except Exception as e_thread:  # noqa: BLE001 — surfaced to retry loop
                 res_queue.put((False, e_thread))
@@ -590,7 +593,8 @@ class TranslationScheduler:
             model=req.model,
             num_ctx=req.max_context_tokens,
         )
-        prompt_chars = len(build_prompt(batch, req.target_lang, req.glossary))
+        prompt_chars = len(build_prompt(batch, req.target_lang, req.glossary,
+                                        req.engine))
         batch_tr: dict[str, str] = {}
         last_err = None
         auth_fails = 0  # consecutive auth-class failures → kill the key fast
@@ -833,9 +837,11 @@ class TranslationScheduler:
                                   max_chars=tighter)
                 )
             try:
-                retry_tr = self.provider.translate(
-                    retry_batch, self.req.target_lang, self.req.glossary, cfg
+                retry_prompt = build_prompt(
+                    retry_batch, self.req.target_lang, self.req.glossary,
+                    self.req.engine,
                 )
+                retry_tr = self.provider.complete_prompt(retry_prompt, retry_batch, cfg)
             except Exception as e_retry:  # noqa: BLE001
                 logger.error("Retry translation failed: %s", e_retry)
                 break
