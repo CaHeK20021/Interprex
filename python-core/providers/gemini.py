@@ -40,39 +40,56 @@ class GeminiProvider(BaseProvider):
         api_key = cfg.api_key or cfg.api_key_2
         if not api_key:
             return []
-        
-        resp = None
-        url = _API_ROOT
-        if self._use_proxy_fallback and cfg.base_url:
-            url = _get_proxy_url(_API_ROOT, cfg.base_url)
 
-        try:
-            resp = httpx.get(
-                url,
-                params={"pageSize": 1000},
-                headers={"x-goog-api-key": api_key, "x-provider": "gemini"},
-                timeout=60,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            if not self._use_proxy_fallback and cfg.base_url:
-                proxy_url = _get_proxy_url(_API_ROOT, cfg.base_url)
-                logger.info("Direct model list failed. Retrying via proxy: %s", proxy_url)
-                try:
-                    resp = httpx.get(
-                        proxy_url,
-                        params={"pageSize": 1000},
-                        headers={"x-goog-api-key": api_key, "x-provider": "gemini"},
-                        timeout=60,
-                    )
-                    resp.raise_for_status()
-                    self._use_proxy_fallback = True
-                except Exception as proxy_e:
-                    logger.warning("Proxy model list also failed: %s", proxy_e)
-                    return []
+        headers = {"x-goog-api-key": api_key, "x-provider": "gemini"}
+        direct_url = _API_ROOT
+
+        # Build step list: (url, timeout, is_proxy)
+        steps = []
+        if cfg.base_url:
+            proxy_url = _get_proxy_url(_API_ROOT, cfg.base_url)
+            # Proxy timeout configurations:
+            # We use connect=20.0s to allow Hugging Face Space cold starts to wake up,
+            # and read=60.0s for the first attempt.
+            timeout_proxy_1 = httpx.Timeout(connect=20.0, read=60.0, write=10.0, pool=5.0)
+            timeout_proxy_2 = httpx.Timeout(connect=20.0, read=90.0, write=10.0, pool=5.0)
+            timeout_direct = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
+
+            if self._use_proxy_fallback:
+                steps = [
+                    (proxy_url, timeout_proxy_1, True),
+                    (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
+                    (direct_url, timeout_direct, False),
+                ]
             else:
-                logger.warning("Model list request failed: %s", e)
-                return []
+                steps = [
+                    (direct_url, timeout_direct, False),
+                    (proxy_url, timeout_proxy_1, True),
+                    (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
+                ]
+        else:
+            timeout_direct = httpx.Timeout(connect=20.0, read=45.0, write=10.0, pool=5.0)
+            steps = [
+                (direct_url, timeout_direct, False)
+            ]
+
+        resp = None
+        last_err: Exception | None = None
+        for i, (url, timeout, is_proxy) in enumerate(steps):
+            try:
+                logger.info("Attempting model list query %d/%d to %s (timeout=%s)", i+1, len(steps), url, timeout)
+                resp = httpx.get(url, params={"pageSize": 1000}, headers=headers, timeout=timeout)
+                resp.raise_for_status()
+                self._use_proxy_fallback = is_proxy
+                break
+            except Exception as e:
+                last_err = e
+                logger.info("Model list query attempt %d failed via %s: %s", i+1, "proxy" if is_proxy else "direct", e)
+                resp = None
+
+        if resp is None:
+            logger.warning("Model list request failed on all paths: %s", last_err)
+            return []
 
         try:
             out: list[str] = []
@@ -154,8 +171,9 @@ class GeminiProvider(BaseProvider):
             ]
         }
         resp = None
+        timeout = httpx.Timeout(200.0, connect=20.0)
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=200)
+            resp = httpx.post(url, json=body, headers=headers, timeout=timeout)
             if resp.is_error:
                 try:
                     err_data = resp.json()
@@ -170,7 +188,7 @@ class GeminiProvider(BaseProvider):
                     if not self._use_proxy_fallback and cfg.base_url:
                         proxy_url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
                         logger.info("Direct Gemini API call failed with status %d: %s. Retrying via proxy: %s", resp.status_code, msg, proxy_url)
-                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=200)
+                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=timeout)
                         if not resp.is_error:
                             self._use_proxy_fallback = True
                     else:
@@ -183,7 +201,7 @@ class GeminiProvider(BaseProvider):
                     proxy_url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
                     logger.info("Direct Gemini API connection failed: %s. Retrying via proxy: %s", e, proxy_url)
                     try:
-                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=200)
+                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=timeout)
                         if not resp.is_error:
                             self._use_proxy_fallback = True
                     except Exception as proxy_e:
