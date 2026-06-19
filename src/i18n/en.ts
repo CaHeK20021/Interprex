@@ -124,6 +124,11 @@ const en = {
   phase_deleting_backup: "deleting backup",
   autofixFixed: (n: number) => `Autofix repaired ${n} line(s) after translation.`,
 
+  // overflow risk + engine-lint
+  riskDialogueTitle: "Dialogue overflow risk:",
+  lintHazardTitle: (n: number) =>
+    `The game engine's own check found ${n} real issue(s) in the translation:`,
+
   // progress
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} strings`,
@@ -218,6 +223,14 @@ const en = {
   proxyModeDirect: "direct (no proxy needed)",
   proxyModeProxy: "via proxy",
   proxyModeUnknown: "unreachable both ways",
+
+  // auto-update overlay
+  updateChecking: "Checking for updates…",
+  updateDownloading: "Downloading update {version}…",
+  updateReady: "Update ready. Restarting…",
+  updateLatest: "You're up to date",
+  updateError: "Update check failed",
+  updateProgress: "{downloaded} / {total} MB",
 };
 
 export default en;

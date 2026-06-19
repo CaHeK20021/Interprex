@@ -53,3 +53,7 @@ Thumbs.db
 
 # ---- Claude dev tool ----
 .claude/
+
+# ---- Tauri signing keys ----
+~/
+~/.tauri/

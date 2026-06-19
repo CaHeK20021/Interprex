@@ -18,8 +18,12 @@ import {
   translateRenpyPython,
   autofixTranslation,
   proxyAutocheck,
+  renpyRisk,
+  renpyLint,
   type ModInfo,
   type ProxyAutocheckResult,
+  type RenpyRiskReport,
+  type RenpyLintResult,
 } from "./lib/ipc";
 import {
   translateBatch,
@@ -38,6 +42,7 @@ import {
 } from "./lib/settings";
 import type { Engine, FontStyle, ProjectFile, TranslationString } from "./lib/types";
 import FolderPicker from "./FolderPicker";
+import UpdateOverlay from "./UpdateOverlay";
 import {
   useT,
   setUiLang,
@@ -139,6 +144,10 @@ export default function App() {
   const [project, setProject] = useState<ProjectFile | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [hasBackup, setHasBackup] = useState<boolean>(false);
+  // Ren'Py text-overflow risk verdict (data-driven, from the game's own layout).
+  const [riskReport, setRiskReport] = useState<RenpyRiskReport | null>(null);
+  // Engine-lint result after a translate (real hazards our injection may cause).
+  const [lintResult, setLintResult] = useState<RenpyLintResult | null>(null);
   const [target, setTarget] = useState<TargetLang>(
     () => loadSetting("targetLang", "Russian") as TargetLang,
   );
@@ -261,6 +270,10 @@ export default function App() {
   const [pythonTranslating, setPythonTranslating] = useState(false);
   const [pythonLogsOpen, setPythonLogsOpen] = useState(false);
   const [pyLogsMouseDown, setPyLogsMouseDown] = useState(false);
+  const updateBusyRef = useRef(false);
+  const setUpdateBusyTracked = (v: boolean) => {
+    updateBusyRef.current = v;
+  };
   // Python-string progress. `stage` distinguishes the two passes (classify =
   // deciding what to translate, translate = the actual work) so the bar resetting
   // to 0 between them reads as a NEW stage, not a regress. Each stage's total is
@@ -324,6 +337,12 @@ export default function App() {
         event.preventDefault();
         if (isClosingInProgress) return;
         isClosingInProgress = true;
+
+        // Block close during auto-update download.
+        if (updateBusyRef.current) {
+          isClosingInProgress = false;
+          return;
+        }
 
         // If a translation is running, abort it immediately.
         if (abortControllerRef.current) {
@@ -601,6 +620,13 @@ export default function App() {
       setProject(proj);
       const { has_backup } = await getBackupStatus(picked);
       setHasBackup(has_backup);
+      // Data-driven text-overflow risk verdict (Ren'Py only; read-only, no engine
+      // run). Best-effort — a failure here must never block extraction.
+      setRiskReport(null);
+      setLintResult(null);
+      if (detected === "renpy") {
+        renpyRisk(picked).then(setRiskReport).catch(() => setRiskReport(null));
+      }
       setPhase("idle");
     } catch (e) {
       fail(e);
@@ -1196,6 +1222,17 @@ export default function App() {
       setHasBackup(has_backup);
       setPhase("idle");
     }
+
+    // 5. Engine-oracle lint (Ren'Py only, non-mods). The game's OWN engine
+    //    validates our injected tl/ files and surfaces real hazards our static
+    //    validators can't (e.g. a translated "100%" = an unterminated format
+    //    code). Best-effort + slow (spawns the engine), so it runs last and never
+    //    blocks the pipeline; absent on a machine without the bundled SDK.
+    if (engine === "renpy" && translationMode !== "mods") {
+      renpyLint(activeRoot, String(target))
+        .then((r) => setLintResult(r.available ? r : null))
+        .catch(() => setLintResult(null));
+    }
   }
 
   async function handleRestoreBackup() {
@@ -1348,6 +1385,8 @@ export default function App() {
 
   return (
     <main className="app">
+      <UpdateOverlay onStateChange={setUpdateBusyTracked} />
+
       <header className="topbar">
         <div className="brand">
           <h1 className={`brand-title engine-${engine || "none"}`}>Interprex</h1>
@@ -1630,6 +1669,35 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Data-driven text-overflow risk verdict (Ren'Py). Only surfaced when the
+          game's own layout says a translation can clip (fixed textbox) — we stay
+          silent on the common "auto/scroll => no risk" case so it's not noise. */}
+      {engine === "renpy" && riskReport &&
+        (riskReport.dialogue_overflow_risk === "high" ||
+         riskReport.dialogue_overflow_risk === "low") && (
+        <div className={`risk-banner risk-${riskReport.dialogue_overflow_risk}`}>
+          <strong>{t("riskDialogueTitle") as string}</strong>{" "}
+          {riskReport.dialogue_reason}
+        </div>
+      )}
+
+      {/* Engine-oracle lint result after a translate: the game's OWN engine found
+          real hazards in our injected files (e.g. a translated "100%"). Only
+          actionable findings are shown; benign tl/-lint noise is filtered out. */}
+      {engine === "renpy" && lintResult && lintResult.available &&
+        lintResult.actionable_count > 0 && (
+        <div className="risk-banner risk-high">
+          <strong>{t("lintHazardTitle")(lintResult.actionable_count) as string}</strong>
+          <ul className="lint-findings">
+            {lintResult.ours.filter((f) => f.actionable).slice(0, 6).map((f, i) => (
+              <li key={i}>
+                <code>{f.file.split("/").pop()}:{f.line}</code> {f.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Resting coverage bar: shown when a project is loaded but no translation
           is running, so "X / Y translated" is visible the moment you pick a

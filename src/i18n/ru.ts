@@ -122,6 +122,11 @@ const ru: Strings = {
   phase_deleting_backup: "удаляю бэкап",
   autofixFixed: (n: number) => `Автофикс исправил ${n} строк(и) после перевода.`,
 
+  // overflow risk + engine-lint
+  riskDialogueTitle: "Риск переполнения диалогов:",
+  lintHazardTitle: (n: number) =>
+    `Проверка движком самой игры нашла ${n} реальную(ых) проблему(ы) в переводе:`,
+
   // progress
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} строк`,
@@ -215,6 +220,14 @@ const ru: Strings = {
   proxyModeDirect: "напрямую (прокси не нужен)",
   proxyModeProxy: "через прокси",
   proxyModeUnknown: "недоступно ни так, ни так",
+
+  // auto-update overlay
+  updateChecking: "Проверка обновлений…",
+  updateDownloading: "Скачивание обновления {version}…",
+  updateReady: "Обновление готово. Перезапуск…",
+  updateLatest: "У вас последняя версия",
+  updateError: "Не удалось проверить обновления",
+  updateProgress: "{downloaded} / {total} МБ",
 };
 
 export default ru;

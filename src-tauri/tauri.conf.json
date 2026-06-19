@@ -22,6 +22,12 @@
       "csp": null
     }
   },
+  "updater": {
+    "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1NkE5MTRGMTg2RjJBRjgKUldUNEttOFlUNUZxdFVWTVZrcHdONkZJV1YxQ3NQTU5hcFg2bVJySklHS1U3UWcyUUVLMUo2VnEK",
+    "endpoints": [
+      "https://api.github.com/repos/CaHeK20021/interprex/releases/latest"
+    ]
+  },
   "bundle": {
     "active": true,
     "targets": "nsis",

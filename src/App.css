@@ -408,6 +408,36 @@ td.tr-edit textarea {
   letter-spacing: 0.5px;
 }
 
+/* Text-overflow risk + engine-lint banner. Surfaced only when there's something
+   the user can act on (high/low risk, or real lint hazards) — never on the calm
+   "no risk" path, so it reads as a signal, not chrome. */
+.risk-banner {
+  margin: 10px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.45;
+  border: 1px solid var(--line);
+}
+.risk-banner strong { display: inline-block; margin-right: 6px; }
+.risk-banner.risk-high {
+  background: color-mix(in srgb, #e5484d 12%, transparent);
+  border-color: color-mix(in srgb, #e5484d 40%, var(--line));
+}
+.risk-banner.risk-low {
+  background: color-mix(in srgb, #f5a623 12%, transparent);
+  border-color: color-mix(in srgb, #f5a623 40%, var(--line));
+}
+.lint-findings {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.lint-findings li { margin: 2px 0; }
+.lint-findings code {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
 /* Secondary/neutral style for Discard Backup */
 button.btn-secondary {
   border-color: var(--line);
@@ -1470,5 +1500,105 @@ input[type="checkbox"]:disabled {
 .fp-sidebar:hover .fp-sidebar-text {
   opacity: 1;
   pointer-events: auto;
+}
+
+/* ── Auto-update overlay ─────────────────────────────────────────────── */
+.update-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(15, 17, 21, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(6px);
+}
+
+.update-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: 48px 56px;
+  border-radius: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+  min-width: 360px;
+}
+
+.update-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.update-checkmark {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #34d058;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.update-checkmark::after {
+  content: "";
+  width: 12px;
+  height: 20px;
+  border: solid var(--bg);
+  border-width: 0 3px 3px 0;
+  transform: rotate(45deg) translate(-2px, -2px);
+}
+
+.update-error-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #f44336;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: #fff;
+  font-weight: bold;
+}
+
+.update-text {
+  font-size: 16px;
+  color: var(--text);
+  text-align: center;
+}
+
+.update-text-error {
+  color: #f44336;
+}
+
+.update-progressbar {
+  width: 100%;
+  height: 6px;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.update-progressfill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.15s ease-out;
+}
+
+.update-progress-text {
+  font-size: 13px;
+  color: var(--muted);
 }
 
