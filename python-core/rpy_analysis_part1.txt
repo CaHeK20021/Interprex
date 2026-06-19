@@ -1,0 +1,4 @@
+  File "C:\Users\Alexandr\Desktop\Interprex\python-core\extract_rpy_detailed.py", line 62
+    is_technical = any(kw in lower for kw in technical_keywords) or ('/' in string) or ('\' in string)
+                                                                                        ^
+SyntaxError: unterminated string literal (detected at line 62); perhaps you escaped the end quote?

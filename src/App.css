@@ -1,0 +1,1474 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --line: #262b36;
+  --text: #e7ebf2;
+  --muted: #8a93a6;
+  --accent: #5b8cff;
+}
+
+/* The two fonts the font-style toggle previews in. Each label is rendered in the
+   ACTUAL font that will be embedded into the game, so the choice is honest:
+   "Smooth" shows NotoSans (what inject swaps in by default), "Pixel" shows
+   PixelOperator (the bitmap font). The .ttf files are copied from
+   python-core/assets/fonts so both sides use the same source. */
+@font-face {
+  font-family: "PixelOperatorUI";
+  src: url("./assets/PixelOperator.ttf") format("truetype");
+  font-display: swap;
+}
+@font-face {
+  font-family: "NotoSansUI";
+  src: url("./assets/NotoSans-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+
+* { box-sizing: border-box; }
+
+/* Theme the scrollbars to match the dark panels instead of the OS default light
+   bar. Firefox uses the two-value `scrollbar-*` props; Chromium/WebKit (the
+   Tauri webview on Windows) uses the ::-webkit-scrollbar pseudo-elements. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 6px;
+  border: 2px solid var(--bg); /* inset look so the thumb floats off the edge */
+}
+*::-webkit-scrollbar-thumb:hover { background: #364052; }
+*::-webkit-scrollbar-corner { background: transparent; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  /* min-height (not height) so the page grows with its content and the WHOLE
+     document scrolls as one bar — instead of trapping the string table in its own
+     tiny inner scroll area on a short window. */
+  min-height: 100vh;
+  padding: 16px 20px;
+  gap: 12px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.topbar h1 {
+  font-size: 20px;
+  margin: 0;
+  letter-spacing: 0.5px;
+}
+/* App name tints to the active engine's accent (matches badges/progress bar),
+   with a soft glow so the brand reads as "themed to this game". */
+.brand-title {
+  color: var(--brand-color, #5b8cff);
+  text-shadow: 0 0 18px color-mix(in srgb, var(--brand-color, #5b8cff) 45%, transparent);
+  transition: color 0.25s ease, text-shadow 0.25s ease;
+}
+.brand-title.engine-rpgmaker { --brand-color: #ffa033; }
+.brand-title.engine-renpy { --brand-color: #ff66a0; }
+.brand-title.engine-godot { --brand-color: #3cd4ff; }
+.brand-title.engine-gamemaker { --brand-color: #32e06b; }
+.brand-title.engine-unity { --brand-color: #c084fc; }
+.brand-title.engine-unreal { --brand-color: #eab308; }
+.brand-title.engine-unreal4_5 { --brand-color: #f0883e; }
+.brand-title.engine-csharp { --brand-color: #818cf8; }
+.brand-title.engine-fusion { --brand-color: #2dd4bf; }
+.brand-title.engine-mmf2 { --brand-color: #fb7185; }
+.brand-title.engine-qsp { --brand-color: #f97316; }
+.brand-title.engine-i18n,
+.brand-title.engine-none { --brand-color: #5b8cff; }
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.tagline { font-size: 12px; color: var(--muted); }
+
+.topright { display: flex; align-items: center; gap: 16px; }
+
+.field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.field select,
+.field input {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.field select { cursor: pointer; }
+.field input { min-width: 160px; }
+.field input:focus,
+.field select:focus { outline: none; border-color: var(--accent); }
+
+.provider-row { padding: 6px 0; }
+.field.grow { flex: 1; }
+.field.grow input { width: 100%; min-width: 0; }
+
+/* Compact segmented toggle for the font style. Each segment previews its own
+   font so the choice is self-explanatory: "Smooth" in Noto, "Pixel" in
+   PixelOperator. Sits inline next to the target-language picker. */
+.font-style-toggle {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.font-style-toggle button {
+  background: var(--panel);
+  color: var(--muted);
+  border: none;
+  padding: 5px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: "NotoSansUI", ui-sans-serif, system-ui, sans-serif;
+}
+.font-style-toggle button + button { border-left: 1px solid var(--line); }
+.font-style-toggle button.fs-pixel {
+  /* Render the "Pixel" label in the actual bitmap font. PixelOperator's design
+     grid is 16px — it renders crisp (1:1, no anti-alias blur) ONLY at a size
+     that's a whole multiple of 16. At 14px the browser fractionally scales the
+     glyphs and smooths them, so it reads like an ordinary font. Pin to 16px and
+     kill smoothing so the pixel grid actually shows. */
+  font-family: "PixelOperatorUI", monospace;
+  font-size: 16px;
+  line-height: 1;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: unset;
+  image-rendering: pixelated;
+}
+.font-style-toggle button:hover:not(:disabled) { color: var(--text); }
+.font-style-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+.font-style-toggle button:disabled { opacity: 0.5; cursor: default; }
+
+.muted { color: var(--muted); font-style: italic; }
+
+/* Per-batch translation progress: a thin bar + "N / T strings" readout. */
+.progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+.progressbar {
+  flex: 1;
+  height: 6px;
+  background: var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.progressfill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.25s ease;
+}
+/* No countable progress (detect/extract/save): a stripe that slides across so
+   the user sees the app is working, not frozen. */
+.progressfill.indeterminate {
+  width: 35%;
+  transition: none;
+  animation: slide 1.1s ease-in-out infinite;
+}
+@keyframes slide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
+.progresslabel {
+  font-size: 12px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.dot {
+  font-size: 12px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.dot::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #444;
+}
+.dot.up::before { background: #36d399; }
+.dot.down::before { background: #f87272; }
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+
+button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: default; }
+
+.badge {
+  font-size: 12px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.phase { font-size: 13px; color: var(--muted); }
+
+.path {
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.notice {
+  font-size: 13px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tablewrap {
+  /* No inner scroll: the table grows to its full height and the PAGE scrolls as
+     one. overflow-x stays for very wide rows; the sticky header sticks to the
+     viewport top during the page scroll. */
+  overflow-x: auto;
+  overflow-y: visible;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: 600;
+}
+tbody td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+td.empty { color: var(--muted); }
+td.where { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+.hint {
+  color: var(--muted);
+  text-align: center;
+  padding: 40px;
+  font-size: 14px;
+}
+
+/* Table pager: prev/next, a typeable page box, and the visible row range. */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* Stick to the bottom of the viewport so the page buttons are ALWAYS reachable
+     — without it, switching to a shorter page shrinks the document and the pager
+     jumps up out of view, forcing a scroll back down to click next. The whole
+     document scrolls (see .app min-height note), so sticky pins to the viewport.
+     Negative side margins + padding span the full width over .app's 20px padding
+     so the bar reads as a solid footer, not a floating strip. */
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin: 0 -20px;
+  padding: 10px 20px;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+.pager button { padding: 4px 12px; font-size: 14px; line-height: 1; }
+.pagerlabel { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.pagerinput {
+  width: 64px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 13px;
+}
+.pagerinput:focus { outline: none; border-color: var(--accent); }
+/* Hide the native number spinner arrows — the prev/next buttons are the control;
+   the box is for typing a page directly. */
+.pagerinput::-webkit-inner-spin-button,
+.pagerinput::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.pagerinput { -moz-appearance: textfield; appearance: textfield; }
+.pagerrange {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ---- Inline translation editing ----------------------------------------- */
+
+/* Normal (non-editing) translation cells: pointer cursor signals they're
+   clickable. Hover gives a subtle highlight so the user knows which row
+   they're about to edit. */
+td.tr-cell {
+  cursor: pointer;
+}
+td.tr-cell:hover {
+  background: rgba(91, 140, 255, 0.07);
+}
+td.tr-cell.empty {
+  color: var(--muted);
+}
+
+/* When a cell is being edited the padding collapses so the textarea flush-fills
+   the cell without any visible gap or double border. */
+td.tr-edit {
+  padding: 0;
+  cursor: text;
+}
+td.tr-edit textarea {
+  display: block;
+  width: 100%;
+  min-height: 2.4rem;
+  padding: 7px 11px;
+  background: var(--panel);
+  color: var(--text);
+  border: 2px solid var(--accent);
+  border-radius: 0;
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+  outline: none;
+}
+
+/* ---- Backup and Restore Styling ---- */
+
+.backup-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  /* Push right only when it fits on the same row; once the toolbar wraps it
+     flows to the start of the new line instead of being stranded far-right. */
+  margin-left: auto;
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  padding: 5px 10px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.backup-label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Secondary/neutral style for Discard Backup */
+button.btn-secondary {
+  border-color: var(--line);
+  color: var(--muted);
+}
+button.btn-secondary:hover:not(:disabled) {
+  border-color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+}
+
+/* Warning/danger style for Restore Original */
+button.btn-danger {
+  border-color: rgba(248, 114, 114, 0.4);
+  color: #f87272;
+}
+button.btn-danger:hover:not(:disabled) {
+  border-color: #f87272;
+  background: rgba(248, 114, 114, 0.1);
+}
+
+/* ---- Custom Confirmation Modal ---- */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(10, 11, 14, 0.75);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease-out;
+}
+
+.modal-content {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 440px;
+  width: 90%;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  animation: scaleUp 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.modal-content h2 {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 18px;
+  color: #f87272; /* highlight warning */
+}
+
+.modal-content p {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 24px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.modal-actions button {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scaleUp {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+/* Mode Switcher */
+.mode-switcher {
+  display: inline-flex;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 2px;
+}
+.mode-btn {
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.mode-btn:hover:not(.active):not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+}
+.mode-btn.active {
+  background: var(--accent);
+  color: #0f1115;
+}
+
+/* Mod Panel */
+.mods-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 4px;
+}
+.mods-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.mods-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.mods-panel-actions {
+  display: flex;
+  gap: 8px;
+}
+.mods-panel-actions button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+.mods-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+  max-height: 150px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.mod-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+.mod-item:hover {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.01);
+}
+.mod-item.selected {
+  border-color: var(--accent);
+}
+.mod-item input[type="checkbox"] {
+  cursor: pointer;
+  margin: 0;
+  width: 14px;
+  height: 14px;
+}
+.mod-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.mod-engine-badge {
+  font-size: 10px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--accent);
+  border: 1px solid var(--line);
+  text-transform: uppercase;
+}
+.mods-warn {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(248, 114, 114, 0.1);
+  border: 1px solid rgba(248, 114, 114, 0.2);
+  color: #f87272;
+  font-size: 12px;
+}
+
+/* Engine specific badge colors */
+.badge.engine-rpgmaker, .mod-engine-badge.engine-rpgmaker {
+  color: #ffa033;
+  border-color: rgba(255, 160, 51, 0.3);
+  background: rgba(255, 160, 51, 0.06);
+}
+.badge.engine-renpy, .mod-engine-badge.engine-renpy {
+  color: #ff66a0;
+  border-color: rgba(255, 102, 160, 0.3);
+  background: rgba(255, 102, 160, 0.06);
+}
+.badge.engine-godot, .mod-engine-badge.engine-godot {
+  color: #3cd4ff;
+  border-color: rgba(60, 212, 255, 0.3);
+  background: rgba(60, 212, 255, 0.06);
+}
+.badge.engine-gamemaker, .mod-engine-badge.engine-gamemaker {
+  color: #32e06b;
+  border-color: rgba(50, 224, 107, 0.3);
+  background: rgba(50, 224, 107, 0.06);
+}
+.badge.engine-unity, .mod-engine-badge.engine-unity {
+  color: #c084fc;
+  border-color: rgba(192, 132, 252, 0.3);
+  background: rgba(192, 132, 252, 0.06);
+}
+.badge.engine-unreal, .mod-engine-badge.engine-unreal {
+  color: #eab308;
+  border-color: rgba(234, 179, 8, 0.3);
+  background: rgba(234, 179, 8, 0.06);
+}
+.badge.engine-unreal4_5, .mod-engine-badge.engine-unreal4_5 {
+  color: #f0883e;
+  border-color: rgba(240, 136, 62, 0.3);
+  background: rgba(240, 136, 62, 0.06);
+}
+.badge.engine-csharp, .mod-engine-badge.engine-csharp {
+  color: #818cf8;
+  border-color: rgba(129, 140, 248, 0.3);
+  background: rgba(129, 140, 248, 0.06);
+}
+.badge.engine-i18n, .mod-engine-badge.engine-i18n {
+  color: #5b8cff;
+  border-color: rgba(91, 140, 255, 0.3);
+  background: rgba(91, 140, 255, 0.06);
+}
+.badge.engine-fusion, .mod-engine-badge.engine-fusion {
+  color: #2dd4bf;
+  border-color: rgba(45, 212, 191, 0.3);
+  background: rgba(45, 212, 191, 0.06);
+}
+.badge.engine-mmf2, .mod-engine-badge.engine-mmf2 {
+  color: #fb7185;
+  border-color: rgba(251, 113, 133, 0.3);
+  background: rgba(251, 113, 133, 0.06);
+}
+.badge.engine-qsp, .mod-engine-badge.engine-qsp {
+  color: #f97316;
+  border-color: rgba(249, 115, 22, 0.3);
+  background: rgba(249, 115, 22, 0.06);
+}
+
+/* Engine specific progress fill colors */
+.progressfill.engine-rpgmaker { background: #ffa033; }
+.progressfill.engine-renpy { background: #ff66a0; }
+.progressfill.engine-godot { background: #3cd4ff; }
+.progressfill.engine-gamemaker { background: #32e06b; }
+.progressfill.engine-unity { background: #c084fc; }
+.progressfill.engine-unreal { background: #eab308; }
+.progressfill.engine-unreal4_5 { background: #f0883e; }
+.progressfill.engine-csharp { background: #818cf8; }
+.progressfill.engine-fusion { background: #2dd4bf; }
+.progressfill.engine-mmf2 { background: #fb7185; }
+.progressfill.engine-qsp { background: #f97316; }
+.progressfill.engine-i18n, .progressfill.engine-none { background: #5b8cff; }
+
+/* Engine specific progress label colors */
+.progresslabel.engine-rpgmaker { color: #ffa033; }
+.progresslabel.engine-renpy { color: #ff66a0; }
+.progresslabel.engine-godot { color: #3cd4ff; }
+.progresslabel.engine-gamemaker { color: #32e06b; }
+.progresslabel.engine-unity { color: #c084fc; }
+.progresslabel.engine-unreal { color: #eab308; }
+.progresslabel.engine-unreal4_5 { color: #f0883e; }
+.progresslabel.engine-csharp { color: #818cf8; }
+.progresslabel.engine-fusion { color: #2dd4bf; }
+.progresslabel.engine-mmf2 { color: #fb7185; }
+.progresslabel.engine-qsp { color: #f97316; }
+.progresslabel.engine-i18n, .progresslabel.engine-none { color: #5b8cff; }
+
+/* Engine specific mode switcher borders and active button backgrounds */
+.mode-switcher.engine-rpgmaker {
+  background: rgba(255, 160, 51, 0.04);
+  border-color: rgba(255, 160, 51, 0.25);
+}
+.mode-switcher.engine-rpgmaker .mode-btn.active { background: #ffa033; color: #0f1115; }
+
+.mode-switcher.engine-renpy {
+  background: rgba(255, 102, 160, 0.04);
+  border-color: rgba(255, 102, 160, 0.25);
+}
+.mode-switcher.engine-renpy .mode-btn.active { background: #ff66a0; color: #0f1115; }
+
+.mode-switcher.engine-godot {
+  background: rgba(60, 212, 255, 0.04);
+  border-color: rgba(60, 212, 255, 0.25);
+}
+.mode-switcher.engine-godot .mode-btn.active { background: #3cd4ff; color: #0f1115; }
+
+.mode-switcher.engine-gamemaker {
+  background: rgba(50, 224, 107, 0.04);
+  border-color: rgba(50, 224, 107, 0.25);
+}
+.mode-switcher.engine-gamemaker .mode-btn.active { background: #32e06b; color: #0f1115; }
+
+.mode-switcher.engine-unity {
+  background: rgba(192, 132, 252, 0.04);
+  border-color: rgba(192, 132, 252, 0.25);
+}
+.mode-switcher.engine-unity .mode-btn.active { background: #c084fc; color: #0f1115; }
+
+.mode-switcher.engine-unreal {
+  background: rgba(234, 179, 8, 0.04);
+  border-color: rgba(234, 179, 8, 0.25);
+}
+.mode-switcher.engine-unreal .mode-btn.active { background: #eab308; color: #0f1115; }
+
+.mode-switcher.engine-csharp {
+  background: rgba(129, 140, 248, 0.04);
+  border-color: rgba(129, 140, 248, 0.25);
+}
+.mode-switcher.engine-csharp .mode-btn.active { background: #818cf8; color: #0f1115; }
+
+.mode-switcher.engine-fusion {
+  background: rgba(45, 212, 191, 0.04);
+  border-color: rgba(45, 212, 191, 0.25);
+}
+.mode-switcher.engine-fusion .mode-btn.active { background: #2dd4bf; color: #0f1115; }
+
+.mode-switcher.engine-mmf2 {
+  background: rgba(251, 113, 133, 0.04);
+  border-color: rgba(251, 113, 133, 0.25);
+}
+.mode-switcher.engine-mmf2 .mode-btn.active { background: #fb7185; color: #0f1115; }
+
+.mode-switcher.engine-qsp {
+  background: rgba(249, 115, 22, 0.04);
+  border-color: rgba(249, 115, 22, 0.25);
+}
+.mode-switcher.engine-qsp .mode-btn.active { background: #f97316; color: #0f1115; }
+
+.mode-switcher.engine-i18n, .mode-switcher.engine-none {
+  background: var(--panel);
+  border-color: var(--line);
+}
+.mode-switcher.engine-i18n .mode-btn.active, .mode-switcher.engine-none .mode-btn.active { background: #5b8cff; color: #0f1115; }
+
+/* Engine specific API key status message colors */
+.key-status-msg {
+  color: var(--accent);
+}
+.key-status-msg.engine-rpgmaker { color: #ffa033; }
+.key-status-msg.engine-renpy { color: #ff66a0; }
+.key-status-msg.engine-godot { color: #3cd4ff; }
+.key-status-msg.engine-gamemaker { color: #32e06b; }
+.key-status-msg.engine-unity { color: #c084fc; }
+.key-status-msg.engine-unreal { color: #eab308; }
+.key-status-msg.engine-csharp { color: #818cf8; }
+.key-status-msg.engine-fusion { color: #2dd4bf; }
+.key-status-msg.engine-mmf2 { color: #fb7185; }
+.key-status-msg.engine-qsp { color: #f97316; }
+.key-status-msg.engine-i18n, .key-status-msg.engine-none { color: #5b8cff; }
+
+/* ── Gear / proxy-settings button ─────────────────────────────────────────── */
+.gear-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s, transform 0.25s;
+}
+.gear-btn:hover { color: var(--text); transform: rotate(45deg); }
+.gear-btn:active { transform: rotate(90deg); }
+
+/* ── Proxy settings panel ─────────────────────────────────────────────────── */
+.proxy-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: fadeSlideDown 0.18s ease;
+}
+
+@keyframes fadeSlideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.proxy-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.proxy-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.3px;
+}
+.proxy-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  padding: 2px 6px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.proxy-close-btn:hover { color: var(--text); background: var(--line); }
+
+.proxy-url-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.proxy-url-label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.proxy-url-input-wrap {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.proxy-url-input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text);
+  transition: border-color 0.15s;
+}
+.proxy-url-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.proxy-url-hint {
+  font-size: 11px;
+  color: var(--muted);
+  opacity: 0.75;
+}
+.proxy-save-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 0.15s;
+}
+.proxy-save-btn:hover { opacity: 0.85; }
+.proxy-save-btn:disabled { opacity: 0.5; cursor: default; }
+
+.proxy-check-results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+}
+.proxy-check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.proxy-check-icon { flex: 0 0 auto; }
+.proxy-check-name { font-weight: 600; }
+.proxy-check-verdict { margin-left: auto; opacity: 0.75; }
+.proxy-check-fail { font-size: 13px; color: #e06c6c; }
+.proxy-check-done { align-self: flex-end; margin-top: 4px; }
+
+/* info toggle button */
+.proxy-info-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(91,140,255,0.08);
+  border: 1px solid rgba(91,140,255,0.2);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #7aa4ff;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s, border-color 0.15s;
+  width: 100%;
+}
+.proxy-info-toggle:hover {
+  background: rgba(91,140,255,0.14);
+  border-color: rgba(91,140,255,0.4);
+}
+.proxy-info-icon {
+  font-size: 15px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.proxy-info-chevron {
+  margin-left: auto;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+/* expandable info body */
+.proxy-info-body {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: fadeSlideDown 0.15s ease;
+}
+.proxy-info-step {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.55;
+}
+.proxy-info-link {
+  color: #7aa4ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.proxy-info-link:hover {
+  color: #a0bfff;
+}
+.proxy-info-free {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: #36d399;
+  font-weight: 600;
+}
+
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  min-width: 14px;
+  width: 14px;
+  height: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  transition: all 0.1s ease;
+  margin: 0;
+  outline: none;
+}
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked::after {
+  content: "✓";
+  color: #0f1115;
+  font-size: 10px;
+  font-weight: bold;
+}
+input[type="checkbox"]:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+
+/* --- live per-thread worker status panel (collapsible grid) --------------- */
+.workers-panel {
+  margin: 8px 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.workers-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.workers-panel-title { font-size: 12px; color: var(--muted); }
+.workers-toggle {
+  padding: 0 10px;
+  line-height: 1.6;
+  min-width: 32px;
+}
+.workers-toggle:disabled { opacity: 0.35; cursor: default; }
+/* Auto-fit columns: the grid grows by ROWS as threads are revealed, so an
+   expanded panel is exactly as tall as it needs to be (no empty space), and a
+   collapsed one shows just the first two cards. */
+.workers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 6px;
+  padding: 8px;
+  transition: max-height 0.2s ease;
+}
+/* When expanded with many threads, cap the height and scroll instead of pushing
+   the table off-screen. The global ::-webkit-scrollbar theme styles the bar to
+   match the dark panels. scrollbar-gutter keeps the cards from shifting when the
+   bar appears. */
+.workers-panel.open .workers-grid {
+  max-height: 40vh;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.worker-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  border-left: 3px solid var(--muted);
+  background: var(--bg);
+  min-width: 0;
+}
+.worker-card-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.worker-card-status {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Status dot — the at-a-glance traffic light per thread. */
+.worker-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+/* Traffic-light tones: yellow = request in flight, green = answer received,
+   red = error. Coloured left border + a subtle matching tint + the dot, so the
+   state reads instantly even at a glance across the grid. */
+.worker-card.tone-busy {
+  border-left-color: #e0a64b;
+  background: linear-gradient(0deg, rgba(224, 166, 75, 0.10), rgba(224, 166, 75, 0.10)), var(--bg);
+}
+.worker-card.tone-busy .worker-dot {
+  background: #e0a64b;
+  animation: worker-pulse 1s ease-in-out infinite;
+}
+.worker-card.tone-ok {
+  border-left-color: #41c98a;
+  background: linear-gradient(0deg, rgba(65, 201, 138, 0.12), rgba(65, 201, 138, 0.12)), var(--bg);
+}
+.worker-card.tone-ok .worker-dot { background: #41c98a; }
+.worker-card.tone-err {
+  border-left-color: #e0564b;
+  background: linear-gradient(0deg, rgba(224, 86, 75, 0.14), rgba(224, 86, 75, 0.14)), var(--bg);
+}
+.worker-card.tone-err .worker-dot { background: #e0564b; }
+/* Stopped: a thread that finished or went to rest — grey + dimmed. */
+.worker-card.tone-stopped { opacity: 0.55; }
+.worker-card.tone-stopped .worker-dot { background: var(--muted); }
+.worker-card.tone-idle { opacity: 0.7; }
+/* Neutral phases keep their own accent on the border without a loud tint. */
+.worker-card.phase-waiting_retry,
+.worker-card.phase-waiting_delay { border-left-color: #e0a64b; }
+.worker-card.phase-paused { border-left-color: #7a86ff; }
+.worker-card.phase-paused .worker-dot { background: #7a86ff; }
+
+@keyframes worker-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.or-usage-badge {
+  align-self: center;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* --- API keys: compact dynamic list --------------------------------------- */
+.api-keys-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 220px;
+}
+.api-keys-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+}
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Custom-styled like the rest of the app — never the vanilla Windows input. */
+.api-key-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.api-key-row input::placeholder { color: var(--muted); letter-spacing: normal; }
+.api-key-row input:hover:not(:disabled) { border-color: #3a4254; }
+.api-key-row input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.api-key-row input:disabled { opacity: 0.55; }
+.api-key-del {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.api-key-del:hover:not(:disabled) {
+  color: #e0564b;
+  border-color: #e0564b;
+  background: color-mix(in srgb, #e0564b 12%, var(--panel));
+}
+/* The "+ add key" pill picks up the active engine accent. */
+.api-key-add {
+  padding: 3px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: 999px;
+}
+
+/* --- themed folder browser (FolderPicker) --------------------------------- */
+.fp-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 11, 14, 0.75);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  animation: fadeIn 0.15s ease-out;
+}
+.fp-modal {
+  --fp-accent: #5b8cff;
+  display: flex;
+  flex-direction: column;
+  width: min(720px, 92vw);
+  height: min(620px, 86vh);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  animation: scaleUp 0.18s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+/* engine accent drives highlights inside the picker */
+.fp-modal.engine-rpgmaker { --fp-accent: #ffa033; }
+.fp-modal.engine-renpy { --fp-accent: #ff66a0; }
+.fp-modal.engine-godot { --fp-accent: #3cd4ff; }
+.fp-modal.engine-gamemaker { --fp-accent: #32e06b; }
+.fp-modal.engine-unity { --fp-accent: #c084fc; }
+.fp-modal.engine-unreal { --fp-accent: #eab308; }
+.fp-modal.engine-unreal4_5 { --fp-accent: #f0883e; }
+.fp-modal.engine-csharp { --fp-accent: #818cf8; }
+.fp-modal.engine-fusion { --fp-accent: #2dd4bf; }
+.fp-modal.engine-mmf2 { --fp-accent: #fb7185; }
+.fp-modal.engine-qsp { --fp-accent: #f97316; }
+
+.fp-head {
+  display: flex;
+  align-items: center;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.fp-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.fp-x {
+  margin-left: auto;
+  width: 30px; height: 30px;
+  padding: 0;
+  font-size: 18px; line-height: 1;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+}
+.fp-x:hover:not(:disabled) { color: var(--text); border-color: var(--line); }
+
+.fp-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 5px 18px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--fp-accent) 5%, transparent);
+}
+.fp-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px 6px 10px;
+  font-size: 13px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid color-mix(in srgb, var(--fp-accent) 30%, var(--line));
+  color: var(--text);
+}
+.fp-shortcut:hover:not(:disabled) {
+  border-color: var(--fp-accent);
+  background: color-mix(in srgb, var(--fp-accent) 12%, var(--bg));
+}
+.fp-shortcut svg { display: block; flex: 0 0 auto; color: var(--fp-accent); }
+.fp-shortcut-tag { font-size: 11px; color: var(--muted); font-weight: 600; }
+
+.fp-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.fp-up { width: 34px; padding: 5px 0; flex: 0 0 auto; font-size: 15px; }
+.fp-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  white-space: nowrap;
+  gap: 1px;
+  scrollbar-width: thin;
+}
+.fp-crumb-wrap { display: inline-flex; align-items: center; }
+.fp-crumb {
+  padding: 3px 7px;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  border-radius: 5px;
+}
+.fp-crumb:hover:not(:disabled) { color: var(--fp-accent); background: var(--bg); }
+.fp-sep { color: var(--line); padding: 0 1px; }
+
+.fp-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 13px;
+}
+.fp-row:hover { background: var(--bg); border-color: var(--line); }
+.fp-ico { font-size: 15px; flex: 0 0 auto; opacity: 0.9; }
+.fp-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-empty {
+  margin: auto;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 40px;
+}
+
+.fp-path-input-wrap {
+  flex: 1;
+  margin: 0 24px 0 16px;
+  max-width: 460px;
+}
+.fp-path-input-wrap input {
+  width: 100%;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.fp-path-input-wrap input:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--line);
+}
+.fp-path-input-wrap input:focus {
+  outline: none;
+  background: var(--bg);
+  border-color: var(--fp-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--fp-accent) 22%, transparent);
+  cursor: text;
+}
+
+.fp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
+}
+.fp-choose {
+  border: none;
+  color: #0f1115;
+  font-weight: 600;
+  background: var(--fp-accent);
+}
+.fp-choose:hover:not(:disabled) { filter: brightness(1.08); }
+.fp-choose:disabled { background: var(--line); color: var(--muted); }
+
+/* Kill the native number-input spinner arrows (ugly OS up/down chevrons). */
+.no-spin::-webkit-outer-spin-button,
+.no-spin::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.no-spin { -moz-appearance: textfield; appearance: textfield; }
+
+/* Navigation Sidebar for FolderPicker */
+.fp-main-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.fp-sidebar {
+  width: 60px;
+  background: color-mix(in srgb, var(--fp-accent) 2%, var(--bg));
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  flex-shrink: 0;
+  transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.fp-sidebar:hover {
+  width: 260px;
+}
+
+.fp-sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  font-size: 13px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+  width: 100%;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.fp-sidebar-item:hover {
+  background: var(--bg);
+  border-color: var(--line);
+}
+
+.fp-sidebar-item.active {
+  background: color-mix(in srgb, var(--fp-accent) 15%, var(--bg));
+  border-color: color-mix(in srgb, var(--fp-accent) 30%, var(--line));
+  font-weight: 600;
+  color: var(--text);
+}
+
+.fp-sidebar-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+}
+
+.fp-sidebar-icon svg {
+  color: var(--fp-accent);
+}
+
+.fp-sidebar-text {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-in-out;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.fp-sidebar:hover .fp-sidebar-text {
+  opacity: 1;
+  pointer-events: auto;
+}
+

@@ -1,0 +1,100 @@
+601:         -----------
+602:         choices : list
+603:             A list of choices. Can be booleans, strings, ints, a mix, etc.
+604:         bag : list
+605:             A shuffled list of the provided choices.
+606:         """
+607: 
+608:         def __init__(self, choices):
+609:             """Creates a RandomBag object."""
+610:             self.choices = choices
+611:             self.bag = [ ]
+612: 
+613:         def draw(self):
+614:             """Removes an item from the bag."""
+615:             # If the bag is empty,
+616:             if not self.bag:
+617:                 # Replace it with a copy of choices,
+618:                 self.bag = list(self.choices)
+619:                 # Then randomize those choices.
+620:                 renpy.random.shuffle(self.bag)
+621:             # Return something from the bag.
+622:             return self.bag.pop(0)
+623: 
+624: 
+625:     def pretty_print_pronouns():
+626:         """
+627:         A helper function which returns a "pretty" version of the player's
+628:         pronouns, for use in the UI or in dialogue.
+629:         Returns a string like "she/her, he/him, they/them, and xe/xem"
+630:         """
+631:         pretty_set = [x for x in store.player_pronouns if x != "custom"]
+632:         if "custom" in store.player_pronouns:
+633:             ret = ", ".join(pretty_set)
+634:             if len(store.player_pronouns) > 1:
+635:                 if len(store.player_pronouns) > 2:
+636:                     ret += ","
+637:                 ret += " and {}/{}".format(custom_pronouns.they, custom_pronouns.them)
+638:             else:
+639:                 ret += "{}/{}".format(custom_pronouns.they, custom_pronouns.them)
+640:         else:
+641:             ret = ", ".join(pretty_set[:-1])
+642:             if len(pretty_set) > 2:
+643:                 ret += ","
+644:             if len(pretty_set) > 1:
+645:                 ret += " and "
+646:             ret += pretty_set[-1]
+647:         return ret
+648: 
+649:     def randomize_pronouns():
+650:         """
+651:         A function which will randomize the player's pronouns based on their
+652:         preferences for frequency.
+653:         """
+654:         if store.pronoun_switch_freq is None:
+655:             ## This player is manually changing their pronouns.
+656:             ## Do not randomize anything.
+657:             return
+658: 
+659:         if len(store.player_pronouns) == 1:
+660:             ## There's only one pronoun that the player is using, so
+661:             ## no randomization to do.
+662:             return
+663: 
+664:         if not store.pronoun_frequency:
+665:             ## The dictionary is empty; this means we'll have an equal
+666:             ## chance of using each pronoun.
+667:             store.pronoun = renpy.random.choice(store.player_pronouns)
+668:             return
+669: 
+670:         ## Make sure at least one of the pronoun frequencies is not 0
+671:         if not any(store.pronoun_frequency.values()):
+672:             ## If they're all 0, just pick a random pronoun.
+673:             return
+674: 
+675:         ## Take the "Random Bag" approach.
+676:         if not store.pronoun_freq_list:
+677:             ## If the list is empty, create it.
+678:             freq_list = [ ]
+679:             for pron in store.player_pronouns:
+680:                 ## If the player has specified a frequency for this
+681:                 ## pronoun, add it to the list that many times.
+682:                 freq_list.extend([pron for x in range(store.pronoun_frequency.get(pronoun, 1))])
+683:             if not freq_list:
+684:                 ## If the list is empty, return
+685:                 return
+686:             store.pronoun_freq_list = RandomBag(freq_list)
+687:         else:
+688:             ## Otherwise, just draw from the bag.
+689:             store.pronoun = store.pronoun_freq_list.draw()
+690: 
+691:     def randomize_pronouns_per_line(*args, **kwargs):
+692:         """
+693:         An interaction callback which will randomize the player's pronouns on
+694:         every line, if they have selected that option.
+695:         """
+696:         if store.pronoun_switch_freq != "line":
+697:             return
+698:         ## Otherwise yes, randomize.
+699:         randomize_pronouns()
+700: 

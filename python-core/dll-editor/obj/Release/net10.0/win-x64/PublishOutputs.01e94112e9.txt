@@ -1,0 +1,9 @@
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\DllEditor.exe
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\DllEditor.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\DllEditor.deps.json
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\DllEditor.runtimeconfig.json
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\DllEditor.pdb
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\Mono.Cecil.Mdb.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\Mono.Cecil.Pdb.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\Mono.Cecil.Rocks.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\Mono.Cecil.dll
