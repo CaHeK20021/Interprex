@@ -102,8 +102,11 @@ powershell -Command "(Get-Content 'package.json') -replace '\"version\":\s*\"!CU
 :: Update tauri.conf.json version
 powershell -Command "(Get-Content 'src-tauri\tauri.conf.json') -replace '\"version\":\s*\"!CURVER!\"', '\"version\": \"!NEWVER!\"' | Set-Content 'src-tauri\tauri.conf.json' -NoNewline"
 
+:: Update Cargo.toml version
+powershell -Command "(Get-Content 'src-tauri\Cargo.toml') -replace '^version = \"!CURVER!\"', 'version = \"!NEWVER!\"' | Set-Content 'src-tauri\Cargo.toml' -NoNewline"
+
 :: Commit version bump and push
-git add package.json src-tauri/tauri.conf.json
+git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
 git commit -m "v!NEWVER!"
 git push origin "!BRANCH!"
 

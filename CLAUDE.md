@@ -54,6 +54,18 @@ Tauri (thin Rust shell)         src-tauri/    window + launches the sidecar
 | `python-core/providers/` | `base.py` (provider ABC, prompt, parse, **Calibrator**, batching), `openai_compat.py` (Ollama + LM Studio), `gemini.py`, registry |
 | `python-core/validators/` | post-translation validators (`get_validator(engine)`); `renpy.py` `ast.parse`-checks `python:`/`$` blocks — catches a broken translated literal WITHOUT the `renpy` binary (works on a Steam player's machine) |
 
+## Auto-update (tauri-plugin-updater)
+
+Built-in updater checks GitHub releases on launch (`UpdateOverlay.tsx`):
+- **Endpoint**: `https://api.github.com/repos/CaHeK20021/interprex/releases/latest`
+- **Flow**: `check()` → `downloadAndInstall()` (NSIS installer) → `relaunch()`
+- **Signing**: `TAURI_SIGNING_PRIVATE_KEY` + password in GitHub Secrets
+- **Release pipeline**: push `v*` tag → `.github/workflows/release.yml` → builds sidecar + NSIS + signs + uploads to GitHub release with `latest.json`
+- **UX**: overlay with spinner + progress bar (MB downloaded), blocks window close during download
+- **Single-instance**: `tauri-plugin-single-instance` prevents duplicate windows; second launch focuses existing
+- **Plugins chain** (lib.rs): `opener → dialog → fs → process → updater → single-instance`
+- **Close blocking**: `updateBusyRef` in App.tsx prevents user from closing during download
+
 ## Two separate language axes (do not conflate)
 
 - **UI language** — language of Interprex itself (`src/i18n/`, en + ru).
