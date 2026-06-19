@@ -5,16 +5,20 @@ from __future__ import annotations
 
 import httpx
 
-def _patched_get(url, *args, **kwargs):
-    with httpx.Client(trust_env=False) as client:
-        return client.get(url, *args, **kwargs)
+# Globally override httpx.Client and AsyncClient constructors to force trust_env=False.
+# This ensures that all HTTP requests (including helper functions like httpx.get/post
+# and manual Client instances) bypass registry/environment proxy settings, matching curl.exe.
+_orig_client_init = httpx.Client.__init__
+def _patched_client_init(self, *args, **kwargs):
+    kwargs["trust_env"] = False
+    _orig_client_init(self, *args, **kwargs)
+httpx.Client.__init__ = _patched_client_init
 
-def _patched_post(url, *args, **kwargs):
-    with httpx.Client(trust_env=False) as client:
-        return client.post(url, *args, **kwargs)
-
-httpx.get = _patched_get
-httpx.post = _patched_post
+_orig_async_client_init = httpx.AsyncClient.__init__
+def _patched_async_client_init(self, *args, **kwargs):
+    kwargs["trust_env"] = False
+    _orig_async_client_init(self, *args, **kwargs)
+httpx.AsyncClient.__init__ = _patched_async_client_init
 
 from .base import (
     BaseProvider,
