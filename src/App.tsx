@@ -1565,7 +1565,7 @@ export default function App() {
                 >
                   github.com/CaHeK20021/interprex-proxy
                 </a>
-                {" — "}{lang === "ru" ? "нажмите \"Deploy to Vercel\"" : "click \"Deploy to Vercel\""}
+                {t("proxyInfoStep1Suffix") as string}
               </p>
               <p className="proxy-info-step">{t("proxyInfoStep2") as string}</p>
               <p className="proxy-info-step">{t("proxyInfoStep3") as string}</p>

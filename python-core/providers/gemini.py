@@ -174,7 +174,7 @@ class GeminiProvider(BaseProvider):
                         if not resp.is_error:
                             self._use_proxy_fallback = True
                     else:
-                        raise RuntimeError("В вашей стране недоступен этот провайдер - нажмите ⚙, чтобы подключить Vercel прокси")
+                        raise RuntimeError("В вашей стране недоступен этот провайдер - нажмите ⚙, чтобы настроить Hugging Face прокси")
                 else:
                     raise RuntimeError(f"Gemini API error ({resp.status_code}): {msg}")
         except Exception as e:
