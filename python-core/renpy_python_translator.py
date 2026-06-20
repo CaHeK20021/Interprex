@@ -260,7 +260,17 @@ SYSTEM_INSTRUCTION = (
     "Preserve all in-game control codes, escape sequences, and placeholders EXACTLY as they appear "
     "(e.g. \\n, \\., \\C[1], %1, {{name}}, <i>). Do not translate text inside such codes. Keep the tone "
     "natural for a player.\n"
+    "CRITICAL: Ren'Py text interpolation tokens like [variable_name], [mc.status], [VALUE], [v] "
+    "MUST appear in the translation EXACTLY as in the source — same spelling, same case, same brackets. "
+    "These are code variables, not translatable text. Changing [player_name] to [имя_игрока] WILL crash "
+    "the game. If a string contains [var], copy it verbatim into the translation.\n"
     "CRITICAL: Strictly match the letter casing and capitalization of the source text (capitalized words, UPPERCASE terms). Never change capitalization.\n"
+    "Ren'Py code tokens MUST be copied verbatim from the source — they are NOT translatable text:\n"
+    "  • [variable_name], [mc.status] — text interpolation variables (keep exact spelling + case)\n"
+    "  • {b}, {/b}, {i}, {/i}, {color=#RRGGBB}, {/color}, {size=N}, {/size}, {a=url}, {/a} — text tags\n"
+    "  • %(name)s, %s, %d — Python format strings (keep verbatim)\n"
+    "  • \\n, \\t — escape sequences (keep as literal backslash+n, NOT as real newline)\n"
+    "Changing any of these WILL crash the game.\n"
     "Do not resolve escape characters; if the source contains a literal '\\n', keep exactly '\\n' in the translation "
     "instead of inserting a real newline.\n"
     "Return ONLY a JSON object containing an 'items' array, where each item has 'id' (from the input) "
@@ -968,7 +978,7 @@ def classify_batch(entries: list[dict], api_key: str, model: str, base_url: str 
     return results, _thread_idx()
 
 
-def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, model: str, base_url: str = None, provider: str = None) -> dict[str, str]:
+def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, model: str, base_url: str = None, provider: str = None, extra_instruction: str = None) -> dict[str, str]:
     """Translate one batch; PROPAGATE API errors so the key-pool can fail over.
     Returns {source_value: translated_value} for entries the model answered."""
     prompt_items = []
@@ -992,6 +1002,8 @@ def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, mo
         })
 
     instruction = SYSTEM_INSTRUCTION.format(lang=target_lang)
+    if extra_instruction:
+        instruction = extra_instruction + "\n\n" + instruction
     lines = [instruction, "", "Translate these strings:"]
     payload = {item["id"]: {"text": item["text"], "context": item["context"]} for item in prompt_items}
     lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1408,6 +1420,36 @@ def parse_and_extract_candidates(file_path: Path, content: str) -> list[dict]:
 
 _INLINE_STRINGS_REL = "game/tl/{lang}/_interprex_inline.rpy"
 
+# Ren'Py-specific tokens that must be preserved verbatim in translations.
+# Changing these crashes the game at runtime.
+_RENPY_VAR_RE = re.compile(r'\[([^\]]+)\]')
+_RENPY_TAG_RE = re.compile(r'\{/?[a-zA-Z][^}]*\}')
+_RENPY_PERCENT_RE = re.compile(r'%(?:%|\(\w+\)[diouxXeEfFgGcrs]|[-#0+]*\d*\.?\d*[hlL]?[diouxXeEfFgGcrs])')
+
+
+def _validate_renpy_tokens(old: str, new: str) -> list[str]:
+    """Check all Ren'Py-specific tokens are preserved in translation.
+
+    Returns list of violation descriptions (empty = OK). Checks:
+    1. [var] interpolation tokens — same set, same case
+    2. {tag} text tags — same set (opening + closing)
+    3. %s / %(name)s / %d format specs — same set
+    """
+    violations = []
+    old_vars = sorted(m.group(0) for m in _RENPY_VAR_RE.finditer(old))
+    new_vars = sorted(m.group(0) for m in _RENPY_VAR_RE.finditer(new))
+    if old_vars != new_vars:
+        violations.append(f"[var] tokens differ: {old_vars} -> {new_vars}")
+    old_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(old))
+    new_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(new))
+    if old_tags != new_tags:
+        violations.append(f"{{tag}} tokens differ: {old_tags} -> {new_tags}")
+    old_fmt = sorted(m.group(0) for m in _RENPY_PERCENT_RE.finditer(old))
+    new_fmt = sorted(m.group(0) for m in _RENPY_PERCENT_RE.finditer(new))
+    if old_fmt != new_fmt:
+        violations.append(f"%-format tokens differ: {old_fmt} -> {new_fmt}")
+    return violations
+
 # Matches an `old "..."` / `old '...'` line in a tl/ strings block.
 _TL_OLD_RE = re.compile(r'^\s*old\s+("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')\s*$')
 
@@ -1470,11 +1512,18 @@ def _write_inline_strings_file(game_path: Path, lang: str,
         f"translate {lang} strings:",
     ]
     written = 0
+    skipped_vars = 0
     for original, translated in pairs:
         if not original or not translated:
             continue
         if original in seen:
             skipped_dupe += 1
+            continue
+        violations = _validate_renpy_tokens(original, translated)
+        if violations:
+            skipped_vars += 1
+            logger.info("Skipped inline pair (tokens corrupted): %r -> %r [%s]",
+                        original, translated, "; ".join(violations))
             continue
         seen.add(original)
         # `new` is DISPLAYED text → runs through the engine's %-substitution, so a
@@ -1527,8 +1576,8 @@ def _write_inline_strings_file(game_path: Path, lang: str,
         _backup_created(game_path, abs_path)
     with open(abs_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
-    logger.info("Wrote inline strings file: %s (%d entries, %d skipped as already in tl/)",
-                rel, written, skipped_dupe)
+    logger.info("Wrote inline strings file: %s (%d entries, %d skipped as already in tl/, %d skipped due to corrupted [var] tokens)",
+                rel, written, skipped_dupe, skipped_vars)
     return written
 
 
@@ -1912,6 +1961,55 @@ def main(args_list=None):
             if tr:
                 trans_cache.put(entry, tr)
         trans_cache.save()
+
+    # Step 4b: Validate Ren'Py tokens in all translations. If [var], {tag}, or
+    # %-format tokens got corrupted by the LLM, retry with an explicit
+    # instruction to preserve them verbatim. Only skip after a second failure.
+    if translations and not args.apply_cached_only:
+        corrupted = []
+        for orig, tr in list(translations.items()):
+            viols = _validate_renpy_tokens(orig, tr)
+            if viols:
+                corrupted.append((orig, tr, viols))
+        if corrupted:
+            logger.info("Token corruption detected in %d translation(s), retrying with explicit instruction...",
+                        len(corrupted))
+            retry_entries = []
+            for orig, old_tr, viols in corrupted:
+                logger.info("  Corrupted: %r -> %r [%s]", orig, old_tr, "; ".join(viols))
+                retry_entries.append({"value": orig, "context_function": "", "context_variable": "", "context_param": ""})
+            if retry_entries:
+                retry_batches = [retry_entries[i:i+20] for i in range(0, len(retry_entries), 20)]
+
+                def _retry_pf(batch, key, worker_idx):
+                    return _translate_batch_raw(batch, args.target_lang, key, args.model,
+                                               args.base_url, args.provider,
+                                               extra_instruction=(
+                                                   "CRITICAL REMINDER: You MUST copy these Ren'Py "
+                                                   "patterns EXACTLY from the source — do NOT change "
+                                                   "them: [variable_name], {b}, {/b}, {i}, {/i}, "
+                                                   "{color=#...}, {size=...}, %(name)s, %s, %d, %%s, "
+                                                   "\\n. These are code, not translatable text. "
+                                                   "Changing them WILL crash the game."
+                                               ))
+
+                retried = _run_batches_over_keypool(
+                    retry_batches, keys, args.threads, args.delay_seconds,
+                    "TokenFixed", _retry_pf
+                )
+                fixed = 0
+                still_broken = 0
+                for orig, old_tr, viols in corrupted:
+                    new_tr = retried.get(orig)
+                    if new_tr and not _validate_renpy_tokens(orig, new_tr):
+                        translations[orig] = new_tr
+                        fixed += 1
+                        logger.info("  Fixed: %r -> %r", orig, new_tr)
+                    else:
+                        still_broken += 1
+                        logger.warning("  Still broken after retry, will be skipped: %r", orig)
+                        del translations[orig]
+                logger.info("Token retry: %d fixed, %d still broken (skipped)", fixed, still_broken)
     elif uncached_to_translate and args.apply_cached_only:
         logger.info("Apply-cached-only: %d string(s) have no cached translation, left as-is.",
                     len(uncached_to_translate))
