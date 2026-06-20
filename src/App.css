@@ -1512,6 +1512,12 @@ input[type="checkbox"]:disabled {
   align-items: center;
   justify-content: center;
   backdrop-filter: blur(6px);
+  animation: update-overlay-in 0.25s ease-out;
+}
+
+@keyframes update-overlay-in {
+  from { opacity: 0; backdrop-filter: blur(0); }
+  to   { opacity: 1; backdrop-filter: blur(6px); }
 }
 
 .update-card {
@@ -1520,11 +1526,25 @@ input[type="checkbox"]:disabled {
   align-items: center;
   gap: 20px;
   padding: 48px 56px;
-  border-radius: 16px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+  border-radius: 18px;
+  /* Subtle vertical sheen + a faint accent halo so the card reads as a focal
+     element rather than a flat box. */
+  background:
+    radial-gradient(120% 80% at 50% 0%,
+      color-mix(in srgb, var(--accent) 9%, var(--panel)) 0%,
+      var(--panel) 60%);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.02) inset,
+    0 0 48px color-mix(in srgb, var(--accent) 14%, transparent);
   min-width: 360px;
+  animation: update-card-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes update-card-in {
+  from { opacity: 0; transform: translateY(12px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .update-spinner {
@@ -1538,6 +1558,72 @@ input[type="checkbox"]:disabled {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Circular progress ring: SVG track + arc, with the live percent in the center. */
+.update-ring {
+  position: relative;
+  width: 120px;
+  height: 120px;
+}
+
+.update-ring-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.update-ring-track {
+  stroke: var(--line);
+  opacity: 0.6;
+}
+
+/* Gradient stops for the arc — accent fading to a brighter tint, gives the ring
+   depth instead of a flat single color. */
+.update-ring-grad-a { stop-color: var(--accent); }
+.update-ring-grad-b {
+  stop-color: color-mix(in srgb, var(--accent) 45%, #ffffff);
+}
+
+.update-ring-arc {
+  stroke: url(#update-ring-grad);
+  /* Smoothly animate the arc as download progress lands (chunks arrive bursty). */
+  transition: stroke-dashoffset 0.25s ease-out;
+  filter: drop-shadow(0 0 5px color-mix(in srgb, var(--accent) 60%, transparent));
+  animation: update-ring-glow 2s ease-in-out infinite;
+}
+
+/* Gentle breathing glow so the ring feels alive during a slow download. */
+@keyframes update-ring-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 4px color-mix(in srgb, var(--accent) 45%, transparent));
+  }
+  50% {
+    filter: drop-shadow(0 0 9px color-mix(in srgb, var(--accent) 75%, transparent));
+  }
+}
+
+/* The center percentage readout. */
+.update-ring-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums; /* digits don't jitter as % climbs */
+  color: var(--text);
+  letter-spacing: 0.5px;
+}
+
+/* Before the total size is known, spin the whole ring as an indeterminate
+   loader and drop the percent text. */
+.update-ring.is-indeterminate .update-ring-svg {
+  animation: spin 0.9s linear infinite;
+}
+.update-ring.is-indeterminate .update-ring-arc {
+  transition: none;
 }
 
 .update-checkmark {
