@@ -836,7 +836,7 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
         }
-        if response_schema and "gemma" not in model.lower():
+        if response_schema:
             body["generationConfig"]["responseSchema"] = response_schema
         
     max_retries = 5
@@ -859,13 +859,16 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
             resp.raise_for_status()
             data = resp.json()
             try:
+                text = ""
                 if is_openai_compat:
                     text = data["choices"][0]["message"]["content"]
                 else:
                     parts = data["candidates"][0]["content"]["parts"]
                     text = "".join(part["text"] for part in parts if not part.get("thought"))
+                    logger.debug("Model raw response text (%d chars): %.200s", len(text), text)
                 return json.loads(text)
             except Exception as e:
+                logger.warning("Failed to parse model response (%.200s): %s", text, e)
                 raise RuntimeError(f"Unexpected response from model: {data}") from e
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (429, 500, 503, 504):
