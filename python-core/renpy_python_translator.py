@@ -252,13 +252,19 @@ CLASSIFICATION_PROMPT = """
 {{"decision": "TRANSLATE" | "SKIP", "reason": "одна строка объяснения"}}
 """
 
+# NOTE: this template is filled via `.replace("{lang}", ...)`, NOT str.format().
+# It deliberately contains literal Ren'Py braces ({b}, {/b}, {color=#...}, etc.)
+# and a literal JSON example with { } — running str.format() over it raises
+# KeyError: 'b' (the {b} text-tag is mistaken for a format field), which silently
+# failed EVERY inline-Python translate batch. Keep single braces here; never call
+# .format() on this string. See `_translate_batch_raw`.
 SYSTEM_INSTRUCTION = (
     "You are a professional game-localization translator. Translate each source string into {lang}.\n"
     "Input is a JSON object mapping ids to objects with a 'text' field and an optional 'context' field.\n"
     "The 'context' field provides metadata (e.g. speaker name, UI location) to help determine the correct "
     "gender, grammatical forms, and tone. Do NOT translate the context itself.\n"
     "Preserve all in-game control codes, escape sequences, and placeholders EXACTLY as they appear "
-    "(e.g. \\n, \\., \\C[1], %1, {{name}}, <i>). Do not translate text inside such codes. Keep the tone "
+    "(e.g. \\n, \\., \\C[1], %1, {name}, <i>). Do not translate text inside such codes. Keep the tone "
     "natural for a player.\n"
     "CRITICAL: Ren'Py text interpolation tokens like [variable_name], [mc.status], [VALUE], [v] "
     "MUST appear in the translation EXACTLY as in the source — same spelling, same case, same brackets. "
@@ -275,11 +281,11 @@ SYSTEM_INSTRUCTION = (
     "instead of inserting a real newline.\n"
     "Return ONLY a JSON object containing an 'items' array, where each item has 'id' (from the input) "
     "and 'translated' (the translated string). Example:\n"
-    "{{\n"
+    "{\n"
     "  \"items\": [\n"
-    "    {{ \"id\": \"a1b2\", \"translated\": \"translation\" }}\n"
+    "    { \"id\": \"a1b2\", \"translated\": \"translation\" }\n"
     "  ]\n"
-    "}}\n"
+    "}\n"
     "Do NOT wrap the JSON in markdown code blocks (e.g., ```json) and do not write any explanations."
 )
 
@@ -635,6 +641,17 @@ _POOL_AUTH_GRACE = 2
 # a fair shot on every key before we give up on it.
 _POOL_BATCH_TRIES = 6
 _POOL_RETRY_BACKOFF = 8.0
+# Per-batch retry cap for "rate"/overload errors. Unlike "other", a rate error
+# keeps the key alive and is expected to recover, so it gets a generous cap — but
+# it MUST be finite. A permanently rate-limited key (daily quota exhausted, a dead
+# provider returning "no available provider") will NEVER recover this run; without
+# a cap the worker requeues the same batch forever, never exits, and the pool's
+# th.join() hangs — the "infinite translation that finishes nothing" bug. Multiplied
+# by key count so every key gets a fair shot before the batch falls to the default.
+_POOL_RATE_TRIES = 30
+# Minimum sleep between rate retries when no pacing delay is configured — without
+# it a rate error with delay_seconds==0 sets no cooldown and busy-spins the CPU.
+_POOL_RATE_MIN_BACKOFF = 2.0
 
 
 def _build_key_list(api_keys, legacy_key: str) -> list[str]:
@@ -662,7 +679,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
 
     work: "queue.Queue" = queue.Queue()
     for i, b in enumerate(batches):
-        work.put((i, b, 0))
+        work.put((i, b, 0, 0))  # (batch_idx, batch, other_attempts, rate_attempts)
 
     merged: dict = {}
     merged_lock = threading.Lock()
@@ -706,7 +723,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                     time.sleep(min(gap, 1.0))
                     continue
             try:
-                batch_idx, batch, attempts = work.get_nowait()
+                batch_idx, batch, attempts, rate_attempts = work.get_nowait()
             except queue.Empty:
                 with accounted_lock:
                     if accounted[0] >= total:
@@ -744,22 +761,39 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                                          batch_idx + 1, total, worker_idx, e)
                             account_one()
                         else:
-                            work.put((batch_idx, batch, attempts))
+                            work.put((batch_idx, batch, attempts, rate_attempts))
                         return  # retire this worker
-                    work.put((batch_idx, batch, attempts))  # grace: let a sibling try
+                    work.put((batch_idx, batch, attempts, rate_attempts))  # grace: let a sibling try
                     continue
                 elif kind == "rate":
-                    if delay_seconds > 0:
-                        with cd_lock:
-                            key_cooldown[key] = max(
-                                key_cooldown.get(key, 0.0), time.time() + delay_seconds
-                            )
-                    work.put((batch_idx, batch, attempts))  # retry, key stays alive
+                    # A rate/overload error keeps the key alive and usually recovers
+                    # — but it MUST be bounded. A permanently rate-limited or dead
+                    # provider (quota gone, "no available provider") never recovers
+                    # this run; without a cap the batch requeues forever and the pool
+                    # never exits (the infinite-translation hang). Cap it, then fall
+                    # to the caller's safe default like "other" does.
+                    if rate_attempts + 1 < _POOL_RATE_TRIES * len(keys):
+                        if delay_seconds > 0:
+                            with cd_lock:
+                                key_cooldown[key] = max(
+                                    key_cooldown.get(key, 0.0), time.time() + delay_seconds
+                                )
+                        else:
+                            # No pacing configured → no cooldown set above, so sleep
+                            # here or we busy-spin the CPU re-claiming instantly.
+                            time.sleep(_POOL_RATE_MIN_BACKOFF)
+                        work.put((batch_idx, batch, attempts, rate_attempts + 1))
+                        continue
+                    logger.error(
+                        "Failed batch %d/%d [thread %d] (rate limit did not recover): %s",
+                        batch_idx + 1, total, worker_idx, e,
+                    )
+                    account_one()
                     continue
                 else:  # "other": cumulative cap across keys, then fall to default
                     if attempts + 1 < _POOL_BATCH_TRIES * len(keys):
                         time.sleep(min(_POOL_RETRY_BACKOFF, 1.0))
-                        work.put((batch_idx, batch, attempts + 1))
+                        work.put((batch_idx, batch, attempts + 1, rate_attempts))
                         continue
                     logger.error(
                         "Failed batch %d/%d [thread %d]: %s",
@@ -1004,7 +1038,10 @@ def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, mo
             "context": " | ".join(ctx_parts)
         })
 
-    instruction = SYSTEM_INSTRUCTION.format(lang=target_lang)
+    # .replace, NOT .format — the template contains literal Ren'Py braces ({b},
+    # {color=#...}) and a literal JSON {…} example. str.format() would read {b} as
+    # a field and raise KeyError: 'b', which silently failed every batch.
+    instruction = SYSTEM_INSTRUCTION.replace("{lang}", target_lang)
     if extra_instruction:
         instruction = extra_instruction + "\n\n" + instruction
     lines = [instruction, "", "Translate these strings:"]

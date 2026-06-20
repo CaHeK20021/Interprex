@@ -1581,7 +1581,15 @@ class RenPyParser(BaseParser):
         logger.info("Decompiling %d .rpyc files in-process...", len(files_to_decompile))
         for f in files_to_decompile:
             try:
-                unrpyc.decompile_rpyc(PathLib(f), overwrite=True)
+                # unrpyc v2.x requires a per-file Context (collects log + result
+                # state). On a partial parse it sets ctx.state to something other
+                # than "ok" instead of raising, so surface that for a clear log
+                # rather than silently producing an empty .rpy.
+                ctx = unrpyc.Context()
+                unrpyc.decompile_rpyc(PathLib(f), ctx, overwrite=True)
+                if getattr(ctx, "state", "ok") != "ok":
+                    logger.error("Decompile of %s did not complete (state=%s): %s",
+                                 f, ctx.state, getattr(ctx, "error", None))
             except Exception as fe:
                 logger.error("Failed to decompile %s: %s", f, fe)
 

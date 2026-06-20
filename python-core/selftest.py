@@ -1237,13 +1237,21 @@ def check_renpy_decompilation() -> None:
     # Create a mock unrpyc module in sys.modules
     import types
     mock_unrpyc = types.ModuleType("unrpyc")
-    def mock_decompile_rpyc(input_filename, **kwargs):
+    # unrpyc v2.x: decompile_rpyc(input_filename, context, overwrite=...) — context
+    # is the SECOND positional arg, and renpy.py now constructs unrpyc.Context()
+    # before each call. Mock both so the new call signature is exercised.
+    def mock_decompile_rpyc(input_filename, context=None, **kwargs):
         from pathlib import Path as PathLib
         out_filename = PathLib(input_filename).with_suffix(".rpy")
         with open(out_filename, "w", encoding="utf-8") as f_out:
             f_out.write('label start:\n    "Decompiled text."\n')
+        if context is not None:
+            context.state = "ok"
         return True
     mock_unrpyc.decompile_rpyc = mock_decompile_rpyc
+    mock_unrpyc.Context = lambda: types.SimpleNamespace(
+        state="error", error=None, value=None, log=lambda *a, **k: None
+    )
 
     import sys
     sys.modules["unrpyc"] = mock_unrpyc
