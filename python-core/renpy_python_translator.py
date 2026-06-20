@@ -1121,7 +1121,40 @@ def load_all_sources(game_path: Path) -> dict[Path, str]:
 
     sources: dict[Path, str] = {}
 
-    # Loose .rpy files on disk (excluding our own backups and the tl/ output).
+    # Reuse the dialogue parser's source iterator: it already merges loose .rpy,
+    # DECOMPILED .rpyc (loose-without-.rpy AND archived .rpyc), and archived .rpy
+    # into one stream, and content-skips shipped tl/<lang>/ translation files.
+    # This is the single source of truth — without it the inline path saw ONLY
+    # loose/.rpa .rpy and missed games that ship scripts as compiled .rpyc (real
+    # bug: Beyond the Turquoise Stars — `renpy.input("Enter your name:")` and the
+    # default `"Absurde"` live in script.rpyc, so they were never translated while
+    # the dialogue path, which decompiles, handled the same file fine).
+    try:
+        from parsers.renpy import RenPyParser
+        parser = RenPyParser()
+        root_str = str(game_path)
+        parser._decompile_rpyc_files(root_str)
+        try:
+            for file_rel, text in parser._iter_sources(root_str):
+                # file_rel is root-relative ("game/script.rpy"); synthesize a stable
+                # readable Path key (NOT written to disk).
+                key = (game_path / file_rel).resolve()
+                if key in sources:
+                    continue
+                sources[key] = text.replace("\r\n", "\n")
+        finally:
+            parser._cleanup_decompile_temp()
+        logger.info("Loaded %d script source(s) (loose + decompiled .rpyc + archived).",
+                    len(sources))
+        if sources:
+            return sources
+        logger.warning("Source iterator returned nothing; falling back to direct read.")
+    except Exception as e:
+        logger.warning("Could not load sources via RenPyParser (%s); falling back to "
+                       "direct loose/.rpa read.", e)
+
+    # Fallback (parser unavailable / errored): read loose + archived .rpy directly.
+    # Misses compiled-only .rpyc, but never crashes the run.
     rpy_files = list(game_dir.rglob("*.rpy"))
     rpy_files = [f for f in rpy_files if ".interprex" not in f.parts and "tl" not in f.parts]
     loose_rel: set[str] = set()
@@ -1133,7 +1166,6 @@ def load_all_sources(game_path: Path) -> dict[Path, str]:
         except Exception as e:
             logger.error("Failed to read loose file %s: %s", fpath, e)
 
-    # Read archived .rpy straight from the .rpa into memory (no disk writes).
     try:
         from parsers.rpa import iter_rpa_files, read_rpa
         archived_read = 0

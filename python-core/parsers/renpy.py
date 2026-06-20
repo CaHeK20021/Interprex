@@ -276,6 +276,18 @@ _SCREEN_FOR_RE = re.compile(
 _USCORE_RE = re.compile(r'_\(\s*"(?P<text>(?:[^"\\]|\\.)*)"\s*\)')
 _USCORE_F_RE = re.compile(r'_\(\s*f(?P<quote>["\'])(?P<text>.*?)(?P=quote)\s*\)', re.IGNORECASE)
 
+# `show text "..."` statement — a quick on-screen Text displayable (intro cards,
+# chapter titles). Ren'Py runs the literal through translate_string() at render
+# time (substitute=True by default), so it's translatable exactly like _() /
+# screen text: emit it as a `string` (old/new) entry. Optional trailing modifiers
+# (`with dissolve`, `as tag`, `at transform`, `behind ...`) are code and live in
+# the suffix — we only take the quoted text. A bare `text "..."` INSIDE a screen
+# is a different statement, already handled by the screen-widget branch; this
+# matches only the top-level `show text` form.
+_SHOW_TEXT_RE = re.compile(
+    r'^(?P<indent>\s*)show\s+text\s+"(?P<text>(?:[^"\\]|\\.)*)"'
+)
+
 
 # If the first prefix word is one of these, the line is a statement, not a say
 # with that word as the speaker. (`return "x"` must not become a "return"
@@ -441,9 +453,15 @@ def is_technical_string(s: str) -> bool:
     # Asset reference by known extension (gui/nvl.png, fonts/x.ttf, bgm.ogg).
     if cleaned.lower().endswith(_ASSET_EXT):
         return True
+    # Strip inline markup + interpolation EARLY. The path/slash heuristic below
+    # must run on the de-tagged content, not the raw string: a closing text tag
+    # `{/i}` contains a `/`, so `{i}Exhausting.{/i}` (one word, no space, has a
+    # `.`) would otherwise be misread as a file path and the line silently
+    # dropped — real bug on Beyond the Turquoise Stars ("{i}Exhausting.{/i}").
+    content = _RENPY_SUB_RE.sub("", _RENPY_TAG_RE.sub("", cleaned))
     # A spaceless slug containing a path separator and a dot is a path even with
     # an unknown extension (audio/se/click.foo). Prose has spaces; paths don't.
-    if " " not in cleaned and ("/" in cleaned or "\\" in cleaned) and "." in cleaned:
+    if " " not in content and ("/" in content or "\\" in content) and "." in content:
         return True
     # Hex colour literal (#fff, #68aee3, #11223344).
     if _HEX_COLOR_RE.match(cleaned):
@@ -455,9 +473,8 @@ def is_technical_string(s: str) -> bool:
         "top_left", "top_right", "thought", "medium", "small", "large",
     }:
         return True
-    # Strip inline markup + interpolation; if no letters survive (e.g. "...",
-    # "{w=0.5}", "[count]") there is nothing to translate.
-    content = _RENPY_SUB_RE.sub("", _RENPY_TAG_RE.sub("", cleaned))
+    # After stripping markup, if no letters survive (e.g. "...", "{w=0.5}",
+    # "[count]") there is nothing to translate.
     if not any(c.isalpha() for c in content):
         return True
     return False
@@ -1385,6 +1402,31 @@ class RenPyParser(BaseParser):
                             "is_menu_caption": False,
                             "src_line": li,
                         }
+                continue
+
+            # `show text "..."` — a top-level on-screen Text displayable (intro
+            # cards, chapter titles). The engine translates it via translate_string
+            # at render time, so it routes to the strings (old/new) block like _().
+            stm = _SHOW_TEXT_RE.match(line)
+            if stm:
+                show_text = stm.group("text")
+                if show_text.strip() and not is_technical_string(show_text):
+                    key = (label, "showtext")
+                    idx = counts.get(key, 0)
+                    counts[key] = idx + 1
+                    yield {
+                        "path": ["label", label, "showtext", str(idx)],
+                        "original": show_text,
+                        "context": f"Label: {label} | on-screen text"
+                                   if not _is_generic_label(label) else "on-screen text",
+                        "native_kind": "string",
+                        "who_var": None,
+                        "attrs": [],
+                        "raw_what": show_text,
+                        "label": label,
+                        "is_menu_caption": False,
+                        "src_line": li,
+                    }
                 continue
 
             m = _LINE_RE.match(_normalise_line(line))

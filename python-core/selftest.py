@@ -951,6 +951,60 @@ def check_renpy_risk() -> None:
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 
+    # --- is_technical_string: strip markup BEFORE the path/slash heuristic ---
+    # Real bug (Beyond the Turquoise Stars): a one-word line wrapped in a closing
+    # text tag — "{i}Exhausting.{/i}" — has no space, a '.', and a '/' (from the
+    # {/i}), so the file-path test misread it as an asset path and DROPPED it
+    # (neighbouring multi-word lines survived → "everything around is Russian but
+    # this one line isn't"). Must be translatable now; real paths still skipped.
+    from parsers.renpy import is_technical_string as _tech
+    for prose in ("{i}Exhausting.{/i}", "{b}Готово.{/b}", "{i}...on repeat.{/i}",
+                  "{i}plcma{/i}", "Exhausting.", "{size=+4}Конец.{/size}"):
+        assert not _tech(prose), f"prose wrongly flagged technical: {prose!r}"
+    for path in ("audio/se/click.foo", "gui/nvl.png", "fonts/DejaVuSans.ttf",
+                 "images/bg/room.jpg", "sound.ogg"):
+        assert _tech(path), f"asset path not flagged technical: {path!r}"
+    for empty in ("{w=0.5}", "...", "[count]", "   ", "{/i}"):
+        assert _tech(empty), f"no-letter markup not flagged technical: {empty!r}"
+    print("OK — renpy is_technical_string: tagged one-word prose kept, asset paths skipped")
+
+    # --- `show text "..."` top-level displayable is extracted as a string ---
+    # Intro cards / chapter titles (Beyond the Turquoise Stars opening) use
+    # `show text "..."`, NOT say lines. The engine translates them via
+    # translate_string at render time, so they must extract as native_kind
+    # "string". A `text "..."` widget inside a screen is a different statement
+    # (already covered) and must NOT be double-matched by this branch.
+    from parsers.renpy import _SHOW_TEXT_RE, RenPyParser as _RP
+    assert _SHOW_TEXT_RE.match('    show text "Hello"'), "show text not matched"
+    assert _SHOW_TEXT_RE.match('    show text "Hi" with dissolve'), "show text+modifier not matched"
+    assert not _SHOW_TEXT_RE.match('    text "widget"'), "bare screen text wrongly matched as show text"
+    assert not _SHOW_TEXT_RE.match('    show eileen happy'), "show image wrongly matched"
+    # End-to-end: extract a tiny project and confirm the show-text lines come out
+    # as native_kind "string", the asset is skipped, and the say line still works.
+    with tempfile.TemporaryDirectory() as _td:
+        _gd = os.path.join(_td, "game")
+        os.makedirs(_gd)
+        with open(os.path.join(_gd, "script.rpy"), "w", encoding="utf-8") as _f:
+            _f.write(
+                "label start:\n"
+                '    show text "As the years go by, life gets harder."\n'
+                '    show text "{i}Thank you for playing!{/i}" with dissolve\n'
+                '    show text "gui/logo.png"\n'   # asset → must be skipped
+                '    "A normal say line."\n'
+            )
+        _recs = _RP().extract(_td)
+        _by = {(_r.original): _r.path for _r in _recs}
+        # Both show-text cards extracted, addressed via the "showtext" path slot.
+        assert _by.get("As the years go by, life gets harder.") == \
+            ["label", "start", "showtext", "0"], _by
+        assert _by.get("{i}Thank you for playing!{/i}") == \
+            ["label", "start", "showtext", "1"], _by
+        # The asset path inside a show-text is filtered out (is_technical_string).
+        assert "gui/logo.png" not in _by, "asset path wrongly extracted from show text"
+        # The ordinary say line still extracts normally (say path), untouched.
+        assert _by.get("A normal say line.") == ["label", "start", "say", "0"], _by
+    print("OK — renpy show text: top-level displayable extracted, modifiers/assets handled")
+
     # --- dialogue auto-fit: {size=*scale} only for KNOWN fixed boxes ---
     from parsers.renpy import fit_scale_for_box, RenPyParser as _RP
     BOX_W, BOX_H, FS = 1650, 360, 45  # real Watch the Road dialogue box
@@ -3246,7 +3300,14 @@ def check_renpy_python_sources() -> None:
     callable). The native strings-dict approach only needs to read the source, so
     archives stay untouched on disk. This builds a tiny game with a loose .rpy and
     a real RPA-3.0 holding an archive-only .rpy, then asserts BOTH are readable as
-    sources AND nothing new was written to the game dir."""
+    sources AND nothing new was written to the game dir.
+
+    NOTE: load_all_sources now routes through RenPyParser._iter_sources (so it also
+    DECOMPILES compiled-only .rpyc — real bug: Beyond the Turquoise Stars ships its
+    scripts only as script.rpyc, so the inline path saw nothing and never translated
+    `renpy.input("Enter your name:")` / the default `"Absurde"`). Decompiled output
+    goes to a TEMP dir, never game/, so the read-only assertion below still holds.
+    The .rpyc-decompile leg itself is covered by check_renpy_decompile."""
     import pickle, zlib
     from pathlib import Path
     import renpy_python_translator as rp
