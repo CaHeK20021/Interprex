@@ -18,11 +18,9 @@ import {
   translateRenpyPython,
   autofixTranslation,
   proxyAutocheck,
-  renpyRisk,
   renpyLint,
   type ModInfo,
   type ProxyAutocheckResult,
-  type RenpyRiskReport,
   type RenpyLintResult,
 } from "./lib/ipc";
 import {
@@ -144,8 +142,6 @@ export default function App() {
   const [project, setProject] = useState<ProjectFile | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [hasBackup, setHasBackup] = useState<boolean>(false);
-  // Ren'Py text-overflow risk verdict (data-driven, from the game's own layout).
-  const [riskReport, setRiskReport] = useState<RenpyRiskReport | null>(null);
   // Engine-lint result after a translate (real hazards our injection may cause).
   const [lintResult, setLintResult] = useState<RenpyLintResult | null>(null);
   const [target, setTarget] = useState<TargetLang>(
@@ -625,13 +621,7 @@ export default function App() {
       setProject(proj);
       const { has_backup } = await getBackupStatus(picked);
       setHasBackup(has_backup);
-      // Data-driven text-overflow risk verdict (Ren'Py only; read-only, no engine
-      // run). Best-effort — a failure here must never block extraction.
-      setRiskReport(null);
       setLintResult(null);
-      if (detected === "renpy") {
-        renpyRisk(picked).then(setRiskReport).catch(() => setRiskReport(null));
-      }
       setPhase("idle");
     } catch (e) {
       fail(e);
@@ -1674,18 +1664,6 @@ export default function App() {
           </div>
         )}
       </div>
-
-      {/* Data-driven text-overflow risk verdict (Ren'Py). Only surfaced when the
-          game's own layout says a translation can clip (fixed textbox) — we stay
-          silent on the common "auto/scroll => no risk" case so it's not noise. */}
-      {engine === "renpy" && riskReport &&
-        (riskReport.dialogue_overflow_risk === "high" ||
-         riskReport.dialogue_overflow_risk === "low") && (
-        <div className={`risk-banner risk-${riskReport.dialogue_overflow_risk}`}>
-          <strong>{t("riskDialogueTitle") as string}</strong>{" "}
-          {riskReport.dialogue_reason}
-        </div>
-      )}
 
       {/* Engine-oracle lint result after a translate: the game's OWN engine found
           real hazards in our injected files (e.g. a translated "100%"). Only

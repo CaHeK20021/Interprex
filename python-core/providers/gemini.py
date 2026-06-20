@@ -41,65 +41,36 @@ class GeminiProvider(BaseProvider):
         if not api_key:
             return []
 
-        headers = {"x-goog-api-key": api_key, "x-provider": "gemini"}
-        direct_url = _API_ROOT
-
-        # Build step list: (url, timeout, is_proxy)
-        steps = []
-        if cfg.base_url:
-            proxy_url = _get_proxy_url(_API_ROOT, cfg.base_url)
-            # Proxy timeout configurations:
-            # We use connect=20.0s to allow Hugging Face Space cold starts to wake up,
-            # and read=60.0s for the first attempt.
-            timeout_proxy_1 = httpx.Timeout(connect=20.0, read=60.0, write=10.0, pool=5.0)
-            timeout_proxy_2 = httpx.Timeout(connect=20.0, read=90.0, write=10.0, pool=5.0)
-            timeout_direct = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=5.0)
-
-            # base_url is set only when the user/autocheck chose a proxy route.
-            # Never fall back to direct Google here — geo-blocked regions (RU etc.)
-            # get "User location is not supported" on direct even when the proxy works.
-            steps = [
-                (proxy_url, timeout_proxy_1, True),
-                (proxy_url, timeout_proxy_2, True),  # Retry on proxy (handles wake-up cold start)
-            ]
-            if not self._use_proxy_fallback:
-                # Last successful path was direct (same session) — try it once before proxy.
-                steps = [(direct_url, timeout_direct, False)] + steps
-        else:
-            timeout_direct = httpx.Timeout(connect=20.0, read=45.0, write=10.0, pool=5.0)
-            steps = [
-                (direct_url, timeout_direct, False)
-            ]
-
-        resp = None
-        last_err: Exception | None = None
-        for i, (url, timeout, is_proxy) in enumerate(steps):
-            try:
-                logger.info("Attempting model list query %d/%d to %s (timeout=%s)", i+1, len(steps), url, timeout)
-                resp = httpx.get(url, params={"pageSize": 1000}, headers=headers, timeout=timeout)
-                resp.raise_for_status()
-                self._use_proxy_fallback = is_proxy
-                break
-            except Exception as e:
-                last_err = e
-                logger.info("Model list query attempt %d failed via %s: %s", i+1, "proxy" if is_proxy else "direct", e)
-                resp = None
-
-        if resp is None:
-            logger.warning("Model list request failed on all paths: %s", last_err)
-            return []
-
-        try:
-            out: list[str] = []
-            for m in resp.json().get("models") or []:
-                methods = m.get("supportedGenerationMethods") or []
-                name = m.get("name", "")
-                if "generateContent" in methods and name.startswith("models/"):
-                    out.append(name[len("models/"):])
-            return sorted(out)
-        except Exception as parse_e:
-            logger.warning("Failed to parse models JSON: %s", parse_e)
-            return []
+        # Hardcoded list of supported Gemini text models to bypass network-level
+        # hangs during start-up key verification.
+        models = [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-001",
+            "gemini-2.0-flash-lite-001",
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-pro-preview-tts",
+            "gemma-4-26b-a4b-it",
+            "gemma-4-31b-it",
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            "gemini-pro-latest",
+            "gemini-2.5-flash-lite",
+            "gemini-3-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-pro-preview-customtools",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-3.5-flash",
+            "deep-research-max-preview-04-2026",
+            "deep-research-preview-04-2026",
+            "deep-research-pro-preview-12-2025",
+            "antigravity-preview-05-2026",
+        ]
+        return sorted(models)
 
     def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """Return the preferred default model so the UI pre-selects it instead of

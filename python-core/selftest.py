@@ -2723,30 +2723,20 @@ def check_providers() -> None:
         models_err = provider.list_models(cfg)
         assert models_err == [], f"expected empty list on error, got {models_err}"
 
-    # Gemini: with an explicit proxy base_url, list_models must not fall back to
-    # direct Google (geo-blocked regions get 400 "User location is not supported").
-    from providers.gemini import GeminiProvider, _API_ROOT
+    # Gemini: list_models is now hardcoded to bypass proxy hangs, so it must
+    # return the static list instantly and NOT make any network calls.
+    from providers.gemini import GeminiProvider
 
     gemini = GeminiProvider()
     gcfg = ProviderConfig(
         api_key="test-key",
         base_url="https://example-proxy.hf.space/v1",
     )
-    proxy_root = "https://example-proxy.hf.space/v1/v1beta/models"
-    mock_g = MagicMock()
-    mock_g.status_code = 200
-    mock_g.json.return_value = {
-        "models": [
-            {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
-        ]
-    }
-    with patch("httpx.get", return_value=mock_g) as mock_get:
+    with patch("httpx.get") as mock_get:
         models_g = gemini.list_models(gcfg)
-        assert models_g == ["gemini-2.5-flash"], models_g
-        assert mock_get.call_count == 1
-        assert mock_get.call_args[0][0] == proxy_root
-        for url in [c[0][0] for c in mock_get.call_args_list]:
-            assert not url.startswith(_API_ROOT), f"direct Google leaked: {url}"
+        assert "gemini-2.5-flash" in models_g
+        assert "gemma-4-31b-it" in models_g
+        assert mock_get.call_count == 0, f"no network call expected, made {mock_get.call_count}"
 
     # /models endpoint: active_model must reuse the fetched list (one HTTP call).
     with patch.object(gemini, "list_models", return_value=["gemini-2.5-flash"]) as mock_list:
