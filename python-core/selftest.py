@@ -928,6 +928,29 @@ def check_renpy_risk() -> None:
         assert _pf(_pf(s)) == _pf(s), f"not idempotent: {s!r}"
     print("OK — renpy %-format: bare % escaped, valid specs/%% verbatim, idempotent")
 
+    # --- text-tag repair (LLM appends junk to a closing tag: {/iR} -> {/i}) ---
+    from parsers.renpy import _repair_text_tags as _rt
+    # The real shipped bug: engine rejects "{/iR} does not match open tag {i}".
+    assert _rt("{i}Вы начинаете новый раунд{/iR}") == "{i}Вы начинаете новый раунд{/i}"
+    # Nested, inner close corrupted -> only the inner tag is snapped back.
+    assert _rt("{b}{i}both{/iX}{/b}") == "{b}{i}both{/i}{/b}"
+    # Tag carrying an arg: name is the part before '=' ({color=#fff} closes {/color}).
+    assert _rt("{color=#fff}red{/colorZ}") == "{color=#fff}red{/color}"
+    assert _rt("{size=+4}big{/sizeQ}") == "{size=+4}big{/size}"
+    # Second pair corrupted, first intact.
+    assert _rt("{i}a{/i}{i}b{/iQ}") == "{i}a{/i}{i}b{/i}"
+    # VALID markup is left byte-verbatim (no false positives).
+    for ok in ("{i}hi{/i}", "plain text", "{size=+4}big{/size}",
+               "{b}{i}x{/i}{/b}", "text{/}", "{w=0.5}wait", "no tags at all"):
+        assert _rt(ok) == ok, f"valid markup altered: {ok!r}"
+    # Ambiguous / unmatched close we CAN'T safely guess -> leave verbatim, never crash.
+    assert _rt("{w=0.5}wait{/i}weird") == "{w=0.5}wait{/i}weird"
+    assert _rt("no close {i}open") == "no close {i}open"
+    # Idempotent: re-running never re-mangles a fixed string.
+    for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain"):
+        assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
+    print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
+
     # --- dialogue auto-fit: {size=*scale} only for KNOWN fixed boxes ---
     from parsers.renpy import fit_scale_for_box, RenPyParser as _RP
     BOX_W, BOX_H, FS = 1650, 360, 45  # real Watch the Road dialogue box

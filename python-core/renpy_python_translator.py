@@ -1538,7 +1538,7 @@ def _write_inline_strings_file(game_path: Path, lang: str,
     `[var]`). Deduped by `old` (the dict is global per language; duplicate keys
     warn and only the last wins). Written as ONE file, registered as a `created`
     backup so restore just deletes it. Returns the number of pairs written."""
-    from parsers.renpy import _string_quote, _escape_bad_percent
+    from parsers.renpy import _string_quote, _escape_bad_percent, _repair_text_tags
 
     # Seed with keys ALREADY in the dialogue tl/ tree: Ren'Py crashes on a
     # duplicate `old` key per language. Pre-loading them here makes the dedup
@@ -1559,6 +1559,10 @@ def _write_inline_strings_file(game_path: Path, lang: str,
         if original in seen:
             skipped_dupe += 1
             continue
+        # Repair a closing text tag the LLM corrupted ({i}…{/iR} -> {i}…{/i})
+        # BEFORE validating: otherwise the mismatch would drop the whole string as
+        # "tokens corrupted". Deterministic, no API.
+        translated = _repair_text_tags(translated)
         violations = _validate_renpy_tokens(original, translated)
         if violations:
             skipped_vars += 1

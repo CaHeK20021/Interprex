@@ -705,6 +705,71 @@ def _escape_bad_percent(s: str) -> str:
     return "".join(out)
 
 
+# A single Ren'Py text tag: capture the leading "/" (closing) and the body.
+_TEXT_TAG_RE = re.compile(r'\{(/?)([^{}]*)\}')
+
+
+def _repair_text_tags(s: str) -> str:
+    """Fix a closing text tag whose name the LLM corrupted by appending junk —
+    e.g. `{i}…{/iR}` -> `{i}…{/i}`. A real shipped bug: the engine rejects
+    "Close text tag '{/iR}' does not match open text tag '{i}'" and the line breaks.
+
+    Ren'Py matches a closing tag `{/name}` against the most-recently-opened tag of
+    the same name (LIFO). We walk the string keeping a stack of open tag names; when
+    a closing tag's name does NOT match the stack top but DOES start with it (the
+    append-junk corruption: open `i` / close `iR`), we snap the close back to the
+    open name. Conservative: anything else (valid match, the bare `{/}` close-last
+    form, an unrelated mismatch we can't safely guess) is left byte-verbatim, so
+    valid markup is never touched. Idempotent. The tag NAME is everything before an
+    optional `=arg` (`{size=+4}` opens "size", closes `{/size}`)."""
+    if "{" not in s:
+        return s
+
+    def _name(body: str) -> str:
+        # Tag name = text before '=' (args) and without surrounding spaces.
+        return body.split("=", 1)[0].strip()
+
+    open_stack: list[str] = []
+    out: list[str] = []
+    pos = 0
+    changed = False
+    for m in _TEXT_TAG_RE.finditer(s):
+        out.append(s[pos:m.start()])
+        pos = m.end()
+        closing, body = m.group(1), m.group(2)
+        name = _name(body)
+        if not closing:
+            # Opening tag (or a standalone like {w=0.5}/{p}/{nw}/{clear}); we only
+            # need real paired tags on the stack. Push the name so a later close
+            # can match it; standalones simply never get a matching close, which is
+            # harmless (they stay on the stack but we never force-close them).
+            open_stack.append(name)
+            out.append(m.group(0))
+        else:
+            if name == "":
+                # `{/}` = close the most recent tag; valid, leave as-is.
+                if open_stack:
+                    open_stack.pop()
+                out.append(m.group(0))
+            elif open_stack and open_stack[-1] == name:
+                open_stack.pop()
+                out.append(m.group(0))
+            elif open_stack and name.startswith(open_stack[-1]) and len(open_stack[-1]) > 0:
+                # Corrupted close: name has junk appended to the real tag name.
+                fixed = open_stack.pop()
+                out.append("{/%s}" % fixed)
+                changed = True
+            else:
+                # Can't safely guess — leave verbatim (don't risk valid markup).
+                out.append(m.group(0))
+                if name in open_stack:
+                    # Pop down to it so the stack stays sane for later tags.
+                    while open_stack and open_stack.pop() != name:
+                        pass
+    out.append(s[pos:])
+    return "".join(out) if changed else s
+
+
 def iter_logical_lines(text: str):
     lines = text.split("\n")
     current_logical = []
@@ -1769,6 +1834,11 @@ class RenPyParser(BaseParser):
                     # engine treats displayed text as a format string by default, so
                     # a bare % is a crash-class lint error. Deterministic, no API.
                     tr = _escape_bad_percent(tr)
+                    # Repair a closing text tag the LLM corrupted (e.g. {i}…{/iR}):
+                    # the engine rejects mismatched tags and the line breaks. Fixed
+                    # deterministically before write, so engine-lint never even sees
+                    # it. No API.
+                    tr = _repair_text_tags(tr)
 
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],

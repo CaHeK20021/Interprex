@@ -178,7 +178,7 @@ const en = {
   hintOpenFolder: "Open a game folder to extract its strings.",
   hintReadyToTranslatePython: "Ready to translate. Select an action below. Simulation will show what strings will be translated without modifying game files.",
   errNoEngine: "No supported engine detected in that folder.",
-  wroteBack: (n: number) => `Wrote ${n} strings back into the game.`,
+  wroteBack: (n: number) => `Wrote ${n} unique strings into the game (duplicates merged — no translation lost).`,
   translateAborted: (done: number, total: number) =>
     `Translation stopped: the model stopped responding after retries. ` +
     `${done} of ${total} strings were translated — fix the backend and run Translate again to finish the rest.`,
@@ -202,7 +202,7 @@ const en = {
   errMixedEngines: "Mixed engines detected. Please select only mods of the same engine type.",
   phase_detecting_mods: "detecting mods",
   hintOpenModsFolder: "Open a mods folder to extract strings from mods.",
-  wroteBackMods: (n: number) => `Wrote ${n} strings back into the mods.`,
+  wroteBackMods: (n: number) => `Wrote ${n} unique strings into the mods (duplicates merged — no translation lost).`,
   writeBackBtnMods: "Write back to mods",
 
   // proxy settings panel
