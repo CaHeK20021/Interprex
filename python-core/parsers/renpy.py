@@ -404,6 +404,69 @@ _RENPY_LANGS = {
     "ko": "korean", "korean": "korean",
 }
 
+# Month names per target language, keyed by the normalized tl/ dir name
+# (_lang_dir output). Used to localize dates the game builds via
+# datetime.strftime("%B …") / "%b …": on Windows `locale.setlocale(LC_TIME,
+# "<lang>.UTF-8")` is UNRELIABLE — strftime returns bytes in the OS codepage
+# that Python then mis-decodes, rendering "Декабрь" as cp1251 mojibake (real
+# Killer Chat bug). So instead of touching locale at all we substitute the
+# English month name (strftime's stable C-locale output) for the target one
+# inside our translate_string wrapper. Index 0 = January. Full names first,
+# abbreviated (matching %b) second.
+_MONTHS_FULL = {
+    "russian": ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль",
+                "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"],
+    "ukrainian": ["Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+                  "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень"],
+    "spanish": ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio",
+                "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"],
+    "german": ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+               "August", "September", "Oktober", "November", "Dezember"],
+    "french": ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet",
+               "Août", "Septembre", "Octobre", "Novembre", "Décembre"],
+    "italian": ["Gennaio", "Febbraio", "Marzo", "Aprile", "Maggio", "Giugno",
+                "Luglio", "Agosto", "Settembre", "Ottobre", "Novembre", "Dicembre"],
+    "portuguese": ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                   "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"],
+    "polish": ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec",
+               "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"],
+    "turkish": ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz",
+                "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"],
+    "japanese": ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月",
+                 "9月", "10月", "11月", "12月"],
+    "chinese": ["一月", "二月", "三月", "四月", "五月", "六月", "七月", "八月",
+                "九月", "十月", "十一月", "十二月"],
+    "korean": ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월",
+               "9월", "10월", "11월", "12월"],
+}
+# Abbreviated month names (matching strftime "%b"). Where a script has no common
+# 3-letter abbreviation we reuse the full name (still correct, just not shortened).
+_MONTHS_ABBR = {
+    "russian": ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен",
+                "окт", "ноя", "дек"],
+    "ukrainian": ["січ", "лют", "бер", "кві", "тра", "чер", "лип", "сер", "вер",
+                  "жов", "лис", "гру"],
+    "spanish": ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep",
+                "oct", "nov", "dic"],
+    "german": ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep",
+               "Okt", "Nov", "Dez"],
+    "french": ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août",
+               "sept", "oct", "nov", "déc"],
+    "italian": ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set",
+                "ott", "nov", "dic"],
+    "portuguese": ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set",
+                   "out", "nov", "dez"],
+    "polish": ["sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz",
+               "paź", "lis", "gru"],
+    "turkish": ["Oca", "Şub", "Mar", "Nis", "May", "Haz", "Tem", "Ağu", "Eyl",
+                "Eki", "Kas", "Ara"],
+}
+# English source names strftime emits in the C locale (our stable lookup keys).
+_MONTHS_EN_FULL = ["January", "February", "March", "April", "May", "June", "July",
+                   "August", "September", "October", "November", "December"]
+_MONTHS_EN_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+                   "Oct", "Nov", "Dec"]
+
 
 # Ren'Py inline text markup ({i}, {/color}, {w=0.5}, {size=+4}…) and runtime
 # interpolation ([player_name], [[, …]). Stripped before the "is this prose?"
@@ -2475,6 +2538,45 @@ class RenPyParser(BaseParser):
         )
         self._atomic_write(root, abs_path, content)
 
+    @staticmethod
+    def _build_month_map_literal(lang: str) -> str:
+        """Return a Python dict-literal mapping each English month name (the C-locale
+        output of strftime %B/%b) to the target-language month name, for embedding in
+        the generated _interprex_font.rpy. Empty dict for languages we have no table
+        for (English target included), making the wrapper a no-op there.
+
+        Full names are emitted before abbreviations so that, when a script's abbrev
+        equals a prefix of the full name, dict insertion order keeps the full mapping;
+        the regex in the wrapper is word-bounded so 'Mar' won't match inside 'March'.
+        """
+        key = (lang or "").strip().lower()
+        if key not in _MONTHS_FULL:
+            # Regional variants ("portuguese (brazil)", "chinese (simplified)")
+            # share the base script's month names — fall back to the part before
+            # "(", matching _normalize_lang's stance.
+            key = key.split("(")[0].strip()
+        full = _MONTHS_FULL.get(key)
+        abbr = _MONTHS_ABBR.get(key)
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        if full:
+            for en, tgt in zip(_MONTHS_EN_FULL, full):
+                if en != tgt:
+                    pairs.append((en, tgt))
+                    seen.add(en)
+        if abbr:
+            for en, tgt in zip(_MONTHS_EN_ABBR, abbr):
+                # English "May" is identical full and abbreviated; the full form
+                # ("Май") must win for %B dates, so never let an abbr overwrite a
+                # key already mapped from the full table.
+                if en != tgt and en not in seen:
+                    pairs.append((en, tgt))
+                    seen.add(en)
+        if not pairs:
+            return "{}"
+        items = ", ".join(f"{en!r}: {tgt!r}" for en, tgt in pairs)
+        return "{" + items + "}"
+
     def _write_native_font(self, root: str, lang: str, font_name: str,
                            game_font_files: set[str] | None = None) -> None:
         """Point EVERY font the game uses at our font for <lang>, leaving the
@@ -2553,31 +2655,14 @@ class RenPyParser(BaseParser):
             f'            pass\n'
             f'    renpy.notify("Interprex: шрифт переведённого текста подставлен автоматически")\n'
             f"\n"
-            f"    # Set Python locale so strftime(\"%B\") returns translated month names,\n"
-            f"    # not English. Every game that formats dates via strftime benefits.\n"
-            f"    import locale as _ix_locale\n"
-            f"    _ix_locale_map = {{\n"
-            f'        "russian": "ru_RU.UTF-8", "spanish": "es_ES.UTF-8",\n'
-            f'        "french": "fr_FR.UTF-8", "german": "de_DE.UTF-8",\n'
-            f'        "italian": "it_IT.UTF-8", "portuguese": "pt_BR.UTF-8",\n'
-            f'        "chinese": "zh_CN.UTF-8", "japanese": "ja_JP.UTF-8",\n'
-            f'        "korean": "ko_KR.UTF-8", "polish": "pl_PL.UTF-8",\n'
-            f'        "turkish": "tr_TR.UTF-8", "arabic": "ar_SA.UTF-8",\n'
-            f'        "dutch": "nl_NL.UTF-8", "swedish": "sv_SE.UTF-8",\n'
-            f'        "czech": "cs_CZ.UTF-8", "hungarian": "hu_HU.UTF-8",\n'
-            f'        "romanian": "ro_RO.UTF-8", "ukrainian": "uk_UA.UTF-8",\n'
-            f'        "vietnamese": "vi_VN.UTF-8", "thai": "th_TH.UTF-8",\n'
-            f'        "hindi": "hi_IN.UTF-8", "indonesian": "id_ID.UTF-8",\n'
-            f'        "portuguese (brazil)": "pt_BR.UTF-8",\n'
-            f'        "chinese (simplified)": "zh_CN.UTF-8",\n'
-            f'        "chinese (traditional)": "zh_TW.UTF-8",\n'
-            f"    }}\n"
-            f"    _ix_loc = _ix_locale_map.get(\"{lang}\")\n"
-            f"    if _ix_loc:\n"
-            f"        try:\n"
-            f"            _ix_locale.setlocale(_ix_locale.LC_TIME, _ix_loc)\n"
-            f"        except _ix_locale.Error:\n"
-            f"            pass\n"
+            # Date localization. Games build dates via strftime("%B …")/"%b …";
+            # the result flows through `text`/say -> translate_string. We DON'T
+            # touch locale (setlocale(LC_TIME, "<lang>.UTF-8") returns OS-codepage
+            # bytes Python mis-decodes on Windows -> "Декабрь" mojibake, the real
+            # bug). Instead we hand the translate_string wrapper a deterministic
+            # English->target month map and let it substitute. Empty for langs we
+            # have no table for (English unchanged), so the wrapper is a no-op there.
+            f"    _ix_month_map = {self._build_month_map_literal(lang)}\n"
             f"\n"
             f"    # Style overrides for choice buttons (auto height and subtitle layout fallback)\n"
             f"    style.choice_button.ysize = None\n"
@@ -2744,61 +2829,74 @@ class RenPyParser(BaseParser):
             f"                _ChatChannel.get_who_typing = property(_get_who_typing_translated)\n"
             f"                _ChatChannel._patched_by_interprex_typing = True\n"
             f"\n"
-            f"        # Patch renpy.translation.translate_string to ALSO translate choices\n"
-            f"        # prefixed with a number (e.g. '1. ...'). CRITICAL: patch IN PLACE via\n"
-            f"        # __code__ swap, NEVER rebind renpy.translation.translate_string. The\n"
-            f"        # engine captures the ORIGINAL translate_string object into the save\n"
-            f"        # graph (via show_display_say's show_function); pickle saves functions\n"
-            f"        # BY REFERENCE and verifies identity, so a rebind makes the saved object\n"
-            f"        # != renpy.translation.translate_string -> PicklingError on EVERY save\n"
-            f"        # (real shipped player crash, Killer Chat 1.4.1). In-place keeps the\n"
-            f"        # SAME object, so saves stay valid. The clone of the original gets a\n"
-            f"        # UNIQUE name so that, if it is itself reached by pickle as a store var,\n"
-            f"        # it resolves to itself instead of the patched original (same gotcha as\n"
-            f"        # the add_ping_hyperlinks clone above). _orig is keyword-only (after\n"
-            f"        # *args) so its default lives in __kwdefaults__, not __defaults__.\n"
-            f"        _ix_ts = getattr(renpy.translation, 'translate_string', None)\n"
-            f"        if callable(_ix_ts) and not getattr(renpy.translation, '_patched_by_interprex_choices', False):\n"
-            f"            import types as _ix_ts_types\n"
+            # NOTE: top-level (4-space) — NOT under the ServerRole/ChatCharacter
+            # gate. It must run for EVERY game so date localization + number-prefix
+            # choice translation work universally, not only on Killer Chat.
+            f"    # Patch renpy.translation.translate_string to ALSO (a) localize dates the\n"
+            f"    # game builds via strftime('%B'/'%b') by substituting English month names\n"
+            f"    # for the target ones (deterministic, NO locale — setlocale gives\n"
+            f"    # OS-codepage mojibake on Windows), and (b) translate choices prefixed with\n"
+            f"    # a number ('1. ...'). CRITICAL: patch IN PLACE via __code__ swap, NEVER\n"
+            f"    # rebind renpy.translation.translate_string. The engine captures the\n"
+            f"    # ORIGINAL translate_string object into the save graph (via\n"
+            f"    # show_display_say's show_function); pickle saves functions BY REFERENCE\n"
+            f"    # and verifies identity, so a rebind makes the saved object !=\n"
+            f"    # renpy.translation.translate_string -> PicklingError on EVERY save (real\n"
+            f"    # shipped player crash, Killer Chat 1.4.1). In-place keeps the SAME object,\n"
+            f"    # so saves stay valid. The clone of the original gets a UNIQUE name and is\n"
+            f"    # registered on renpy.translation so that, when it too is reached by pickle\n"
+            f"    # from the save graph, the by-reference lookup resolves to itself instead of\n"
+            f"    # raising 'attribute lookup failed'. _orig/_lookup/_mre are keyword-only\n"
+            f"    # (after *args) so their defaults live in __kwdefaults__, not __defaults__.\n"
+            f"    _ix_ts = getattr(renpy.translation, 'translate_string', None)\n"
+            f"    if callable(_ix_ts) and not getattr(renpy.translation, '_patched_by_interprex_choices', False):\n"
+            f"        import types as _ix_ts_types, re as _ix_ts_re\n"
+            f"        _ix_month_lookup = dict(_ix_month_map)\n"
+            f"        _ix_month_re = None\n"
+            f"        if _ix_month_lookup:\n"
             f"            try:\n"
-            f"                _interprex_orig_translate_string = _ix_ts_types.FunctionType(\n"
-            f"                    _ix_ts.__code__, _ix_ts.__globals__,\n"
-            f"                    '_interprex_orig_translate_string',\n"
-            f"                    _ix_ts.__defaults__, _ix_ts.__closure__)\n"
-            f"                try:\n"
-            f"                    _interprex_orig_translate_string.__qualname__ = '_interprex_orig_translate_string'\n"
-            f"                except Exception:\n"
-            f"                    pass\n"
-            f"                # The clone is reachable from the save graph (it sits in the\n"
-            f"                # patched function's __kwdefaults__ AND the engine references it\n"
-            f"                # via show_display_say). Pickle saves functions BY REFERENCE\n"
-            f"                # using obj.__module__ + __qualname__; the clone inherits\n"
-            f"                # __module__='renpy.translation' from the original's globals, so\n"
-            f"                # pickle does getattr(renpy.translation, '_interprex_orig_\n"
-            f"                # translate_string') — which FAILS ('attribute lookup failed')\n"
-            f"                # unless we register it there. Registering the SAME object makes\n"
-            f"                # the by-reference lookup resolve to itself -> save succeeds.\n"
-            f"                renpy.translation._interprex_orig_translate_string = _interprex_orig_translate_string\n"
-            f"                def _ix_ts_wrapper(s, *args, _orig=_interprex_orig_translate_string, **kwargs):\n"
-            f"                    res = _orig(s, *args, **kwargs)\n"
-            f"                    if res == s and s:\n"
-            f"                        try:\n"
-            f"                            import re\n"
-            f"                            m = re.match(r'^(\\d+[\\.\\)]\\s*)(.*)$', s)\n"
-            f"                            if m:\n"
-            f"                                prefix, rest = m.groups()\n"
-            f"                                translated_rest = _orig(rest, *args, **kwargs)\n"
-            f"                                if translated_rest != rest:\n"
-            f"                                    return prefix + translated_rest\n"
-            f"                        except Exception:\n"
-            f"                            pass\n"
-            f"                    return res\n"
-            f"                _ix_ts.__code__ = _ix_ts_wrapper.__code__\n"
-            f"                _ix_ts.__defaults__ = _ix_ts_wrapper.__defaults__\n"
-            f"                _ix_ts.__kwdefaults__ = _ix_ts_wrapper.__kwdefaults__\n"
-            f"                renpy.translation._patched_by_interprex_choices = True\n"
+            f"                _ix_month_re = _ix_ts_re.compile(r'\\b(' + '|'.join(_ix_ts_re.escape(_k) for _k in _ix_month_lookup) + r')\\b')\n"
+            f"            except Exception:\n"
+            f"                _ix_month_re = None\n"
+            f"        try:\n"
+            f"            _interprex_orig_translate_string = _ix_ts_types.FunctionType(\n"
+            f"                _ix_ts.__code__, _ix_ts.__globals__,\n"
+            f"                '_interprex_orig_translate_string',\n"
+            f"                _ix_ts.__defaults__, _ix_ts.__closure__)\n"
+            f"            try:\n"
+            f"                _interprex_orig_translate_string.__qualname__ = '_interprex_orig_translate_string'\n"
             f"            except Exception:\n"
             f"                pass\n"
+            f"            renpy.translation._interprex_orig_translate_string = _interprex_orig_translate_string\n"
+            f"            def _ix_ts_wrapper(s, *args, _orig=_interprex_orig_translate_string, _lookup=_ix_month_lookup, _mre=_ix_month_re, **kwargs):\n"
+            f"                res = _orig(s, *args, **kwargs)\n"
+            f"                # Only post-process strings the engine had NO tl/ translation\n"
+            f"                # for (res == s): already-translated text must stay verbatim,\n"
+            f"                # and dynamically-built strings (dates, numbered choices) are\n"
+            f"                # exactly the ones that come back unchanged.\n"
+            f"                if res == s and s:\n"
+            f"                    try:\n"
+            f"                        import re as _re2\n"
+            f"                        m = _re2.match(r'^(\\d+[\\.\\)]\\s*)(.*)$', s)\n"
+            f"                        if m:\n"
+            f"                            prefix, rest = m.groups()\n"
+            f"                            translated_rest = _orig(rest, *args, **kwargs)\n"
+            f"                            if translated_rest != rest:\n"
+            f"                                return prefix + translated_rest\n"
+            f"                    except Exception:\n"
+            f"                        pass\n"
+            f"                    if _mre is not None:\n"
+            f"                        try:\n"
+            f"                            return _mre.sub(lambda mm: _lookup.get(mm.group(0), mm.group(0)), res)\n"
+            f"                        except Exception:\n"
+            f"                            pass\n"
+            f"                return res\n"
+            f"            _ix_ts.__code__ = _ix_ts_wrapper.__code__\n"
+            f"            _ix_ts.__defaults__ = _ix_ts_wrapper.__defaults__\n"
+            f"            _ix_ts.__kwdefaults__ = _ix_ts_wrapper.__kwdefaults__\n"
+            f"            renpy.translation._patched_by_interprex_choices = True\n"
+            f"        except Exception:\n"
+            f"            pass\n"
         )
         self._atomic_write(root, abs_path, content)
 

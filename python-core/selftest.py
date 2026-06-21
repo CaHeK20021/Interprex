@@ -512,6 +512,45 @@ def check_renpy_font() -> None:
         f"SAME object -> pickle-by-reference save crash (got {_found!r})"
     )
 
+    # DATE LOCALIZATION (mojibake fix). The game builds dates via
+    # strftime("%B %d, %Y") -> "December 01, 2024", which flows through
+    # translate_string with NO tl/ match (res == s). The wrapper must substitute
+    # the English month for the Russian one — deterministically, NOT via
+    # locale.setlocale (which returns OS-codepage bytes Python mis-decodes on
+    # Windows: "Декабрь" rendered as cp1251 garbage, the real player bug). The
+    # mock translate_string returns "translated:" + s, so a date string (which a
+    # real engine returns unchanged) is simulated by feeding a string the mock
+    # passes through. Here we exercise the substitution directly via the wrapper's
+    # month map: every English month maps to its Russian name, and the result must
+    # be the proper UTF-8 string, never mojibake.
+    _ru_months = {
+        "January": "Январь", "February": "Февраль", "March": "Март",
+        "April": "Апрель", "May": "Май", "June": "Июнь", "July": "Июль",
+        "August": "Август", "September": "Сентябрь", "October": "Октябрь",
+        "November": "Ноябрь", "December": "Декабрь",
+    }
+    _wrap_map = (trans_fn.__kwdefaults__ or {}).get("_lookup") or {}
+    for _en, _ru in _ru_months.items():
+        assert _wrap_map.get(_en) == _ru, (
+            f"month map missing/wrong for {_en!r}: got {_wrap_map.get(_en)!r}, want {_ru!r}"
+        )
+    # The substitution itself: a date string the engine returns unchanged must
+    # come back with the month localized. The mock prefixes "translated:", and
+    # since "December 01, 2024" has no tl/ entry the engine returns it as-is; our
+    # mock returns "translated:..." so to test the date path we use a string the
+    # mock leaves unchanged. Build a tiny pass-through call via the registered
+    # clone semantics: feed the wrapper a string equal to its own output.
+    # Simplest robust check: the regex+map substitution must turn the English
+    # month into Russian (word-bounded, so "Mar" inside "March" is NOT touched).
+    import re as _re_chk
+    _mre = (trans_fn.__kwdefaults__ or {}).get("_mre")
+    assert _mre is not None, "month regex must be built for a non-English target"
+    _sub = _mre.sub(lambda mm: _wrap_map.get(mm.group(0), mm.group(0)), "December 01, 2024")
+    assert _sub == "Декабрь 01, 2024", f"date localization failed: {_sub!r}"
+    # Word boundary: a month abbrev must not corrupt a longer word containing it.
+    _sub2 = _mre.sub(lambda mm: _wrap_map.get(mm.group(0), mm.group(0)), "Marathon")
+    assert _sub2 == "Marathon", f"month abbrev wrongly matched inside a word: {_sub2!r}"
+
     # Verify that ChatChannel get_who_typing property is patched and dynamically translates typing indicators
     patched_channel_class = env.get("ChatChannel")
     channel_inst = patched_channel_class()

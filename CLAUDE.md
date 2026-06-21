@@ -812,6 +812,23 @@ Ren'Py games can have customized UI/layout styling or run-time text preprocessin
    - `style.choice_button.ysize = None`: Permits choice/menu buttons to dynamically scale vertically, accommodating longer translated options.
    - `style.choice_button_text.layout = 'subtitle'`: Enables better word-wrapping algorithms on choice captions.
 
+1b. **Date localization WITHOUT `locale` (mojibake fix).** Games build dates via
+   `datetime.strftime("%B %d, %Y")` / `"%b …"` (real case: Killer Chat
+   `chat_system_functions.rpy` → `text todays_date_for_display`). The English month
+   name flows through `renpy.translation.translate_string` at render time. We do
+   **NOT** call `locale.setlocale(LC_TIME, "<lang>.UTF-8")`: on Windows `strftime`
+   then returns bytes in the OS codepage that Python mis-decodes, rendering
+   "Декабрь" as cp1251 garbage (the reported player bug). Instead the generated
+   block embeds a **deterministic** English→target month dict
+   (`_build_month_map_literal`, from module tables `_MONTHS_FULL`/`_MONTHS_ABBR`,
+   regional variants like "portuguese (brazil)" normalized to the base script) and
+   the `translate_string` wrapper word-boundary-substitutes month names in any
+   string the engine returned unchanged (`res == s`). English target → empty map →
+   no-op. The substitution is keyed on strftime's STABLE C-locale output
+   (`_MONTHS_EN_FULL`/`_ABBR`), so it never depends on the player's OS locale.
+   Verified in `check_renpy_font` (December→Декабрь, word-boundary "Marathon"
+   untouched) + all 9 target langs build a non-empty map (except English).
+
 2. **Function Wrapping (e.g., *Killer Chat!*)**:
    - The game pre-processes chat messages at runtime by calling `add_ping_hyperlinks()`, replacing variable pings like `@[username]` with temporary symbols (`<0001>`) and calling `renpy.substitute()`. This means `translate_string` is run on the placeholder-replaced version, which fails to match the original translation key.
    - We patch `add_ping_hyperlinks` to intercept the text and translate it *before* placeholders are injected.
