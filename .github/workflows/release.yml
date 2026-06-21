@@ -14,10 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Добавили кэш для Node.js (cache: 'npm')
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -27,16 +29,26 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # 2. Добавили кэш для Python (cache: 'pip')
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: 'python-core/requirements.txt' # Чтобы кэш обновлялся при изменении этого файла
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r python-core/requirements.txt
           python -m pip install pyinstaller
+
+      # Дополнительно: Кэшируем сборку самого PyInstaller, чтобы он не пересобирал всё с нуля
+      - name: PyInstaller Cache
+        uses: actions/cache@v4
+        with:
+          path: python-core/build
+          key: ${{ runner.os }}-pyinstaller-${{ hashFiles('python-core/requirements.txt') }}
 
       - name: Build Python sidecar
         run: python -m PyInstaller --distpath python-core/dist --workpath python-core/build --noconfirm python-core/sidecar.spec
