@@ -1779,6 +1779,32 @@ class RenPyParser(BaseParser):
                     )
             except Exception as e_fit:
                 logger.warning("auto-fit budgets unavailable: %s", e_fit)
+
+            # Screen-caption box-fit map: (file_rel, line) -> (box_w, box_h, size)
+            # for every textbutton/text/label that lives in a KNOWN fixed box. A
+            # `string`-kind caption (screen text / _() / label) gets NO fitting
+            # otherwise — only say lines and menu choices did — so a 2-line button
+            # like THE RIGHT BUTTON?\nOR THE RIGHT BUTTON? wraps to 3 lines in the
+            # wider target script and clips at the top (real Killer Chat bug). We
+            # wrap such a caption in {size=*scale} so the engine renders the WHOLE
+            # text smaller, exactly like _fit_dialogue. Unknown box -> absent from
+            # the map -> untouched (auto-grow contract). Built once here.
+            screen_box_map: dict[tuple[str, int], tuple[int, int, int]] = {}
+            try:
+                _box_sources = list(self._iter_sources(root, sub_paths))
+                _style_boxes = self._parse_style_boxes(_box_sources)
+                _style_sizes = self._parse_style_text_sizes(_box_sources)
+                _body_size = _gui_ints.get("text_size") if isinstance(_gui_ints, dict) else None
+                if not _body_size and _style_sizes:
+                    from collections import Counter
+                    _body_size = Counter(_style_sizes.values()).most_common(1)[0][0]
+                _body_size = _body_size or 32
+                screen_box_map = self._screen_widget_boxes(
+                    _box_sources, _style_boxes, _style_sizes, _body_size
+                )
+            except Exception as e_box:
+                logger.warning("screen caption box-fit unavailable: %s", e_box)
+
             # Every font FILE the game references by name (e.g. font "TinyUnicode.ttf",
             # gui.bsod_text_font = "AnalogueOS-Regular.ttf"). The engine resolves ANY
             # font name through config.font_name_map.get(name, name) (renpy/text/text.py),
@@ -1920,6 +1946,18 @@ class RenPyParser(BaseParser):
                                 tr, choice_box_w, choice_font_size, target_lang,
                                 font_style,
                             )
+                        else:
+                            # Screen caption (text / _() / label / textbutton): if it
+                            # lives in a KNOWN fixed box and the translation would
+                            # clip, wrap in {size=*scale} so the engine renders the
+                            # WHOLE text smaller — never cut. Absent from the map ->
+                            # unknown box -> left untouched (auto-grow contract).
+                            box = screen_box_map.get((file_rel, rec["src_line"]))
+                            if box:
+                                bw, bh, bsz = box
+                                entry_tr = self._fit_dialogue(
+                                    entry_tr, bw, bh, bsz, target_lang, font_style,
+                                )
                         string_entries.setdefault(tl_rel, []).append(
                             (f"{file_rel}:{rec['src_line']}", old_decoded, entry_tr))
 
@@ -2010,6 +2048,175 @@ class RenPyParser(BaseParser):
                         best = max(best, int(xm.group(1)))
                     i += 1
         return best
+
+    # Screen widgets whose caption lives in a FIXED box and so can clip a longer
+    # translation. `textbutton`/`label` are clickable captions; `text` is a
+    # heading/paragraph. All three get box-fit when (and only when) we can read a
+    # real fixed width AND height for them — otherwise we leave the text untouched
+    # (auto-grow contract). A bare inline `xsize/ysize/xysize` on the widget wins
+    # over the style; the style supplies whatever the widget doesn't state.
+    _WIDGET_BOX_RE = re.compile(
+        r'^(?P<indent>[ \t]*)(?P<kind>textbutton|text|label)\b'
+    )
+    _STYLE_REF_RE = re.compile(r'\bstyle\s+["\'](?P<style>\w[\w.]*)["\']')
+    _PREFIX_REF_RE = re.compile(r'^[ \t]*style_prefix\s+["\']?(?P<prefix>\w[\w.]*)["\']?')
+    _INLINE_XYSIZE_RE = re.compile(r'\bxysize\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)')
+    _INLINE_XSIZE_RE = re.compile(r'\b(?:xsize|xmaximum)\s+(\d+)\b')
+    _INLINE_YSIZE_RE = re.compile(r'\b(?:ysize|ymaximum)\s+(\d+)\b')
+
+    def _parse_style_boxes(self, sources) -> dict[str, tuple[int, int]]:
+        """Map style name -> (width, height) declared by `xysize (W,H)` / `xsize N`
+        / `ysize N` in its `style <name>:` block, resolving a one-level `is <parent>`
+        so a child that only adds geometry still inherits the parent's box (Killer
+        Chat: `name_customization_confirm_cancel_button is name_customization_select_button`
+        then `xysize (364, 81)`). 0 on an axis means "not fixed on that axis". Same
+        scan shape as `_parse_style_text_sizes`, so the two never drift."""
+        head = re.compile(
+            r'^([ \t]*)style\s+(\w[\w.]*)\b(?:\s+is\s+(\w[\w.]*))?\s*:\s*(?:#.*)?$'
+        )
+        is_line = re.compile(r'^\s+is\s+(\w[\w.]*)\b')
+        xysize = re.compile(r'^\s*xysize\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)')
+        xsize = re.compile(r'^\s*(?:xsize|xmaximum)\s+(\d+)\b')
+        ysize = re.compile(r'^\s*(?:ysize|ymaximum)\s+(\d+)\b')
+        boxes: dict[str, list[int]] = {}   # name -> [w, h]
+        parents: dict[str, str] = {}
+        for _file_rel, text in sources:
+            lines = text.split("\n")
+            i = 0
+            while i < len(lines):
+                m = head.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                name = m.group(2)
+                if m.group(3):
+                    parents.setdefault(name, m.group(3))
+                indent = len(m.group(1))
+                wh = boxes.setdefault(name, [0, 0])
+                i += 1
+                while i < len(lines):
+                    l = lines[i]
+                    if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                        break
+                    mt = xysize.match(l)
+                    if mt:
+                        wh[0] = wh[0] or int(mt.group(1))
+                        wh[1] = wh[1] or int(mt.group(2))
+                    else:
+                        mx = xsize.match(l)
+                        if mx:
+                            wh[0] = wh[0] or int(mx.group(1))
+                        my = ysize.match(l)
+                        if my:
+                            wh[1] = wh[1] or int(my.group(1))
+                    im = is_line.match(l)
+                    if im:
+                        parents.setdefault(name, im.group(1))
+                    i += 1
+        # Inherit a missing axis from the parent (one level — covers the common
+        # `child is parent` + child-adds-geometry case without chasing chains).
+        for name, parent in parents.items():
+            pwh = boxes.get(parent)
+            if not pwh:
+                continue
+            cwh = boxes.setdefault(name, [0, 0])
+            cwh[0] = cwh[0] or pwh[0]
+            cwh[1] = cwh[1] or pwh[1]
+        return {n: (wh[0], wh[1]) for n, wh in boxes.items()}
+
+    def _screen_widget_boxes(
+        self, sources, style_boxes: dict[str, tuple[int, int]],
+        style_sizes: dict[str, int], body_size: int,
+    ) -> dict[tuple[str, int], tuple[int, int, int]]:
+        """Map (file_rel, src_line) -> (box_w, box_h, text_size) for every screen
+        `textbutton`/`text`/`label` widget whose caption lives in a KNOWN fixed box
+        (both width AND height resolvable). Only these can clip; everything else is
+        omitted so inject leaves it untouched (auto-grow contract).
+
+        A widget's box = its own inline `xysize/xsize/ysize` (wins) merged with the
+        style it resolves to: an explicit `style "X"` on the widget, else the
+        nearest enclosing `style_prefix` → `<prefix>_button`/`<prefix>` /`<prefix>_text`.
+        The text size comes from `<style>_text` (via style_sizes) → body_size."""
+        out: dict[tuple[str, int], tuple[int, int, int]] = {}
+        for file_rel, text in sources:
+            lines = text.split("\n")
+            # Stack of (indent, prefix) so a nested style_prefix shadows an outer.
+            prefix_stack: list[tuple[int, str]] = []
+            for idx, raw in enumerate(lines):
+                if not raw.strip() or raw.lstrip().startswith("#"):
+                    continue
+                indent = len(raw) - len(raw.lstrip())
+                # A style_prefix applies to its SIBLINGS (same indent) and deeper
+                # lines, until we dedent STRICTLY past it. So pop only on a strict
+                # dedent — same-indent siblings (the textbutton next to the prefix)
+                # must keep it.
+                while prefix_stack and indent < prefix_stack[-1][0]:
+                    prefix_stack.pop()
+                pm = self._PREFIX_REF_RE.match(raw)
+                if pm:
+                    # A new prefix at the same indent replaces the previous sibling
+                    # prefix rather than nesting under it.
+                    while prefix_stack and indent == prefix_stack[-1][0]:
+                        prefix_stack.pop()
+                    prefix_stack.append((indent, pm.group("prefix")))
+                    continue
+                wm = self._WIDGET_BOX_RE.match(raw)
+                if not wm:
+                    continue
+                # Gather this widget's logical line (it + deeper-indented props,
+                # e.g. `xsize 350` on the next line) so inline sizes are seen.
+                blob = raw
+                j = idx + 1
+                while j < len(lines):
+                    nxt = lines[j]
+                    if not nxt.strip():
+                        j += 1
+                        continue
+                    if (len(nxt) - len(nxt.lstrip())) <= indent:
+                        break
+                    blob += "\n" + nxt
+                    j += 1
+
+                box_w = box_h = 0
+                mxy = self._INLINE_XYSIZE_RE.search(blob)
+                if mxy:
+                    box_w, box_h = int(mxy.group(1)), int(mxy.group(2))
+                mx = self._INLINE_XSIZE_RE.search(blob)
+                if mx:
+                    box_w = box_w or int(mx.group(1))
+                my = self._INLINE_YSIZE_RE.search(blob)
+                if my:
+                    box_h = box_h or int(my.group(1))
+
+                # Resolve the widget's style: explicit `style "X"` else the active
+                # style_prefix's button/base style. text/label/textbutton share the
+                # prefix's box style in custom UIs.
+                styles: list[str] = []
+                sref = self._STYLE_REF_RE.search(blob)
+                if sref:
+                    styles.append(sref.group("style"))
+                if prefix_stack:
+                    pfx = prefix_stack[-1][1]
+                    styles += [f"{pfx}_button", pfx]
+                for st in styles:
+                    sw, sh = style_boxes.get(st, (0, 0))
+                    box_w = box_w or sw
+                    box_h = box_h or sh
+                    if box_w and box_h:
+                        break
+
+                if box_w <= 0 or box_h <= 0:
+                    continue  # unknown box -> don't touch (contract)
+
+                # Text size: <style>_text size for any resolved style, else body.
+                tsize = 0
+                for st in styles:
+                    tsize = style_sizes.get(st)
+                    if tsize:
+                        break
+                tsize = tsize or body_size
+                out[(file_rel, idx + 1)] = (box_w, box_h, tsize)
+        return out
 
     def finalize_backups(self, root: str) -> None:
         """Delete files marked as ``type=created`` in backup metadata, except
@@ -2332,7 +2539,11 @@ class RenPyParser(BaseParser):
             f"                def __repr__(self):\n"
             f"                    return repr(self.russian_val)\n"
             f"                def __eq__(self, other):\n"
-            f"                    if isinstance(other, TranslatingString):\n"
+            f"                    # Use type(self), NOT the bare class name: a method's\n"
+            f"                    # global lookup of TranslatingString fails inside a\n"
+            f"                    # translate-python exec block (NameError) — type(self)\n"
+            f"                    # resolves the class with no global dependency.\n"
+            f"                    if isinstance(other, type(self)):\n"
             f"                        return self.english_val == other.english_val\n"
             f"                    return self.english_val == other or self.russian_val == other\n"
             f"                def __ne__(self, other):\n"
@@ -2357,10 +2568,10 @@ class RenPyParser(BaseParser):
             f"        if 'ServerRole' in globals():\n"
             f"            _ServerRole = globals()['ServerRole']\n"
             f"            if not hasattr(_ServerRole, '_patched_by_interprex'):\n"
-            f"                def _get_role_name(self):\n"
+            f"                def _get_role_name(self, _TS=TranslatingString):\n"
             f"                    raw = self.__dict__.get('name', '')\n"
-            f"                    if isinstance(raw, str) and not isinstance(raw, TranslatingString):\n"
-            f"                        return TranslatingString(raw)\n"
+            f"                    if isinstance(raw, str) and not isinstance(raw, _TS):\n"
+            f"                        return _TS(raw)\n"
             f"                    return raw\n"
             f"                def _set_role_name(self, val):\n"
             f"                    self.__dict__['name'] = val\n"
@@ -2370,10 +2581,10 @@ class RenPyParser(BaseParser):
             f"        if 'ChatCharacter' in globals():\n"
             f"            _ChatCharacter = globals()['ChatCharacter']\n"
             f"            if not hasattr(_ChatCharacter, '_patched_by_interprex'):\n"
-            f"                def _get_dominant_role(self):\n"
+            f"                def _get_dominant_role(self, _TS=TranslatingString):\n"
             f"                    raw = self.__dict__.get('dominant_role', '')\n"
-            f"                    if isinstance(raw, str) and not isinstance(raw, TranslatingString):\n"
-            f"                        return TranslatingString(raw)\n"
+            f"                    if isinstance(raw, str) and not isinstance(raw, _TS):\n"
+            f"                        return _TS(raw)\n"
             f"                    return raw\n"
             f"                def _set_dominant_role(self, val):\n"
             f"                    self.__dict__['dominant_role'] = val\n"

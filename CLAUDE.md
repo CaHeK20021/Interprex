@@ -158,13 +158,34 @@ FONT and keeping the word whole. Two mechanisms, both preserve the full text:
    (`new`/say body), never in `old`/identifier, so it can't affect hashes or
    code comparisons.
 
+3. **Screen captions (`text` / `_()` / `label` / `textbutton`)** (`parsers/renpy.py::
+   _parse_style_boxes` + `_screen_widget_boxes`, applied via `_fit_dialogue` in the
+   inject `string` branch): a `string`-kind caption that lives in a **fixed box** used
+   to get NO fitting — only say lines (2) and menu choices got it — so a multi-line
+   screen button overflowed unchecked. Real Killer Chat bug: `error_screen.rpy:117`
+   `textbutton _("THE RIGHT BUTTON?\nOR THE RIGHT BUTTON?")` in a 350×81 box — the
+   wider RU line wrapped to a 3rd line and **clipped at the top**. Fix: resolve each
+   screen widget's box (inline `xsize/ysize/xysize` wins, else its `style_prefix`'s
+   `<prefix>_button`/`<prefix>` style box, with **one-level `is` inheritance** so a
+   child that only adds geometry still inherits the parent's box), then box-fit the
+   SAME way as dialogue: `{size=*scale}` so the engine renders the WHOLE caption
+   smaller. Point-fix per widget (a fitting sibling button is left untouched — better
+   than shrinking the whole style). **Same CONTRACT: box must be KNOWN on BOTH axes
+   (width AND height); unknown → widget is absent from the map → text untouched**
+   (auto-grow chat captions like "is typing…" never get a box, stay full size). The
+   `style_prefix` scope follows the engine: it applies to its SIBLINGS at its own
+   indent, so the pop rule is **strict dedent** (a same-indent later prefix replaces
+   it) — otherwise the textbutton next to the prefix loses it.
+
 Most dialogue boxes auto-grow or scroll, so a true fixed-box overflow is rare — a
 runtime per-frame auto-fit was considered and **rejected** as too risky for too
 little gain; the offline `{size=*}` approach covers the real cases with zero
 runtime cost. Verified end-to-end: real inject on Watch the Road (box 1650×360) wraps
 a 750-char RU line in `{size=*0.65}` (full text intact), leaves a 292-char line
-untouched; Killer Chat (no gui box) → fit OFF. Offline guards: `check_renpy`
-dialogue-auto-fit case + scheduler 1-word-no-reask case in `selftest.py`.
+untouched; Killer Chat (no gui box) → dialogue fit OFF, but the fixed-box screen
+button (350×81) wraps `{size=*0.8}` (full RU text intact) while its fitting siblings
+stay full size. Offline guards: `check_renpy` dialogue-auto-fit + menu-choice-fit +
+**screen-caption box-fit** cases + scheduler 1-word-no-reask case in `selftest.py`.
 
 ## Engine-oracle lint — validate our `tl/` with the game's OWN Ren'Py
 
@@ -764,6 +785,21 @@ To prevent crashes, infinite recursion, or issues in game/test environments:
       # apply patch
   ```
 - **Closure Default Argument Binding**: Capture the original function as a default parameter in the wrapper signature (e.g., `def _patched_fn(text, _orig=_orig_fn):`). This stores the reference at definition time, preventing infinite recursion or `NameError`/`RecursionError` when the code is executed multiple times or inside Python `exec()` blocks.
+- **A class defined in the block is NOT a global for its methods — bind it via
+  default arg / `type(self)`, NEVER the bare name.** A `translate <lang> python:`
+  block runs with the store as GLOBALS and a SEPARATE locals frame, so a
+  `class TranslatingString(str)` defined in the block binds into LOCALS, not the
+  patched methods' `__globals__`. A method (property getter, `__eq__`) that
+  references the bare class name then raises **`NameError: name 'TranslatingString'
+  is not defined` at call time** (real Killer Chat 1.4.1 crash in `_get_role_name`
+  / `_get_dominant_role` / `__eq__`). Fix: capture the class as a default arg at
+  def-time (`def _get_role_name(self, _TS=TranslatingString):` then use `_TS`); and
+  inside the class's OWN methods, where the name isn't bound yet, use
+  `isinstance(other, type(self))` — zero global lookup. Same closure rule as the
+  `add_ping_hyperlinks` wrapper above: never rely on a name being a global inside
+  exec'd patch code. **Test trap:** `check_renpy_font` must `exec(body, globals, locals)`
+  with DISTINCT dicts (not one dict for both) and THEN call the getters — a
+  single-dict exec makes the class findable and hides the bug.
 - **Skip during Lint/Prediction**: Check `not (renpy.game.lint or renpy.predicting())` inside wrappers to prevent unnecessary evaluation or potential crashes during game linting/saving/loading.
 - **NEVER REBIND a `store` function name — patch it IN PLACE (`__code__` swap).** Ren'Py pickles `store` functions BY REFERENCE on save and verifies identity (`store.<name>` must be the SAME object as the one captured in the save graph). If you do `globals()['fn'] = wrapper` (a NEW object), every save raises `PicklingError: Can't pickle <function fn>: it's not the same object as store.fn` and the player loses ALL progress — saving is impossible. This was a real shipped bug (Killer Chat 1.4.1, `add_ping_hyperlinks`). The fix: keep the SAME function object and swap its behaviour —
   ```python

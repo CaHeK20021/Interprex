@@ -400,6 +400,34 @@ def check_renpy_font() -> None:
     assert env.get("add_ping_hyperlinks") is mock_add_ping_hyperlinks
     assert patched_fn("hi") == "hyperlinked:translated:hi", "second run changed behaviour"
 
+    # REAL-GAME SCOPING: a `translate <lang> python:` block runs with the store as
+    # globals and a SEPARATE locals frame — so a `class TranslatingString` defined
+    # in the block binds into LOCALS, not the patched methods' __globals__. A method
+    # that referenced the bare class name then raised `NameError: TranslatingString
+    # is not defined` at call time (real Killer Chat crash in _get_role_name /
+    # _get_dominant_role / __eq__). The single-dict exec above can't catch it (one
+    # namespace serves as both globals and locals). Re-run with DISTINCT dicts and
+    # then EXERCISE the getters so a regression surfaces here, not in the player's game.
+    sep_globals = {
+        "config": _Cfg(), "gui": _Gui(), "FontGroup": _FontGroup, "renpy": _Renpy,
+        "add_ping_hyperlinks": mock_add_ping_hyperlinks, "style": MockStyle(),
+        "ServerRole": MockServerRole, "ChatCharacter": MockChatCharacter,
+        "ChatChannel": MockChatChannel,
+    }
+    sep_globals["config"].font_name_map = {}
+    sep_locals = {}
+    exec(body, sep_globals, sep_locals)
+    _SR = sep_globals["ServerRole"]
+    _CC = sep_globals["ChatCharacter"]
+    _r = _SR("sweet serial killer", icon="❤️")
+    _c = _CC("sweet serial killer")
+    # These calls go through _get_role_name/_get_dominant_role + __eq__ — they must
+    # NOT raise NameError now that the class is bound via default arg / type(self).
+    assert str(_r.name) == "translated:sweet serial killer", "getter scope/NameError regressed"
+    assert str(_c.dominant_role) == "translated:sweet serial killer"
+    assert _r.name == "sweet serial killer", "__eq__ raw-compare regressed"
+    assert _c.dominant_role == _r.name
+
     # Verify that ServerRole and ChatCharacter name/dominant_role fields are dynamically translated but keep raw value comparisons intact
     patched_role_class = env.get("ServerRole")
     patched_char_class = env.get("ChatCharacter")
@@ -1047,6 +1075,58 @@ def check_renpy_risk() -> None:
     assert _RP2._fit_one_line(long_c, 0, CB_FS, "Russian", "smooth") == long_c
     print("OK — renpy menu-choice one-line fit: short untouched, long shrunk to one "
           "line, unknown width untouched")
+
+    # --- screen-caption box-fit: fixed-box textbutton/text/label {size=*} ------
+    # A `string`-kind screen caption (textbutton/_()/text/label) in a FIXED box
+    # used to get NO fitting — only say lines and menu choices did — so a 2-line
+    # button wrapped to 3 lines in the wider target script and clipped at the top
+    # (real Killer Chat error_screen.rpy:117 bug). _parse_style_boxes +
+    # _screen_widget_boxes must resolve the box; inject wraps an overflowing
+    # caption in {size=*scale} (full text intact), leaves a fitting sibling alone.
+    _BX = _RP()
+    # `is` inheritance + child-adds-geometry, plus a nested style_prefix whose
+    # sibling textbutton must keep the prefix (the strict-dedent pop rule).
+    src = [("game/s.rpy", "\n".join([
+        "style cc_button:",
+        "    is base_button",
+        "    xysize (364, 81)",
+        "style base_button:",
+        "    xysize (228, 66)",
+        "style cc_button_text:",
+        "    size 29",
+        "screen err():",
+        "    vbox:",
+        "        style_prefix \"cc\"",
+        "        textbutton _(\"THE RIGHT BUTTON?\\nOR THE RIGHT BUTTON?\"):",
+        "            xsize 350",
+        "        textbutton _(\"OK\")",
+    ]))]
+    boxes = _BX._parse_style_boxes(src)
+    assert boxes.get("cc_button") == (364, 81), boxes.get("cc_button")
+    # child with no own width inherits parent width but keeps own height:
+    assert boxes.get("base_button") == (228, 66)
+    sizes = _BX._parse_style_text_sizes(src)
+    wb = _BX._screen_widget_boxes(src, boxes, sizes, 32)
+    # The wide 2-line button (line 11): inline xsize 350 wins width, style gives
+    # height 81 and text size 29. The "OK" button (line 13) also resolves a box.
+    assert wb.get(("game/s.rpy", 11)) == (350, 81, 29), wb.get(("game/s.rpy", 11))
+    # The clipping caption fits at a shrunk scale; "OK" stays full size.
+    huge_cap = "ПРАВАЯ КНОПКА?\nИЛИ ПРАВИЛЬНАЯ КНОПКА?"
+    bw, bh, bsz = wb[("game/s.rpy", 11)]
+    fitted = _BX._fit_dialogue(huge_cap, bw, bh, bsz, "Russian", "smooth")
+    assert fitted.startswith("{size=*") and huge_cap in fitted, fitted
+    # A caption that already fits its box is NOT wrapped.
+    assert _BX._fit_dialogue("ОК", bw, bh, bsz, "Russian", "smooth") == "ОК"
+    # No style_prefix / unknown box -> widget absent from the map -> untouched.
+    src_nobox = [("game/n.rpy", "\n".join([
+        "screen chat():",
+        "    vbox:",
+        "        text _(\"Несколько человек печатают сообщение прямо сейчас\")",
+    ]))]
+    wb2 = _BX._screen_widget_boxes(src_nobox, {}, {}, 32)
+    assert wb2 == {}, wb2
+    print("OK — renpy screen-caption box-fit: fixed-box textbutton {size=*} full "
+          "text, fitting sibling untouched, unknown box untouched, is-inheritance")
 
 
 def check_renpy_identifier_parity() -> None:
