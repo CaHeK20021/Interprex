@@ -41,17 +41,22 @@ jobs:
           python -m pip install -r python-core/requirements.txt
           python -m pip install pyinstaller
 
+      # PyInstaller's analysis/bytecode cache. Keyed on requirements AND the spec
+      # so a spec change (e.g. an excludes edit) busts it; restore-keys lets an
+      # older cache still seed a partial speedup. Cuts ~1-3 min off the sidecar build.
       - name: PyInstaller Cache
         uses: actions/cache@v4
         with:
           path: python-core/build
-          key: ${{ runner.os }}-pyinstaller-${{ hashFiles('python-core/requirements.txt') }}
+          key: ${{ runner.os }}-pyinstaller-${{ hashFiles('python-core/requirements.txt', 'python-core/sidecar.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-pyinstaller-
 
+      # Build the sidecar (PyInstaller). lib.rs embeds python-core/dist/sidecar.exe
+      # directly via include_bytes!, and tauri.conf has no externalBin — so the old
+      # "copy to sidecar-x86_64-pc-windows-msvc.exe" step was dead weight and is gone.
       - name: Build Python sidecar
         run: python -m PyInstaller --distpath python-core/dist --workpath python-core/build --noconfirm python-core/sidecar.spec
-
-      - name: Copy sidecar for Tauri
-        run: copy python-core\dist\sidecar.exe python-core\dist\sidecar-x86_64-pc-windows-msvc.exe
 
       - name: Install frontend dependencies
         run: npm ci

@@ -855,8 +855,11 @@ To prevent crashes, infinite recursion, or issues in game/test environments:
   fn = globals()['fn']
   if not getattr(fn, '_patched_by_interprex', False):
       try:
-          orig = types.FunctionType(fn.__code__, fn.__globals__, fn.__name__,
+          # The clone MUST get a UNIQUE name, NOT fn.__name__ (see gotcha below).
+          orig = types.FunctionType(fn.__code__, fn.__globals__,
+                                    '_interprex_orig_fn',   # unique, NOT 'fn'
                                     fn.__defaults__, fn.__closure__)  # clone original
+          orig.__qualname__ = '_interprex_orig_fn'
           def _wrap(arg, _orig=orig, _renpy=renpy):  # zero freevars (defaults only)
               ...  # call _orig(arg)
           fn.__code__ = _wrap.__code__            # SAME object, new behaviour
@@ -865,7 +868,8 @@ To prevent crashes, infinite recursion, or issues in game/test environments:
       except Exception:
           pass   # function has free variables -> swap impossible -> skip, NEVER crash
   ```
-  The wrapper must have NO closure free variables (capture everything via default args), or `__code__` assignment fails. Rebinding a `renpy.*` MODULE attribute (e.g. `renpy.translation.translate_string`) is fine — engine modules aren't pickled into saves; only the `store` namespace + log are. Verified by `check_renpy_font` (asserts the patched function `is` the original object).
+  The wrapper must have NO closure free variables (capture everything via default args), or `__code__` assignment fails. Rebinding a `renpy.*` MODULE attribute (e.g. `renpy.translation.translate_string`) is fine — engine modules aren't pickled into saves; only the `store` namespace + log are.
+  - **GOTCHA the `__code__`-swap itself created (2nd shipped save crash):** the clone of the original is assigned to a variable INSIDE the `translate <lang> python:` block, so it becomes a **store var**, and it gets captured in the rollback log (a Say's `show_function` → … → the wrapper's `_orig` default). On save, pickle stores a function BY REFERENCE as `getattr(store, fn.__name__)`. If the clone kept the original's `__name__` (`add_ping_hyperlinks`), that lookup returns the PATCHED original (a *different* object) → the SAME `"not the same object as store.add_ping_hyperlinks"` PicklingError, just from the clone instead of a rebind. **Fix: give the clone a UNIQUE `__name__`/`__qualname__`** (e.g. `_interprex_orig_aph`) so pickle-by-reference resolves it to itself. Verified by `check_renpy_font`: asserts the patched fn `is` the original AND that NO leftover store function named `add_ping_hyperlinks` is a different object (mirrors pickle's check), and the renamed clone still calls through.
 
 ### Testing Monkey-Patches
 All runtime code injected into `_interprex_font.rpy` must be verified via automated self-tests:

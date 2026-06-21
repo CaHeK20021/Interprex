@@ -400,6 +400,27 @@ def check_renpy_font() -> None:
     assert env.get("add_ping_hyperlinks") is mock_add_ping_hyperlinks
     assert patched_fn("hi") == "hyperlinked:translated:hi", "second run changed behaviour"
 
+    # PICKLE-BY-REFERENCE SAFETY: the kept clone of the original must NOT carry the
+    # name "add_ping_hyperlinks". As a store var in a translate-python block it gets
+    # pickled BY REFERENCE on save — pickle re-imports it as getattr(store, fn.__name__);
+    # if its __name__ were "add_ping_hyperlinks", that resolves to the PATCHED original
+    # (a different object) -> "not the same object as store.add_ping_hyperlinks"
+    # PicklingError -> the player can't save (real Killer Chat 1.4.1 crash). So every
+    # leftover function object in the store whose __name__ == "add_ping_hyperlinks"
+    # must BE the canonical store.add_ping_hyperlinks. Mirror pickle's check here.
+    import types as _t
+    canonical = env.get("add_ping_hyperlinks")
+    for _k, _v in list(env.items()):
+        if isinstance(_v, _t.FunctionType) and _v.__name__ == "add_ping_hyperlinks":
+            assert _v is canonical, (
+                f"store var {_k!r} is a function named 'add_ping_hyperlinks' but is "
+                f"NOT store.add_ping_hyperlinks -> pickle-by-reference save crash"
+            )
+    # The clone we DID keep must be present under a unique name (so it pickles to
+    # itself) and must still call through to the original behaviour.
+    assert "_interprex_orig_aph" in env, "renamed original clone missing"
+    assert env["_interprex_orig_aph"].__name__ == "_interprex_orig_aph"
+
     # REAL-GAME SCOPING: a `translate <lang> python:` block runs with the store as
     # globals and a SEPARATE locals frame — so a `class TranslatingString` defined
     # in the block binds into LOCALS, not the patched methods' __globals__. A method
