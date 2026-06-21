@@ -484,6 +484,34 @@ def check_renpy_font() -> None:
     trans_fn = _Renpy.translation.translate_string
     assert trans_fn("1. hello") == "1. translated:hello", f"choice patch failed: {trans_fn('1. hello')}"
 
+    # PICKLE-BY-REFERENCE SAFETY for translate_string (3rd shipped save crash).
+    # The engine captures translate_string into the SAVE GRAPH (show_display_say).
+    # Pickle saves a function by reference as getattr(<its __module__>, <its
+    # __qualname__>) and verifies that resolves to the SAME object. TWO objects are
+    # now reachable and BOTH must pass that check:
+    #   (a) translate_string itself — must stay the SAME object (in-place __code__
+    #       swap, never a rebind), else "not the same object as
+    #       renpy.translation.translate_string".
+    #   (b) the original's clone, held in the wrapper's __kwdefaults__['_orig'] and
+    #       reachable from the graph — its __module__ inherits 'renpy.translation'
+    #       from the original's globals, so pickle does getattr(renpy.translation,
+    #       '_interprex_orig_translate_string'); that FAILS ('attribute lookup
+    #       failed') unless we registered the SAME object there. (Real crash: the
+    #       first fix swapped in place but didn't register the clone.)
+    assert trans_fn is _mock_translate_string, \
+        "translate_string must stay the SAME object (rebind breaks pickle/saves)"
+    _clone = (trans_fn.__kwdefaults__ or {}).get("_orig")
+    assert _clone is not None, "patched translate_string must hold the clone in _orig kwdefault"
+    assert _clone is not trans_fn, "clone must be a distinct object from the patched fn"
+    # Mirror pickle.save_global: the clone must be findable by name on its module
+    # AND resolve to itself. The mock's `renpy.translation` is _Translation; the
+    # real one is the module. Either way getattr(module, clone.__qualname__) is clone.
+    _found = getattr(_Renpy.translation, _clone.__qualname__, None)
+    assert _found is _clone, (
+        f"clone {_clone.__qualname__!r} not registered on renpy.translation as the "
+        f"SAME object -> pickle-by-reference save crash (got {_found!r})"
+    )
+
     # Verify that ChatChannel get_who_typing property is patched and dynamically translates typing indicators
     patched_channel_class = env.get("ChatChannel")
     channel_inst = patched_channel_class()
