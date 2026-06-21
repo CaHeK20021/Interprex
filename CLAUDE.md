@@ -132,6 +132,17 @@ are only a hint we hand the model.
 
 ## Text fitting: shrink the FONT, NEVER abbreviate a word (Ren'Py)
 
+**⚠️ BUILD TRAP — PIL/Pillow MUST be bundled in the sidecar.** ALL Ren'Py
+text-fitting measurement (`_line_height`, `_wrapped_line_count`, `fit_scale_for_box`,
+`measure_*_px`) uses PIL, and every one DEGRADES GRACEFULLY to "don't shrink" if PIL
+import fails. So if `python-core/sidecar.spec` lists `"PIL"` in `excludes` (it used to),
+the built exe has no PIL → box-fit silently does NOTHING in the shipped app, while it
+works fine in `npm run sidecar` (dev venv has PIL). Symptom: "autosize works when I run
+it in dev but the build doesn't shrink anything." Pillow is in `requirements.txt` and
+MUST stay OUT of the spec `excludes`. ALSO: a stale `sidecar.exe` from a previous run
+can keep owning port 8723 (two `sidecar.exe` in tasklist) so the app talks to OLD code —
+`taskkill /F /IM sidecar.exe` before testing a rebuild.
+
 **Load-bearing user rule:** a translated word must never be butchered to fit a box —
 "Сохранение" must stay "Сохранение", not become "Сох". We fit by shrinking the
 FONT and keeping the word whole. Two mechanisms, both preserve the full text:
@@ -237,6 +248,19 @@ error. Fixed deterministically (no API) by `_escape_bad_percent` (mirrors the en
 leaves valid specs and `%%` byte-verbatim, idempotent), applied at inject to `tr` AND
 to inline-Python `new` strings (never `old`). Verified: engine lint 3→0 actionable on
 Killer Chat; `check_renpy` %-format case in `selftest.py`.
+
+**Stray-newline fixup** (`_match_newlines`, applied at inject right after
+`_repair_text_tags`): the LLM often collapses a 2-line source to one line but leaves
+the trailing `\n` (`"I DIDN'T SIGN UP\nFOR THIS"` → `"Я НА ЭТО НЕ ПОДПИСЫВАЛСЯ\n"`).
+That phantom empty line makes a fixed-height button reserve a SECOND line, so the
+engine centres the visible text against two lines and it sits jammed at the TOP (real
+Killer Chat bug) — AND it falsely triggers the box-fit `{size=*}` shrink. The fix
+strips ONLY leading/trailing fully-EMPTY lines the original itself lacks (interior
+paragraph blanks and any content line are byte-verbatim; if the original ends with a
+newline the translation's is kept), compared against the UNESCAPED original,
+idempotent. After it: the SIGN UP button is one centred line with no shrink; the
+genuinely-2-line RIGHT BUTTON still gets `{size=*0.8}`. Guard: `check_renpy` newline-
+match case in `selftest.py`.
 
 ## Overflow risk analyzer (`parsers/renpy_risk.py`, endpoint `/renpy/risk`)
 

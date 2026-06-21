@@ -787,6 +787,35 @@ def _repair_text_tags(s: str) -> str:
     return "".join(out) if changed else s
 
 
+def _match_newlines(translation: str, original: str) -> str:
+    """Drop ARTEFACT empty lines the LLM added that the original doesn't have —
+    most often a trailing `\\n` left over when a 2-line source was translated as
+    one line (`"I DIDN'T SIGN UP\\nFOR THIS"` -> `"Я НА ЭТО НЕ ПОДПИСЫВАЛСЯ\\n"`).
+    That stray newline makes a fixed-height button reserve a SECOND, empty line, so
+    the engine centres the visible text against two lines and it sits jammed at the
+    top (real Killer Chat bug). It also fools the box-fit into shrinking a caption
+    that actually fits on one line.
+
+    Conservative — only LEADING/TRAILING fully-empty lines are removed, and only
+    when the original doesn't itself start/end with a blank line. Interior blank
+    lines (a deliberate paragraph gap the translator kept) and any non-empty line
+    are left byte-verbatim. `translation`/`original` are the UNESCAPED strings (real
+    newline chars). Idempotent."""
+    if "\n" not in translation:
+        return translation
+    o_lines = original.split("\n")
+    t_lines = translation.split("\n")
+    o_lead = len(o_lines) > 0 and o_lines[0].strip() == ""
+    o_trail = len(o_lines) > 1 and o_lines[-1].strip() == ""
+    # Trim trailing empties the original lacks.
+    while len(t_lines) > 1 and t_lines[-1].strip() == "" and not o_trail:
+        t_lines.pop()
+    # Trim leading empties the original lacks.
+    while len(t_lines) > 1 and t_lines[0].strip() == "" and not o_lead:
+        t_lines.pop(0)
+    return "\n".join(t_lines)
+
+
 def iter_logical_lines(text: str):
     lines = text.split("\n")
     current_logical = []
@@ -1909,6 +1938,11 @@ class RenPyParser(BaseParser):
                     # deterministically before write, so engine-lint never even sees
                     # it. No API.
                     tr = _repair_text_tags(tr)
+                    # Drop a stray leading/trailing empty line the LLM left when it
+                    # collapsed a multi-line source to fewer lines (a trailing \n →
+                    # a phantom 2nd line → button text jams to the top + false
+                    # box-fit shrink). Compared against the UNESCAPED original. No API.
+                    tr = _match_newlines(tr, _unescape_translation(rec["original"]))
 
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],

@@ -57,7 +57,14 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "tkinter", "matplotlib", "numpy", "pandas", "PIL",
+        # NOTE: PIL/Pillow must NOT be excluded — the Ren'Py text-fitting
+        # (auto-shrink {size=*}, line-count/width measurement) uses it
+        # (parsers/renpy.py: _line_height, _wrapped_line_count, fit_scale_*).
+        # Excluding it made every measurement silently degrade to "don't shrink",
+        # so box-fit never fired in the BUILT app (only in dev, where PIL is
+        # present in the venv). This was the "autosize works in dev, not in the
+        # build" bug. numpy/pandas/matplotlib stay excluded (PIL doesn't need them).
+        "tkinter", "matplotlib", "numpy", "pandas",
         "pytest", "IPython", "jupyter",
     ],
     noarchive=False,

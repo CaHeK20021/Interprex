@@ -979,6 +979,28 @@ def check_renpy_risk() -> None:
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 
+    # --- newline match: drop artefact leading/trailing empty lines -------------
+    # The LLM often collapses a 2-line source to one line but leaves the trailing
+    # \n, so a fixed-height button reserves a phantom 2nd line -> visible text jams
+    # to the top + a false box-fit shrink (real Killer Chat "Я НА ЭТО НЕ
+    # ПОДПИСЫВАЛСЯ" bug). _match_newlines strips ONLY leading/trailing EMPTY lines
+    # the original lacks; interior blanks and any content are byte-verbatim.
+    from parsers.renpy import _match_newlines as _mn
+    # trailing artefact removed (source 2 lines, translation 1 line + stray \n)
+    assert _mn("Я НА ЭТО НЕ ПОДПИСЫВАЛСЯ\n", "I DIDN'T SIGN UP\nFOR THIS") == \
+        "Я НА ЭТО НЕ ПОДПИСЫВАЛСЯ"
+    assert _mn("Текст", "Text") == "Текст"                 # no newline -> untouched
+    assert _mn("А\nБ", "A\nB") == "А\nБ"                    # matching 2 lines -> kept
+    assert _mn("\nТекст", "Text") == "Текст"               # leading empty stripped
+    assert _mn("Текст\n", "Text\n") == "Текст\n"           # original ends \n -> kept
+    assert _mn("А\n\nБ", "A\n\nB") == "А\n\nБ"             # interior blank kept
+    # Don't strip a real content line that just differs in count (no empty to drop).
+    assert _mn("Длинная\nфраза тут", "Short") == "Длинная\nфраза тут"
+    # Idempotent.
+    assert _mn(_mn("X\n", "Y"), "Y") == _mn("X\n", "Y")
+    print("OK — renpy newline match: trailing/leading empty stripped, interior kept, "
+          "original-trailing respected, idempotent")
+
     # --- is_technical_string: strip markup BEFORE the path/slash heuristic ---
     # Real bug (Beyond the Turquoise Stars): a one-word line wrapped in a closing
     # text tag — "{i}Exhausting.{/i}" — has no space, a '.', and a '/' (from the
