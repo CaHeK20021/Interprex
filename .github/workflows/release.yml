@@ -2,8 +2,10 @@ name: Release
 
 on:
   push:
+    branches:
+      - main  # Теперь кэш будет стабильно копиться в ветке main при обычных пушах
     tags:
-      - 'v*'
+      - 'v*'   # Сборка релиза по-прежнему будет запускаться при создании тега
 
 permissions:
   contents: write
@@ -14,7 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Добавили кэш для Node.js (cache: 'npm')
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -29,13 +30,12 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 2. Добавили кэш для Python (cache: 'pip')
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.14'
           cache: 'pip'
-          cache-dependency-path: 'python-core/requirements.txt' # Чтобы кэш обновлялся при изменении этого файла
+          cache-dependency-path: 'python-core/requirements.txt'
 
       - name: Install Python dependencies
         run: |
@@ -43,7 +43,6 @@ jobs:
           python -m pip install -r python-core/requirements.txt
           python -m pip install pyinstaller
 
-      # Дополнительно: Кэшируем сборку самого PyInstaller, чтобы он не пересобирал всё с нуля
       - name: PyInstaller Cache
         uses: actions/cache@v4
         with:
@@ -60,6 +59,8 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
+        # ДОБАВИЛИ УСЛОВИЕ: делать релиз на GitHub ТОЛЬКО если сборка вызвана тегом (твоим батником)
+        if: startsWith(github.ref, 'refs/tags/v') 
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
