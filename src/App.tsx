@@ -195,7 +195,7 @@ function getForeignFilterLabel(targetLang: TargetLang) {
 function getStringType(s: TranslationString) {
   if (s.path.includes("say")) return "Диалог";
   if (s.path.includes("menu_choice")) return "Выбор в меню";
-  if (s.path.includes("uscore")) return "Python-код";
+  if (s.path.includes("uscore") || s.path.includes("inline_python")) return "Python-код";
   if (s.path[0] === "screen") return "Интерфейс";
   if (s.path[0] === "define") return "Имя персонажа";
   return "Обычная";

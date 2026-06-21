@@ -50,7 +50,7 @@ def _wait_if_paused():
 # Ensure we can import parsers and providers relative to this script
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parsers import rpa as rpamod
-from parsers.base import INTERPREX_DIR
+from parsers.base import INTERPREX_DIR, make_id
 from parsers.renpy import RenPyParser
 
 # Reuse the SAME error bucketing the main scheduler uses, so this path fails over
@@ -1015,6 +1015,28 @@ def classify_batch(entries: list[dict], api_key: str, model: str, base_url: str 
     return results, _thread_idx()
 
 
+def _clean_translated_value(orig: str, trans: str) -> str:
+    """Strip common LLM-hallucinated conversational prefixes like 'translated own:'."""
+    if not trans:
+        return trans
+    prefixes = [
+        "translated own: ",
+        "translated own:",
+        "translated: ",
+        "translated:",
+        "translation: ",
+        "translation:",
+        "translated text: ",
+        "translated text:",
+    ]
+    orig_lower = orig.lower()
+    trans_lower = trans.lower()
+    for prefix in prefixes:
+        if trans_lower.startswith(prefix) and not orig_lower.startswith(prefix):
+            return trans[len(prefix):].strip()
+    return trans
+
+
 def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, model: str, base_url: str = None, provider: str = None, extra_instruction: str = None) -> dict[str, str]:
     """Translate one batch; PROPAGATE API errors so the key-pool can fail over.
     Returns {source_value: translated_value} for entries the model answered."""
@@ -1080,7 +1102,8 @@ def _translate_batch_raw(entries: list[dict], target_lang: str, api_key: str, mo
             item_id = item.get("id")
             translated_val = item.get("translated") or item.get("translation")
             if item_id in id_map and translated_val:
-                translations[id_map[item_id]] = translated_val
+                orig_val = id_map[item_id]
+                translations[orig_val] = _clean_translated_value(orig_val, translated_val)
     return translations
 
 
@@ -2130,17 +2153,39 @@ def main(args_list=None):
         logger.info("No strings identified for translation.")
         sys.exit(0)
         
+    # Load user translations from project.json if they exist.
+    # User translations in project.json have the highest priority!
+    project_translations = {}
+    project_path = game_path / INTERPREX_DIR / "project.json"
+    if project_path.is_file():
+        try:
+            with open(project_path, "r", encoding="utf-8") as f:
+                proj_data = json.load(f)
+            proj_strings = proj_data.get("strings", {})
+            for sid, sval in proj_strings.items():
+                if isinstance(sval, dict):
+                    orig = sval.get("original")
+                    trans = sval.get("translated")
+                    if orig and trans and trans.strip():
+                        project_translations[orig] = trans
+        except Exception as e:
+            logger.warning("Failed to load user translations from project.json: %s", e)
+
     # Step 4: Translate. Pull anything already in the translation cache (free), and
     # only send cache-misses to the API. This is what makes a re-run "translate
     # only new strings" and lets the no-API apply path work at all.
     translations: dict[str, str] = {}
     uncached_to_translate: list[dict] = []
     for entry in to_translate:
-        cached_tr = trans_cache.get(entry)
-        if cached_tr is not None:
-            translations[entry["value"]] = cached_tr
+        val = entry["value"]
+        if val in project_translations:
+            translations[val] = project_translations[val]
         else:
-            uncached_to_translate.append(entry)
+            cached_tr = trans_cache.get(entry)
+            if cached_tr is not None:
+                translations[val] = _clean_translated_value(val, cached_tr)
+            else:
+                uncached_to_translate.append(entry)
 
     if translations:
         logger.info("Translation cache hit: %d / %d strings", len(translations), len(to_translate))
@@ -2256,6 +2301,51 @@ def main(args_list=None):
         logger.info("[DRY RUN] Finished simulation. Total strings to translate: %d", success_count)
     else:
         success_count = _write_inline_strings_file(game_path, lang_dir, pairs)
+        
+        # Write the new Python translations back into project.json so they appear in the UI
+        if project_path.is_file() and pairs:
+            try:
+                with open(project_path, "r", encoding="utf-8") as f:
+                    proj_data = json.load(f)
+                
+                proj_strings = proj_data.setdefault("strings", {})
+                updated_proj = False
+                
+                cand_by_value = {entry["value"]: entry for entry in to_translate}
+                for orig_val, trans_val in pairs:
+                    entry = cand_by_value.get(orig_val, {})
+                    file_path = entry.get("file_path", "")
+                    if file_path:
+                        try:
+                            rel_file = Path(file_path).relative_to(game_path).as_posix()
+                        except ValueError:
+                            rel_file = Path(file_path).name
+                        if not rel_file:
+                            rel_file = f"game/tl/{args.target_lang}/_interprex_inline.rpy"
+                    else:
+                        rel_file = f"game/tl/{args.target_lang}/_interprex_inline.rpy"
+                    
+                    path_list = ["inline_python", orig_val]
+                    sid = make_id("renpy", rel_file, path_list, orig_val)
+                    
+                    if sid not in proj_strings or proj_strings[sid].get("translated") != trans_val:
+                        proj_strings[sid] = {
+                            "original": orig_val,
+                            "translated": trans_val,
+                            "approved": False,
+                            "file": rel_file,
+                            "path": path_list,
+                            "engine": "renpy"
+                        }
+                        updated_proj = True
+                
+                if updated_proj:
+                    with open(project_path, "w", encoding="utf-8") as f:
+                        json.dump(proj_data, f, ensure_ascii=False, indent=2)
+                    logger.info("Successfully updated project.json with %d Python inline translations.", len(pairs))
+            except Exception as e:
+                logger.warning("Failed to sync translations back to project.json: %s", e)
+
         finalize_backups(game_path)
         logger.info("Inline Python translation finished. Wrote %d string translations to tl/%s/_interprex_inline.rpy.",
                     success_count, lang_dir)
