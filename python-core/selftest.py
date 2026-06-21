@@ -1109,10 +1109,10 @@ def check_renpy_risk() -> None:
     wb = _BX._screen_widget_boxes(src, boxes, sizes, 32)
     # The wide 2-line button (line 11): inline xsize 350 wins width, style gives
     # height 81 and text size 29. The "OK" button (line 13) also resolves a box.
-    assert wb.get(("game/s.rpy", 11)) == (350, 81, 29), wb.get(("game/s.rpy", 11))
+    assert wb.get(("game/s.rpy", 11)) == (350, 81, 29, 0, 0), wb.get(("game/s.rpy", 11))
     # The clipping caption fits at a shrunk scale; "OK" stays full size.
     huge_cap = "ПРАВАЯ КНОПКА?\nИЛИ ПРАВИЛЬНАЯ КНОПКА?"
-    bw, bh, bsz = wb[("game/s.rpy", 11)]
+    bw, bh, bsz, _bls, _bll = wb[("game/s.rpy", 11)]
     fitted = _BX._fit_dialogue(huge_cap, bw, bh, bsz, "Russian", "smooth")
     assert fitted.startswith("{size=*") and huge_cap in fitted, fitted
     # A caption that already fits its box is NOT wrapped.
@@ -1125,8 +1125,68 @@ def check_renpy_risk() -> None:
     ]))]
     wb2 = _BX._screen_widget_boxes(src_nobox, {}, {}, 32)
     assert wb2 == {}, wb2
+    # Padding shrinks the inner text box: `padding (20, 10)` -> -40 w, -20 h.
+    src_pad = [("game/p.rpy", "\n".join([
+        "style pad_button:",
+        "    xysize (400, 120)",
+        "    padding (20, 10)",
+        "style pad_button_text:",
+        "    size 30",
+        "screen p():",
+        "    style_prefix \"pad\"",
+        "    textbutton _(\"X\")",
+    ]))]
+    pb = _BX._parse_style_boxes(src_pad)
+    assert pb.get("pad_button") == (400, 120)
+    assert _BX._style_box_padding.get("pad_button") == (40, 20), _BX._style_box_padding
+    wbp = _BX._screen_widget_boxes(src_pad, pb, _BX._parse_style_text_sizes(src_pad), 32)
+    assert wbp.get(("game/p.rpy", 8)) == (360, 100, 30, 0, 0), wbp.get(("game/p.rpy", 8))
     print("OK — renpy screen-caption box-fit: fixed-box textbutton {size=*} full "
-          "text, fitting sibling untouched, unknown box untouched, is-inheritance")
+          "text, fitting sibling untouched, unknown box untouched, is-inheritance, padding")
+
+    # --- wrap measurement: real line height + tex line count ------------------
+    # The engine stacks lines by the FONT's ascent+descent (~1.4×size), NOT the
+    # old 1.25 — so _line_height must exceed the naive 1.25×size (else we
+    # under-count height and let translated captions clip, the real bug).
+    from parsers.renpy import (
+        _line_height as _LH, _target_font as _TF, _wrapped_line_count as _WLC,
+        _tex_line_count as _TLC,
+    )
+    _f29 = _TF("Russian", 29, "smooth")
+    lh = _LH(_f29, 29)
+    assert lh > 29 * 1.25, f"line height must use real metrics (got {lh}, naive {29*1.25})"
+    # ascent+descent for our Noto at 29px ≈ 40; allow a small range.
+    assert 36 <= lh <= 44, f"unexpected line height {lh}"
+    # line_spacing/line_leading add to the box height — and may be NEGATIVE
+    # (a tightened line box), which the engine honors, so we must too.
+    assert _LH(_f29, 29, line_spacing=5, line_leading=3) == lh + 8
+    assert _LH(_f29, 29, line_spacing=-8) == lh - 8, "negative spacing must tighten"
+    assert _LH(_f29, 29, line_spacing=-9999) == 1.0, "height clamps to >=1, never <=0"
+    # A style's line_spacing/line_leading flow into the widget box tuple.
+    src_sp = [("game/sp.rpy", "\n".join([
+        "style sp_button:",
+        "    xysize (300, 90)",
+        "style sp_button_text:",
+        "    size 28",
+        "    line_spacing -8",
+        "screen sp():",
+        "    style_prefix \"sp\"",
+        "    textbutton _(\"Y\")",
+    ]))]
+    spb = _BX._parse_style_boxes(src_sp)
+    sps = _BX._parse_style_line_spacing(src_sp)
+    assert sps.get("sp_button") == (-8, 0), sps
+    wsp = _BX._screen_widget_boxes(
+        src_sp, spb, _BX._parse_style_text_sizes(src_sp), 32, sps)
+    assert wsp.get(("game/sp.rpy", 8)) == (300, 90, 28, -8, 0), wsp.get(("game/sp.rpy", 8))
+    # tex line count: a 2-word caption that overflows wraps to 2 lines; a short
+    # one stays 1; an over-wide single word stands alone (never infinite-loops).
+    _wide = _TF("Russian", 40, "smooth")
+    assert _WLC("Короткий", _wide, 10000) == 1
+    assert _TLC(["Очень", "длинная", "фраза", "тут"], _wide, 120) >= 2
+    assert _TLC(["Сверхдлинноеслово"], _wide, 30) == 1  # one over-wide word -> 1 line
+    print("OK — renpy wrap measure: real-metric line height (>1.25×), tex line "
+          "count (overflow=2, short=1, over-wide-word=1, +line_spacing)")
 
 
 def check_renpy_identifier_parity() -> None:

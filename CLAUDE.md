@@ -177,6 +177,28 @@ FONT and keeping the word whole. Two mechanisms, both preserve the full text:
    indent, so the pop rule is **strict dedent** (a same-indent later prefix replaces
    it) — otherwise the textbutton next to the prefix loses it.
 
+**Predicting the line count EXACTLY (why the box-fit is trustworthy).** Whether a
+caption needs shrinking comes down to *how many lines the engine wraps it to* — get
+that wrong by one and we either over-shrink or still clip. So the offline measure
+mirrors the engine's real layout (`renpy/text/text.py::Layout`), not an approximation:
+- **Line height** = the font's FreeType `ascent + descent` (`_line_height`, via PIL
+  `getmetrics()` — the SAME metrics Ren'Py's `place_vertical` stacks by), NOT the old
+  `font_size * 1.25` (which under-counted height ~12% and was the clip cause). Plus the
+  style's `line_spacing` + `line_leading` (`_parse_style_line_spacing`), which DEFAULT
+  0 but can be **negative** (a tightened line box, e.g. `line_spacing -8`) — the engine
+  adds them per line, so we add them too (clamping only the FINAL height to ≥1), and
+  they scale WITH the `{size=*}` factor.
+- **Line count** = `_wrapped_line_count` emulates the engine's DEFAULT `style.layout =
+  "tex"` (Knuth-Plass optimal break, `_tex_line_count`), not pure greedy. On the 199
+  real Killer Chat captions greedy and tex agree on the count, but tex can place a
+  break greedy wouldn't, and the engine uses tex — so we compute the true optimum and
+  never under-count. An over-wide single word stands alone (the engine can't break
+  inside a word either), so it never loops.
+- **Wrap width** = the box's INNER text width = `box_w − xpadding` (`_parse_style_boxes`
+  also returns `_style_box_padding`). We do NOT subtract a `Frame(img, 8, 8)`
+  background's border — those numbers are 9-slice image scaling, not a text inset
+  (verified in `display/imagelike.py`). Padding defaults 0, so usually a no-op.
+
 Most dialogue boxes auto-grow or scroll, so a true fixed-box overflow is rare — a
 runtime per-frame auto-fit was considered and **rejected** as too risky for too
 little gain; the offline `{size=*}` approach covers the real cases with zero
@@ -185,7 +207,9 @@ a 750-char RU line in `{size=*0.65}` (full text intact), leaves a 292-char line
 untouched; Killer Chat (no gui box) → dialogue fit OFF, but the fixed-box screen
 button (350×81) wraps `{size=*0.8}` (full RU text intact) while its fitting siblings
 stay full size. Offline guards: `check_renpy` dialogue-auto-fit + menu-choice-fit +
-**screen-caption box-fit** cases + scheduler 1-word-no-reask case in `selftest.py`.
+**screen-caption box-fit** (incl. padding + negative line_spacing) + **wrap-measure**
+(real-metric line height, tex line count) cases + scheduler 1-word-no-reask case in
+`selftest.py`.
 
 ## Engine-oracle lint — validate our `tl/` with the game's OWN Ren'Py
 

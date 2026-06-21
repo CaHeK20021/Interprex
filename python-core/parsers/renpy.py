@@ -1789,18 +1789,20 @@ class RenPyParser(BaseParser):
             # wrap such a caption in {size=*scale} so the engine renders the WHOLE
             # text smaller, exactly like _fit_dialogue. Unknown box -> absent from
             # the map -> untouched (auto-grow contract). Built once here.
-            screen_box_map: dict[tuple[str, int], tuple[int, int, int]] = {}
+            screen_box_map: dict[tuple[str, int], tuple[int, int, int, int, int]] = {}
             try:
                 _box_sources = list(self._iter_sources(root, sub_paths))
                 _style_boxes = self._parse_style_boxes(_box_sources)
                 _style_sizes = self._parse_style_text_sizes(_box_sources)
+                _style_spacing = self._parse_style_line_spacing(_box_sources)
                 _body_size = _gui_ints.get("text_size") if isinstance(_gui_ints, dict) else None
                 if not _body_size and _style_sizes:
                     from collections import Counter
                     _body_size = Counter(_style_sizes.values()).most_common(1)[0][0]
                 _body_size = _body_size or 32
                 screen_box_map = self._screen_widget_boxes(
-                    _box_sources, _style_boxes, _style_sizes, _body_size
+                    _box_sources, _style_boxes, _style_sizes, _body_size,
+                    _style_spacing,
                 )
             except Exception as e_box:
                 logger.warning("screen caption box-fit unavailable: %s", e_box)
@@ -1954,9 +1956,10 @@ class RenPyParser(BaseParser):
                             # unknown box -> left untouched (auto-grow contract).
                             box = screen_box_map.get((file_rel, rec["src_line"]))
                             if box:
-                                bw, bh, bsz = box
+                                bw, bh, bsz, blsp, blld = box
                                 entry_tr = self._fit_dialogue(
                                     entry_tr, bw, bh, bsz, target_lang, font_style,
+                                    line_spacing=blsp, line_leading=blld,
                                 )
                         string_entries.setdefault(tl_rel, []).append(
                             (f"{file_rel}:{rec['src_line']}", old_decoded, entry_tr))
@@ -1982,18 +1985,22 @@ class RenPyParser(BaseParser):
 
     @staticmethod
     def _fit_dialogue(tr: str, box_w: int, box_h: int, font_size: int,
-                      target_lang: str, font_style: str) -> str:
+                      target_lang: str, font_style: str,
+                      line_spacing: int = 0, line_leading: int = 0) -> str:
         """Wrap an overflowing say-line in {size=*scale} so the engine renders the
         FULL translation small enough to fit a known fixed textbox. Returns `tr`
         unchanged when the box is unknown (box_w/h == 0), the text already fits, or
         it already carries a leading {size=...} (don't double-wrap). The word/
-        sentence is NEVER cut — only the font scales, exactly per the user's rule."""
+        sentence is NEVER cut — only the font scales, exactly per the user's rule.
+        line_spacing/line_leading (from the style, default 0, may be negative) are
+        added to each line's height so the fit matches the engine exactly."""
         if box_w <= 0 or box_h <= 0:
             return tr
         # Respect an existing author/our size tag at the very start.
         if tr.lstrip().startswith("{size="):
             return tr
-        scale = fit_scale_for_box(tr, target_lang, font_size, box_w, box_h, font_style)
+        scale = fit_scale_for_box(tr, target_lang, font_size, box_w, box_h,
+                                  font_style, line_spacing, line_leading)
         if scale >= 0.999:
             return tr
         return "{size=*%s}%s{/size}" % (scale, tr)
@@ -2078,7 +2085,16 @@ class RenPyParser(BaseParser):
         xysize = re.compile(r'^\s*xysize\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)')
         xsize = re.compile(r'^\s*(?:xsize|xmaximum)\s+(\d+)\b')
         ysize = re.compile(r'^\s*(?:ysize|ymaximum)\s+(\d+)\b')
-        boxes: dict[str, list[int]] = {}   # name -> [w, h]
+        # Padding reduces the inner TEXT area the engine wraps within: the wrap
+        # width is `box_w - xpadding(left+right)`, height budget `box_h -
+        # ypadding(top+bottom)`. `padding (a, b)` sets both axes; `padding (a, b,
+        # c, d)` sets l/t/r/b; `xpadding N`/`ypadding N` set one axis (each side).
+        # We do NOT subtract a Frame background's border (e.g. Frame("x", 8, 8)) —
+        # that's 9-slice image scaling, not a text inset (verified in imagelike.py).
+        pad_tuple = re.compile(r'^\s*padding\s*\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*,\s*(\d+)\s*)?\)')
+        xpad_re = re.compile(r'^\s*xpadding\s+(\d+)\b')
+        ypad_re = re.compile(r'^\s*ypadding\s+(\d+)\b')
+        boxes: dict[str, list[int]] = {}   # name -> [w, h, xpad, ypad]
         parents: dict[str, str] = {}
         for _file_rel, text in sources:
             lines = text.split("\n")
@@ -2092,7 +2108,7 @@ class RenPyParser(BaseParser):
                 if m.group(3):
                     parents.setdefault(name, m.group(3))
                 indent = len(m.group(1))
-                wh = boxes.setdefault(name, [0, 0])
+                wh = boxes.setdefault(name, [0, 0, 0, 0])
                 i += 1
                 while i < len(lines):
                     l = lines[i]
@@ -2109,35 +2125,59 @@ class RenPyParser(BaseParser):
                         my = ysize.match(l)
                         if my:
                             wh[1] = wh[1] or int(my.group(1))
+                    pt = pad_tuple.match(l)
+                    if pt:
+                        # padding (a,b) -> xpad=a, ypad=b; padding(l,t,r,b) -> l+r, t+b.
+                        if pt.group(3) is not None:
+                            wh[2] = wh[2] or (int(pt.group(1)) + int(pt.group(3)))
+                            wh[3] = wh[3] or (int(pt.group(2)) + int(pt.group(4)))
+                        else:
+                            wh[2] = wh[2] or (2 * int(pt.group(1)))
+                            wh[3] = wh[3] or (2 * int(pt.group(2)))
+                    xp = xpad_re.match(l)
+                    if xp:
+                        wh[2] = wh[2] or (2 * int(xp.group(1)))
+                    yp = ypad_re.match(l)
+                    if yp:
+                        wh[3] = wh[3] or (2 * int(yp.group(1)))
                     im = is_line.match(l)
                     if im:
                         parents.setdefault(name, im.group(1))
                     i += 1
-        # Inherit a missing axis from the parent (one level — covers the common
-        # `child is parent` + child-adds-geometry case without chasing chains).
+        # Inherit a missing axis/padding from the parent (one level — covers the
+        # common `child is parent` + child-adds-geometry case).
         for name, parent in parents.items():
             pwh = boxes.get(parent)
             if not pwh:
                 continue
-            cwh = boxes.setdefault(name, [0, 0])
-            cwh[0] = cwh[0] or pwh[0]
-            cwh[1] = cwh[1] or pwh[1]
+            cwh = boxes.setdefault(name, [0, 0, 0, 0])
+            for k in range(4):
+                cwh[k] = cwh[k] or pwh[k]
+        # Return (w, h) for back-compat callers; padding is exposed via the
+        # parallel _style_box_padding map below (same keys), so the box tuple
+        # stays a 2-tuple everywhere it's already consumed.
+        self._style_box_padding = {n: (wh[2], wh[3]) for n, wh in boxes.items()}
         return {n: (wh[0], wh[1]) for n, wh in boxes.items()}
 
     def _screen_widget_boxes(
         self, sources, style_boxes: dict[str, tuple[int, int]],
         style_sizes: dict[str, int], body_size: int,
-    ) -> dict[tuple[str, int], tuple[int, int, int]]:
-        """Map (file_rel, src_line) -> (box_w, box_h, text_size) for every screen
-        `textbutton`/`text`/`label` widget whose caption lives in a KNOWN fixed box
-        (both width AND height resolvable). Only these can clip; everything else is
-        omitted so inject leaves it untouched (auto-grow contract).
+        style_spacing: dict[str, tuple[int, int]] | None = None,
+    ) -> dict[tuple[str, int], tuple[int, int, int, int, int]]:
+        """Map (file_rel, src_line) -> (box_w, box_h, text_size, line_spacing,
+        line_leading) for every screen `textbutton`/`text`/`label` widget whose
+        caption lives in a KNOWN fixed box (both width AND height resolvable). Only
+        these can clip; everything else is omitted so inject leaves it untouched
+        (auto-grow contract).
 
         A widget's box = its own inline `xysize/xsize/ysize` (wins) merged with the
         style it resolves to: an explicit `style "X"` on the widget, else the
         nearest enclosing `style_prefix` → `<prefix>_button`/`<prefix>` /`<prefix>_text`.
-        The text size comes from `<style>_text` (via style_sizes) → body_size."""
-        out: dict[tuple[str, int], tuple[int, int, int]] = {}
+        The text size comes from `<style>_text` (via style_sizes) → body_size;
+        line_spacing/line_leading from the resolved style (default 0) so the height
+        prediction matches the engine even when a style tightens its line box."""
+        style_spacing = style_spacing or {}
+        out: dict[tuple[str, int], tuple[int, int, int, int, int]] = {}
         for file_rel, text in sources:
             lines = text.split("\n")
             # Stack of (indent, prefix) so a nested style_prefix shadows an outer.
@@ -2198,15 +2238,33 @@ class RenPyParser(BaseParser):
                 if prefix_stack:
                     pfx = prefix_stack[-1][1]
                     styles += [f"{pfx}_button", pfx]
+                box_style = None
                 for st in styles:
                     sw, sh = style_boxes.get(st, (0, 0))
-                    box_w = box_w or sw
-                    box_h = box_h or sh
+                    if not box_w and sw:
+                        box_w = sw
+                    if not box_h and sh:
+                        box_h = sh
+                    if box_style is None and (sw or sh):
+                        box_style = st
                     if box_w and box_h:
                         break
 
                 if box_w <= 0 or box_h <= 0:
                     continue  # unknown box -> don't touch (contract)
+
+                # Subtract the style's padding so (box_w, box_h) is the INNER text
+                # area the engine actually wraps within (width - xpadding,
+                # height - ypadding) — matching text.py `width - first_indent`.
+                # Padding default is 0, so this is a no-op unless a style sets it.
+                pad = getattr(self, "_style_box_padding", {})
+                xpad = ypad = 0
+                for st in styles:
+                    px, py = pad.get(st, (0, 0))
+                    xpad = xpad or px
+                    ypad = ypad or py
+                box_w = max(1, box_w - xpad)
+                box_h = max(1, box_h - ypad)
 
                 # Text size: <style>_text size for any resolved style, else body.
                 tsize = 0
@@ -2215,7 +2273,20 @@ class RenPyParser(BaseParser):
                     if tsize:
                         break
                 tsize = tsize or body_size
-                out[(file_rel, idx + 1)] = (box_w, box_h, tsize)
+
+                # Line spacing/leading from the resolved style (default 0). These
+                # can be negative (tightened line box) — the engine adds them to
+                # the per-line height, so honoring them keeps the prediction exact.
+                lsp = lld = 0
+                for st in styles:
+                    s_ls, s_ll = style_spacing.get(st, (0, 0))
+                    if not lsp and s_ls:
+                        lsp = s_ls
+                    if not lld and s_ll:
+                        lld = s_ll
+                    if lsp and lld:
+                        break
+                out[(file_rel, idx + 1)] = (box_w, box_h, tsize, lsp, lld)
         return out
 
     def finalize_backups(self, root: str) -> None:
@@ -2720,6 +2791,63 @@ class RenPyParser(BaseParser):
                 sizes[prefix] = sizes[parent]
         return sizes
 
+    @staticmethod
+    def _parse_style_line_spacing(sources) -> dict[str, tuple[int, int]]:
+        """Map style name -> (line_spacing, line_leading) from its `style <name>:`
+        block, resolving one-level `is <parent>`. Both default 0. These can be
+        NEGATIVE (games tighten line boxes, e.g. `line_spacing -8` on a 2-line
+        confirm button) — and the engine adds them to the FreeType ascent+descent
+        per line (place_vertical), so honoring them is what makes our height
+        prediction EXACT instead of over-shrinking a deliberately-tightened box.
+        Keyed by the BASE style name (no `_text` suffix) to match style_boxes."""
+        head = re.compile(
+            r'^([ \t]*)style\s+(\w[\w.]*?)(?:_text)?\b(?:\s+is\s+(\w[\w.]*?)(?:_text)?)?\s*:\s*(?:#.*)?$'
+        )
+        ls_re = re.compile(r'^\s*line_spacing\s+(-?\d+)\b')
+        ll_re = re.compile(r'^\s*line_leading\s+(-?\d+)\b')
+        is_re = re.compile(r'^\s+is\s+(\w[\w.]*?)(?:_text)?\b')
+        vals: dict[str, list] = {}     # name -> [ls, ll, ls_set, ll_set]
+        parents: dict[str, str] = {}
+        for _file_rel, text in sources:
+            lines = text.split("\n")
+            i = 0
+            while i < len(lines):
+                m = head.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                name = m.group(2)
+                if m.group(3):
+                    parents.setdefault(name, m.group(3))
+                indent = len(m.group(1))
+                v = vals.setdefault(name, [0, 0, False, False])
+                i += 1
+                while i < len(lines):
+                    l = lines[i]
+                    if l.strip() and (len(l) - len(l.lstrip())) <= indent:
+                        break
+                    ms = ls_re.match(l)
+                    if ms and not v[2]:
+                        v[0] = int(ms.group(1)); v[2] = True
+                    ml = ll_re.match(l)
+                    if ml and not v[3]:
+                        v[1] = int(ml.group(1)); v[3] = True
+                    mi = is_re.match(l)
+                    if mi:
+                        parents.setdefault(name, mi.group(1))
+                    i += 1
+        # One-level inheritance for whichever axis the child didn't set itself.
+        for name, parent in parents.items():
+            pv = vals.get(parent)
+            if not pv:
+                continue
+            cv = vals.setdefault(name, [0, 0, False, False])
+            if not cv[2]:
+                cv[0] = pv[0]
+            if not cv[3]:
+                cv[1] = pv[1]
+        return {n: (v[0], v[1]) for n, v in vals.items()}
+
     def _generate_style_overrides(self, root: str, lang: str,
                                   measured_factors: dict[str, float] | None = None) -> None:
         """For screens with fixed-height frames, inject font size reductions
@@ -2932,7 +3060,7 @@ class RenPyParser(BaseParser):
                         "следующему этапу, пожалуйста, нажмите правую кнопку."
                     )
                     lines = _wrapped_line_count(sample, font, inner_w)
-                    needed_h = lines * body_size * _LINE_HEIGHT_MULT
+                    needed_h = lines * _line_height(font, body_size)
                     if needed_h > text_budget_h:
                         factor = text_budget_h / needed_h
                         tight_size = max(12, int(body_size * factor))
@@ -3294,43 +3422,120 @@ def measure_translation_px(translation: str, target_lang: str, font_size: int, f
     return _max_line_px(translation, _target_font(target_lang, font_size, font_style), font_size)
 
 
-# Approximate line-height multiple Ren'Py uses (font size * this ≈ line box). A
-# hair generous so we never under-estimate height and let text clip.
-_LINE_HEIGHT_MULT = 1.25
+# Fallback line-height multiple when real font metrics are unavailable. Ren'Py's
+# place_vertical stacks each line by the FONT's own ascent+descent (FreeType),
+# which for our Noto faces is ~1.39–1.41 × size — NOT 1.25. A too-small multiple
+# under-estimates height and lets text clip (the real bug). _line_height() below
+# uses the true metrics; this constant only guards the no-PIL degrade path, where
+# we err on the GENEROUS side so we never under-count height.
+_LINE_HEIGHT_MULT = 1.4
 # Never shrink dialogue/caption font below this fraction of the game's own size —
 # below it text is unreadable; better to ride a hair tall than render ants.
 _FIT_FONT_FLOOR = 0.6
 
 
+def _line_height(font, font_size: int, line_spacing: int = 0, line_leading: int = 0) -> float:
+    """Pixel height of ONE rendered line — matches the engine's place_vertical,
+    which stacks lines by the font's FreeType ascent+descent plus the style's
+    line_spacing/line_leading (both default 0). PIL's getmetrics() returns the
+    same ascent+descent FreeType gives Ren'Py, so this is the engine's real line
+    box, not the old font_size*1.25 approximation that under-counted height and
+    let translated text clip. Degrades to the generous _LINE_HEIGHT_MULT if
+    metrics are unavailable."""
+    # line_spacing/line_leading may be NEGATIVE (a style tightening its line box,
+    # e.g. line_spacing -8) — the engine ADDS them to ascent+descent, so we do
+    # too, clamping only the FINAL height to >=1 (never the addends individually).
+    try:
+        ascent, descent = font.getmetrics()
+        h = ascent + descent
+        if h > 0:
+            return max(1.0, h + line_spacing + line_leading)
+    except Exception:
+        pass
+    return max(1.0, font_size * _LINE_HEIGHT_MULT + line_spacing + line_leading)
+
+
 def _wrapped_line_count(plain_text: str, font, box_width: float) -> int:
-    """Visual line count of `plain_text` (tags already stripped) greedily word-
-    wrapped to `box_width` in `font`. Honors explicit \\n. Pure measurement."""
+    """Visual line count of `plain_text` (tags already stripped) wrapped to
+    `box_width` in `font`, honoring explicit \\n. Emulates the ENGINE's default
+    `layout = "tex"` (Knuth-Plass): the count is the MINIMUM number of lines whose
+    optimal break never overflows `box_width`. For a single paragraph this equals
+    the greedy count (greedy already achieves the fewest lines), but TeX can place
+    a break the greedy pass wouldn't — so we compute the true optimum here rather
+    than assume greedy. A word wider than the box still occupies its own line (the
+    engine can't break inside a word either), so we never loop forever."""
     total = 0
     for para in plain_text.split("\n"):
         words = para.split(" ")
-        if not words:
+        if not words or (len(words) == 1 and words[0] == ""):
             total += 1
             continue
-        line = ""
-        lines = 1
-        for w in words:
-            trial = w if not line else line + " " + w
-            try:
-                fits = font.getlength(trial) <= box_width
-            except Exception:
-                fits = len(trial) * 0.6 * font.size <= box_width if hasattr(font, "size") else True
-            if fits or not line:
-                line = trial
-            else:
-                lines += 1
-                line = w
-        total += lines
+        total += _tex_line_count(words, font, box_width)
     return total
+
+
+def _tex_line_count(words: list, font, box_width: float) -> int:
+    """Minimum line count for `words` under TeX-style optimal breaking: DP that
+    minimizes summed squared trailing slack with an infinite penalty for any line
+    that overflows (except a single over-wide word, which must stand alone). The
+    line count of that optimal break is what the engine's `layout=tex` produces.
+    Pure measurement — never mutates anything."""
+    try:
+        space_w = font.getlength(" ")
+        widths = [font.getlength(w) for w in words]
+    except Exception:
+        # No PIL: fall back to greedy with a crude per-char estimate.
+        return _greedy_line_count(words, font, box_width)
+    n = len(words)
+    INF = float("inf")
+    # cost[i], lines[i] = best (squared-slack cost, line count) for words[i:].
+    cost = [INF] * (n + 1)
+    lines = [0] * (n + 1)
+    cost[n] = 0.0
+    for i in range(n - 1, -1, -1):
+        line_w = 0.0
+        best_c = INF
+        best_l = 0
+        for j in range(i, n):
+            line_w += widths[j] + (space_w if j > i else 0.0)
+            if line_w > box_width and j > i:
+                break  # adding word j overflows; stop extending this line
+            slack = box_width - line_w
+            # Last line is ragged-right: no slack penalty. Tie-break on fewer lines.
+            c = (0.0 if j == n - 1 else slack * slack) + cost[j + 1]
+            l = 1 + lines[j + 1]
+            if c < best_c - 1e-9 or (abs(c - best_c) <= 1e-9 and l < best_l):
+                best_c = c
+                best_l = l
+        if best_l == 0:  # even one word overflows -> it stands alone
+            best_l = 1 + lines[i + 1]
+        cost[i] = best_c if best_c < INF else 0.0
+        lines[i] = best_l
+    return lines[0]
+
+
+def _greedy_line_count(words: list, font, box_width: float) -> int:
+    """Greedy fallback line count (used only when PIL metrics are unavailable)."""
+    line = ""
+    count = 1
+    for w in words:
+        trial = w if not line else line + " " + w
+        try:
+            fits = font.getlength(trial) <= box_width
+        except Exception:
+            fits = len(trial) * 0.6 * getattr(font, "size", 20) <= box_width
+        if fits or not line:
+            line = trial
+        else:
+            count += 1
+            line = w
+    return count
 
 
 def fit_scale_for_box(translation: str, target_lang: str, font_size: int,
                       box_width: float, box_height: float,
-                      font_style: str = "smooth") -> float:
+                      font_style: str = "smooth",
+                      line_spacing: int = 0, line_leading: int = 0) -> float:
     """Largest font-scale in [_FIT_FONT_FLOOR, 1.0] at which `translation`, word-
     wrapped to `box_width`, fits within `box_height`. Returns 1.0 if it already
     fits (no shrink needed) or if box dims are unknown/non-positive (we never
@@ -3339,7 +3544,9 @@ def fit_scale_for_box(translation: str, target_lang: str, font_size: int,
     This drives the dialogue safety-net: inject wraps an overflowing say line in
     a native `{size=*scale}` tag so the ENGINE itself renders the FULL, unabridged
     translation smaller — the word/sentence is never cut. Mirrors the engine's own
-    `{size=*}` semantics (text.py)."""
+    `{size=*}` semantics (text.py). line_spacing/line_leading (style values,
+    default 0, possibly negative) scale WITH the font and are added per line so the
+    height check equals the engine's place_vertical."""
     if box_width <= 0 or box_height <= 0:
         return 1.0
     plain = _strip_tags(translation)
@@ -3354,7 +3561,12 @@ def fit_scale_for_box(translation: str, target_lang: str, font_size: int,
             fs = max(1, int(round(font_size * s)))
             font = _target_font(target_lang, fs, font_style)
             lines = _wrapped_line_count(plain, font, box_width)
-            if lines * fs * _LINE_HEIGHT_MULT <= box_height:
+            # The engine scales line_spacing/line_leading with the {size=*} tag
+            # too (they're style ints fed through scale_int), so scale them here.
+            ls = int(round(line_spacing * s))
+            ll = int(round(line_leading * s))
+            # Real engine line box (FreeType ascent+descent + spacing), not fs*1.25.
+            if lines * _line_height(font, fs, ls, ll) <= box_height:
                 return round(s, 3)
             s -= 0.05
         return round(_FIT_FONT_FLOOR, 3)
