@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ping,
@@ -118,6 +118,131 @@ function mergeTranslations(
   return { ...proj, strings };
 }
 
+// Get regex for foreign words based on the target language of translation
+function getForeignWordRegex(targetLang: TargetLang) {
+  if (targetLang === "Russian") {
+    return /\b[a-zA-Z]+\b/g;
+  }
+  if (["English", "German", "French", "Spanish", "Portuguese (Brazil)"].includes(targetLang)) {
+    return /\b[а-яА-ЯёЁ]+\b|[\u4E00-\u9FAF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]+/g;
+  }
+  return /\b[a-zA-Z]+\b|\b[а-яА-ЯёЁ]+\b/g;
+}
+
+// Check if a word in the text context is a technical token (variable, function call, path, arg, etc.)
+function isTechnicalWord(word: string, partText: string, wordIndex: number): boolean {
+  // 1. Programming and syntax keywords
+  const programmingKeywords = ["true", "false", "none", "self", "import", "def", "config", "renpy", "init", "python", "pass", "return", "eval", "exec", "is", "not", "and", "or", "for", "in", "if", "else", "elif", "try", "except"];
+  if (programmingKeywords.includes(word.toLowerCase())) {
+    return true;
+  }
+
+  // Find boundaries of the full surrounding non-space token (e.g. "img=Transform")
+  let tokenStart = wordIndex;
+  while (tokenStart > 0 && !/\s/.test(partText[tokenStart - 1])) {
+    tokenStart--;
+  }
+  let tokenEnd = wordIndex + word.length;
+  while (tokenEnd < partText.length && !/\s/.test(partText[tokenEnd])) {
+    tokenEnd++;
+  }
+  const token = partText.slice(tokenStart, tokenEnd);
+
+  // 2. File paths or extensions
+  if (token.includes("/") || token.includes("\\") || /\.(webp|png|jpg|jpeg|ogg|mp3|wav|rpy|rpyc|json|txt|py|dll|exe)$/i.test(token)) {
+    return true;
+  }
+
+  // 3. Assignment / arguments (e.g. zoom=0.3)
+  if (token.includes("=")) {
+    return true;
+  }
+
+  // 4. Variables snake_case or containing numbers (e.g. mc_bodyacc, acc4)
+  if (token.includes("_") || /[0-9]/.test(token)) {
+    return true;
+  }
+
+  // 5. Method calls (e.g. .format)
+  let beforeIdx = wordIndex - 1;
+  while (beforeIdx >= 0 && /\s/.test(partText[beforeIdx])) {
+    beforeIdx--;
+  }
+  if (beforeIdx >= 0 && partText[beforeIdx] === ".") {
+    return true;
+  }
+
+  // 6. Function calls (e.g. Transform( )
+  let afterIdx = wordIndex + word.length;
+  while (afterIdx < partText.length && /\s/.test(partText[afterIdx])) {
+    afterIdx++;
+  }
+  if (afterIdx < partText.length && partText[afterIdx] === "(") {
+    return true;
+  }
+
+  return false;
+}
+
+// Get filter button display name based on target language
+function getForeignFilterLabel(targetLang: TargetLang) {
+  if (targetLang === "Russian") return "С латиницей";
+  if (["English", "German", "French", "Spanish", "Portuguese (Brazil)"].includes(targetLang)) return "С кириллицей";
+  return "Чужой алфавит";
+}
+
+// Get string type display label
+function getStringType(s: TranslationString) {
+  if (s.path.includes("say")) return "Диалог";
+  if (s.path.includes("menu_choice")) return "Выбор в меню";
+  if (s.path.includes("uscore")) return "Python-код";
+  if (s.path[0] === "screen") return "Интерфейс";
+  if (s.path[0] === "define") return "Имя персонажа";
+  return "Обычная";
+}
+
+// Highlight foreign words inside translations, ignoring Ren'Py formatting tags and technical tokens.
+function highlightLatin(text: string, targetLang: TargetLang) {
+  if (!text) return "";
+  
+  // Split by Ren'Py format tags {...} and variables [...]
+  const parts = text.split(/(\{.*?\}|\[.*?\])/g);
+  const foreignRegex = getForeignWordRegex(targetLang);
+  
+  // We need to match keeping track of absolute character indices to verify isTechnicalWord
+  return parts.map((part, index) => {
+    // If it's a tag or variable interpolation, render it raw
+    if (part.startsWith('{') || part.startsWith('[')) {
+      return <span key={index} className="tag-node">{part}</span>;
+    }
+    
+    // Split the text part by foreign words
+    const foreignRegexCapture = new RegExp(`(${foreignRegex.source})`, 'g');
+    const subParts = part.split(foreignRegexCapture);
+    
+    // Accumulate characters offset to find exact word index
+    let currentOffset = 0;
+    return (
+      <span key={index}>
+        {subParts.map((subPart, subIndex) => {
+          const isForeign = new RegExp(`^(${foreignRegex.source})$`).test(subPart);
+          const startIdx = currentOffset;
+          currentOffset += subPart.length;
+
+          if (isForeign && !isTechnicalWord(subPart, part, startIdx)) {
+            return (
+              <span key={subIndex} className="latin-highlight" title="Инородный символ в переводе">
+                {subPart}
+              </span>
+            );
+          }
+          return subPart;
+        })}
+      </span>
+    );
+  });
+}
+
 export default function App() {
   const { t, lang } = useT();
 
@@ -215,8 +340,126 @@ export default function App() {
   // after an offline start, so a translate run knows to re-check first.
   const proxyResolvedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  // Search query for string filtering
+  const [searchQuery, setSearchQuery] = useState("");
+  // Search mode: all fields, original only, translation only, or none
+  const [searchMode, setSearchMode] = useState<"all" | "original" | "translation" | "none">("all");
+  // Filter only items containing Latin words in translations
+  const [onlyLatinInTranslation, setOnlyLatinInTranslation] = useState(false);
+  // Selected translation string IDs for batch operations
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // IDs of strings that were just translated in the current/last batch run
+  const [justTranslatedIds, setJustTranslatedIds] = useState<Set<string>>(new Set());
+  // Filter strings by source type: all, regular strings (say, screen, define), python (uscore), or none
+  const [stringTypeFilter, setStringTypeFilter] = useState<"all" | "regular" | "python" | "none">("all");
   // Zero-based index of the visible table page (PAGE_SIZE rows each).
   const [page, setPage] = useState(0);
+
+  // Filter dropdown state and ref
+  const [isFilterMenuOpen, setIsFilterMenuOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsFilterMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, []);
+
+  // Reset page to 0 on search input change
+  const handleSearchChange = (val: string) => {
+    setSearchQuery(val);
+    setPage(0);
+  };
+
+  const handleSearchModeCheckbox = (field: "original" | "translation", checked: boolean) => {
+    setPage(0);
+    if (checked) {
+      if (searchMode === "none") {
+        setSearchMode(field);
+      } else if (searchMode === "original" && field === "translation") {
+        setSearchMode("all");
+      } else if (searchMode === "translation" && field === "original") {
+        setSearchMode("all");
+      }
+    } else {
+      if (searchMode === "all") {
+        setSearchMode(field === "original" ? "translation" : "original");
+      } else if (searchMode === field) {
+        setSearchMode("none");
+      }
+    }
+  };
+
+  const handleStringTypeCheckbox = (type: "regular" | "python", checked: boolean) => {
+    setPage(0);
+    if (checked) {
+      if (stringTypeFilter === "none") {
+        setStringTypeFilter(type);
+      } else if (stringTypeFilter === "regular" && type === "python") {
+        setStringTypeFilter("all");
+      } else if (stringTypeFilter === "python" && type === "regular") {
+        setStringTypeFilter("all");
+      }
+    } else {
+      if (stringTypeFilter === "all") {
+        setStringTypeFilter(type === "regular" ? "python" : "regular");
+      } else if (stringTypeFilter === type) {
+        setStringTypeFilter("none");
+      }
+    }
+  };
+
+  const handleOnlyLatinToggle = () => {
+    setOnlyLatinInTranslation(prev => !prev);
+    setPage(0);
+  };
+
+  const resetAllFilters = () => {
+    setSearchMode("all");
+    setStringTypeFilter("all");
+    setOnlyLatinInTranslation(false);
+    setJustTranslatedIds(new Set()); // Clear pinned/highlighted translations
+    setPage(0);
+  };
+
+  const getActiveFiltersCount = () => {
+    let count = 0;
+    if (searchMode !== "all") count++;
+    if (stringTypeFilter !== "all") count++;
+    if (onlyLatinInTranslation) count++;
+    return count;
+  };
+
+  const toggleSelectId = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const selectAllVisible = (visibleStrings: TranslationString[]) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const allSelected = visibleStrings.every((s) => next.has(s.id));
+      if (allSelected) {
+        visibleStrings.forEach((s) => next.delete(s.id));
+      } else {
+        visibleStrings.forEach((s) => next.add(s.id));
+      }
+      return next;
+    });
+  };
   // The table container — used to scroll its headers to the top of the viewport
   // when the user navigates pages (the whole document scrolls, so a fresh page
   // would otherwise stay parked at the old scroll offset, mid-table).
@@ -295,6 +538,11 @@ export default function App() {
     setApiKeys(arr);
     saveProviderKeys(provider, arr);
   }
+
+  // Clear recently translated highlight when changing active directory/engine
+  useEffect(() => {
+    setJustTranslatedIds(new Set());
+  }, [root, modsDir, translationMode]);
 
   useEffect(() => {
     ping().then((up) => {
@@ -643,7 +891,7 @@ export default function App() {
   }
 
 
-  async function translateAll(): Promise<{ ok: boolean; project?: ProjectFile }> {
+  async function translateAll(targetIds?: string[]): Promise<{ ok: boolean; project?: ProjectFile }> {
     if (!project || !engine) return { ok: false };
     let ok = true;
     let currentProject = project;
@@ -653,10 +901,16 @@ export default function App() {
       setPyProgress(null);
       const todo = strings.filter((s) => {
         const entry = project.strings[s.id];
+        if (targetIds) {
+          return targetIds.includes(s.id);
+        }
         // entry absent = never translated; entry present but translated empty = also needs translation.
         // approved strings are always skipped regardless.
         return !(entry?.approved) && !(entry?.translated);
       });
+
+      // Record translating IDs so they are pinned and highlighted
+      setJustTranslatedIds(new Set(todo.map((s) => s.id)));
 
       // Calculate unique representatives matching the backend de-duplication
       const uniqueKeys = new Set(strings.map((s) => `${s.original}\x00${s.context}`));
@@ -1170,7 +1424,7 @@ export default function App() {
   // Steps share ONE .interprex_backups store, so the single Restore button undoes
   // everything. Each step short-circuits the chain if the user aborts or it fails;
   // autofix is best-effort (its own try/catch) and never blocks completion.
-  async function handleTranslate() {
+  async function handleTranslate(targetIds?: string[]) {
     const activeRoot = translationMode === "mods" ? modsDir : root;
     if (!project || !engine || !activeRoot) return;
 
@@ -1180,7 +1434,7 @@ export default function App() {
     await ensureProxyResolved();
 
     // 1. Translate.
-    const { ok: translated, project: updatedProject } = await translateAll();
+    const { ok: translated, project: updatedProject } = await translateAll(targetIds);
     if (!translated) return;
 
     // 2. Write the tl/ files (must precede autofix — it has nothing to check
@@ -1370,17 +1624,118 @@ export default function App() {
   // phase_* keys map to plain strings; cast narrows the t() union for JSX.
   const phaseLabel = busy ? (t(`phase_${phase}` as StringKey) as string) : "";
 
+  // Filter strings by search query (original, translation, path), type and mode
+  const filteredStrings = useMemo(() => {
+    let result = strings;
+
+    // Filter by string type (regular vs python/uscore)
+    if (stringTypeFilter === "regular") {
+      result = result.filter((s) => !s.path.includes("uscore") || justTranslatedIds.has(s.id));
+    } else if (stringTypeFilter === "python") {
+      result = result.filter((s) => s.path.includes("uscore") || justTranslatedIds.has(s.id));
+    } else if (stringTypeFilter === "none") {
+      result = result.filter((s) => justTranslatedIds.has(s.id));
+    }
+
+    // Filter only those that contain foreign words in their translation (ignoring Ren'Py tags)
+    if (onlyLatinInTranslation) {
+      const foreignRegex = getForeignWordRegex(target);
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        
+        const entry = project?.strings[s.id];
+        const trans = entry?.translated || "";
+        if (!trans) return false;
+
+        const parts = trans.split(/(\{.*?\}|\[.*?\])/g);
+        return parts.some((part) => {
+          if (part.startsWith('{') || part.startsWith('[')) return false;
+          
+          foreignRegex.lastIndex = 0;
+          let match;
+          while ((match = foreignRegex.exec(part)) !== null) {
+            const word = match[0];
+            const idx = match.index;
+            if (!isTechnicalWord(word, part, idx)) {
+              return true;
+            }
+          }
+          return false;
+        });
+      });
+    }
+
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        
+        const entry = project?.strings[s.id];
+        const orig = s.original.toLowerCase();
+        const trans = (entry?.translated || "").toLowerCase();
+        const loc = s.path.join(" ").toLowerCase();
+
+        if (searchMode === "original") {
+          return orig.includes(q) || loc.includes(q);
+        } else if (searchMode === "translation") {
+          return trans.includes(q);
+        } else if (searchMode === "none") {
+          return false;
+        } else {
+          return orig.includes(q) || trans.includes(q) || loc.includes(q);
+        }
+      });
+    }
+
+    // Sort recently translated rows to the top
+    if (justTranslatedIds.size > 0) {
+      result = [...result].sort((a, b) => {
+        const aJust = justTranslatedIds.has(a.id) ? 1 : 0;
+        const bJust = justTranslatedIds.has(b.id) ? 1 : 0;
+        return bJust - aJust;
+      });
+    }
+
+    return result;
+  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds]);
+
   // Pagination math. pageCount is at least 1 so "page 1 of 1" reads right on a
   // small project. Clamp the current page in case strings shrank under it (e.g.
   // a re-extract), so we never slice past the end or show a blank page.
-  const pageCount = Math.max(1, Math.ceil(strings.length / PAGE_SIZE));
+  const pageCount = Math.max(1, Math.ceil(filteredStrings.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const pageStart = safePage * PAGE_SIZE;
-  const pageRows = strings.slice(pageStart, pageStart + PAGE_SIZE);
+  const pageRows = filteredStrings.slice(pageStart, pageStart + PAGE_SIZE);
 
   return (
     <main className="app">
       <UpdateOverlay onStateChange={setUpdateBusyTracked} />
+
+      {selectedIds.size > 0 && (
+        <div className="floating-action-bar">
+          <span className="selected-count">
+            Выбрано строк: <strong>{selectedIds.size}</strong>
+          </span>
+          <button
+            className="retranslate-btn"
+            onClick={() => {
+              handleTranslate(Array.from(selectedIds));
+              setSelectedIds(new Set()); // Reset selection after translation
+            }}
+            disabled={busy}
+            title="Перевести выбранные строки заново с помощью выбранной модели"
+          >
+            🔄 Переперевести
+          </button>
+          <button
+            className="reset-selection-btn"
+            onClick={() => setSelectedIds(new Set())}
+            title="Сбросить выделение всех строк"
+          >
+            ❌ Сбросить выбор
+          </button>
+        </div>
+      )}
 
       <header className="topbar">
         <div className="brand">
@@ -1619,7 +1974,7 @@ export default function App() {
             </div>
           </label>
         )}
-        <button onClick={handleTranslate} disabled={translateDisabled}>
+        <button onClick={() => handleTranslate()} disabled={translateDisabled}>
           {t("translate")}
         </button>
         {activeRoot && !busy && (
@@ -2122,20 +2477,130 @@ export default function App() {
       {activeRoot && <div className="path">{activeRoot}</div>}
       {error && <div className="notice">{error}</div>}
 
+      {strings.length > 0 && (
+        <div className="search-container">
+          <div className="search-wrapper">
+            <span className="search-icon">🔍</span>
+            <input
+              type="text"
+              className="search-input"
+              placeholder="Поиск по таблице..."
+              value={searchQuery}
+              onChange={(e) => handleSearchChange(e.target.value)}
+            />
+            {searchQuery && (
+              <button className="search-clear" onClick={() => handleSearchChange("")}>
+                ✕
+              </button>
+            )}
+          </div>
+          
+          <div className="filter-dropdown-container" ref={dropdownRef}>
+            <button
+              className={`filter-dropdown-btn ${getActiveFiltersCount() > 0 ? "active" : ""}`}
+              onClick={() => setIsFilterMenuOpen(!isFilterMenuOpen)}
+              title="Фильтры и настройки поиска"
+            >
+              ⚙️ Фильтры {getActiveFiltersCount() > 0 ? `(${getActiveFiltersCount()})` : ""} ▾
+            </button>
+            {isFilterMenuOpen && (
+              <div className="filter-dropdown-menu">
+                <div className="filter-dropdown-item reset-item" onClick={resetAllFilters}>
+                  <span>❌ Сбросить все</span>
+                </div>
+                <div className="filter-dropdown-divider" />
+                
+                <div className="filter-dropdown-section-title">Искать в:</div>
+                <label className="filter-dropdown-item">
+                  <input
+                    type="checkbox"
+                    checked={searchMode === "original" || searchMode === "all"}
+                    onChange={(e) => handleSearchModeCheckbox("original", e.target.checked)}
+                  />
+                  <span>Оригинал</span>
+                </label>
+                <label className="filter-dropdown-item">
+                  <input
+                    type="checkbox"
+                    checked={searchMode === "translation" || searchMode === "all"}
+                    onChange={(e) => handleSearchModeCheckbox("translation", e.target.checked)}
+                  />
+                  <span>Перевод</span>
+                </label>
+                
+                <div className="filter-dropdown-divider" />
+                
+                <div className="filter-dropdown-section-title">Тип строк:</div>
+                <label className="filter-dropdown-item">
+                  <input
+                    type="checkbox"
+                    checked={stringTypeFilter === "regular" || stringTypeFilter === "all"}
+                    onChange={(e) => handleStringTypeCheckbox("regular", e.target.checked)}
+                  />
+                  <span>Обычные строки</span>
+                </label>
+                <label className="filter-dropdown-item">
+                  <input
+                    type="checkbox"
+                    checked={stringTypeFilter === "python" || stringTypeFilter === "all"}
+                    onChange={(e) => handleStringTypeCheckbox("python", e.target.checked)}
+                  />
+                  <span>Python-код</span>
+                </label>
+                
+                <div className="filter-dropdown-divider" />
+                
+                <div className="filter-dropdown-section-title">Ошибки / Подсветка:</div>
+                <label className="filter-dropdown-item">
+                  <input
+                    type="checkbox"
+                    checked={onlyLatinInTranslation}
+                    onChange={handleOnlyLatinToggle}
+                  />
+                  <span>{getForeignFilterLabel(target)}</span>
+                </label>
+              </div>
+            )}
+          </div>
+
+
+
+          {(searchQuery || onlyLatinInTranslation || stringTypeFilter !== "all" || selectedIds.size > 0) && (
+            <span className="search-count">
+              Найдено: {filteredStrings.length} из {strings.length}
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="tablewrap" ref={tableWrapRef}>
         <table>
           <thead>
             <tr>
+              <th style={{ width: "30px", textAlign: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={pageRows.length > 0 && pageRows.every((s) => selectedIds.has(s.id))}
+                  onChange={() => selectAllVisible(pageRows)}
+                />
+              </th>
               <th>{t("colOriginal")}</th>
               <th>{t("colTranslation")}</th>
-              <th>{t("colWhere")}</th>
+              <th>Тип строки</th>
             </tr>
           </thead>
           <tbody>
             {pageRows.map((s) => {
               const entry = project?.strings[s.id];
               return (
-                <tr key={s.id}>
+                <tr key={s.id} className={justTranslatedIds.has(s.id) ? "just-translated-row" : ""}>
+                  <td style={{ textAlign: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(s.id)}
+                      onChange={() => toggleSelectId(s.id)}
+                    />
+                  </td>
                   <td>{s.original}</td>
                   <td
                     className={
@@ -2160,24 +2625,32 @@ export default function App() {
                           }
                         }}
                       />
+                    ) : entry?.translated ? (
+                      highlightLatin(entry.translated, target)
                     ) : (
-                      entry?.translated || "—"
+                      "—"
                     )}
                   </td>
-                  <td className="where">{s.path.join(" › ")}</td>
+                  <td className="where" title={`${s.file}\n${s.path.join(" › ")}`}>
+                    {getStringType(s)}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
-        {!strings.length && (
+        {!strings.length ? (
           <p className="hint">
             {translationMode === "mods" ? (t("hintOpenModsFolder") as string) : (t("hintOpenFolder") as string)}
           </p>
-        )}
+        ) : !filteredStrings.length ? (
+          <p className="hint">
+            Ничего не найдено по запросу "{searchQuery}"
+          </p>
+        ) : null}
       </div>
 
-      {strings.length > PAGE_SIZE && (
+      {filteredStrings.length > PAGE_SIZE && (
         <div className="pager">
           <button onClick={() => goToPage(safePage - 1)} disabled={safePage <= 0}>
             ‹
@@ -2209,8 +2682,8 @@ export default function App() {
           <span className="pagerrange">
             {t("showingRows")(
               pageStart + 1,
-              Math.min(pageStart + PAGE_SIZE, strings.length),
-              strings.length,
+              Math.min(pageStart + PAGE_SIZE, filteredStrings.length),
+              filteredStrings.length,
             )}
           </span>
         </div>

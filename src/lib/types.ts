@@ -27,7 +27,8 @@ export type Engine =
   | "i18n"
   | "fusion"
   | "mmf2"
-  | "qsp";
+  | "qsp"
+  | "twine";
 
 /**
  * One translatable unit of text, as produced by a parser's extract().

@@ -43,6 +43,12 @@ import struct
 from pathlib import Path
 import subprocess
 import shutil
+import os
+
+def _run_cmd(args, **kwargs):
+    if os.name == 'nt':
+        kwargs['creationflags'] = 0x08000000
+    return subprocess.run(args, **kwargs)
 import tempfile
 import re
 import functools
@@ -412,7 +418,7 @@ def _find_retoc() -> str:
         
     # Verify the executable runs and supports 'to-zen'
     try:
-        res = subprocess.run([path_to_try, "--help"], capture_output=True, text=True, check=False)
+        res = _run_cmd([path_to_try, "--help"], capture_output=True, text=True, check=False)
         help_text = res.stdout + res.stderr
         if "to-zen" not in help_text:
             raise RuntimeError(
@@ -435,7 +441,7 @@ def _detect_ue_version(utoc_path: str, retoc_bin: str) -> str:
     """Run 'retoc info' to detect the UE version by reading Toc version.
     Returns string like 'UE5_4', 'UE5_5', 'UE5_6'. Defaults to 'UE5_4'."""
     try:
-        res = subprocess.run([retoc_bin, "info", "--path", utoc_path], capture_output=True, text=True, check=True)
+        res = _run_cmd([retoc_bin, "info", "--path", utoc_path], capture_output=True, text=True, check=True)
         info_text = res.stdout
         if "ReplaceIoChunkHashWithIoHash" in info_text:
             return "UE5_6"
@@ -546,7 +552,7 @@ class UnrealEngine4_5Parser(BaseParser):
             list_re = re.compile(r"^(?P<chunk_id>[0-9a-fA-F]+)\s+.*?\s+(?P<inner_path>.*\.locres)$")
             for uf in utocs[:5]:
                 try:
-                    res = subprocess.run([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, timeout=5)
+                    res = _run_cmd([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, timeout=5)
                     for line in res.stdout.splitlines():
                         if list_re.match(line.strip()):
                             return True
@@ -616,7 +622,7 @@ class UnrealEngine4_5Parser(BaseParser):
         for uf in utocs:
             utoc_rel = uf.relative_to(root).as_posix()
             try:
-                res = subprocess.run([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
+                res = _run_cmd([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
             except Exception as e:
                 logger.error(f"Failed to list utoc {utoc_rel}: {e}")
                 continue
@@ -641,7 +647,7 @@ class UnrealEngine4_5Parser(BaseParser):
                         
                     temp_file = Path(tmp_dir) / f"{chunk_id}.locres"
                     try:
-                        subprocess.run([retoc_bin, "get", str(uf), chunk_id, str(temp_file)], check=True, capture_output=True)
+                        _run_cmd([retoc_bin, "get", str(uf), chunk_id, str(temp_file)], check=True, capture_output=True)
                         if temp_file.is_file():
                             locres_data = temp_file.read_bytes()
                             m = parse_locres(locres_data)
@@ -786,7 +792,7 @@ class UnrealEngine4_5Parser(BaseParser):
         for uf in utocs:
             utoc_rel = uf.relative_to(root).as_posix()
             try:
-                res = subprocess.run([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
+                res = _run_cmd([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
             except Exception as e:
                 logger.error(f"Failed to list utoc {utoc_rel}: {e}")
                 continue
@@ -812,7 +818,7 @@ class UnrealEngine4_5Parser(BaseParser):
                         
                     temp_file = Path(tmp_extract_dir) / f"{chunk_id}.locres"
                     try:
-                        subprocess.run([retoc_bin, "get", str(uf), chunk_id, str(temp_file)], check=True, capture_output=True)
+                        _run_cmd([retoc_bin, "get", str(uf), chunk_id, str(temp_file)], check=True, capture_output=True)
                         if temp_file.is_file():
                             locres_data = temp_file.read_bytes()
                             m = parse_locres(locres_data)
@@ -849,7 +855,7 @@ class UnrealEngine4_5Parser(BaseParser):
                             self.backup_file(root, str(p_file))
                             
                     try:
-                        subprocess.run([
+                        _run_cmd([
                             retoc_bin, "to-zen",
                             "--version", ue_ver,
                             str(tmp_zen_dir),
