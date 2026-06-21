@@ -35,9 +35,10 @@ jobs:
           cache: 'pip'
           cache-dependency-path: 'python-core/requirements.txt'
 
+      # No `pip install --upgrade pip` — the runner's bundled pip is recent enough
+      # and upgrading it every build just adds ~10-20s for no benefit.
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade pip
           python -m pip install -r python-core/requirements.txt
           python -m pip install pyinstaller
 

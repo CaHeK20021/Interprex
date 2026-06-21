@@ -33,3 +33,19 @@ windows = { version = "0.58", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+# Release profile tuned for BUILD SPEED, not micro-runtime-speed. Interprex is a
+# thin Tauri shell (it just launches the Python sidecar + window), so the runtime
+# cost of less aggressive optimization is imperceptible, while CI/local compile
+# time drops a lot:
+#   lto = false        -> skips whole-program link-time optimization (the single
+#                         slowest release step).
+#   codegen-units = 16 -> lets the compiler parallelize codegen instead of the
+#                         default release codegen-units = 1.
+#   opt-level = 2      -> nearly all the speed of 3, compiles faster.
+# Trade-off: the exe is ~5-15% larger and a hair slower at pure CPU work — neither
+# matters for a window+sidecar launcher. Revert by deleting this block.
+[profile.release]
+lto = false
+codegen-units = 16
+opt-level = 2

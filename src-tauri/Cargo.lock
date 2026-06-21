@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "interprex"
-version = "0.0.17"
+version = "0.0.24"
 dependencies = [
  "serde",
  "serde_json",
