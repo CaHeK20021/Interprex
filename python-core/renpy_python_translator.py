@@ -1374,7 +1374,7 @@ def extract_python_blocks(rpy_content: str) -> list[dict]:
     block_lines = []
     block_start_line = 0
     
-    python_block_re = re.compile(r'^\s*(?:init\s+[-0-9]+\s+)?python(?:\s+\w+)?\s*:\s*(?:#.*)?$')
+    python_block_re = re.compile(r'^\s*(?:init\s+(?:[-0-9]+\s+)?)?python(?:\s+\w+)?\s*:\s*(?:#.*)?$')
     
     for idx, line in enumerate(lines, 1):
         stripped = line.strip()
@@ -1464,13 +1464,153 @@ def _extract_screen_call_candidates(content: str) -> list[dict]:
     return candidates
 
 
+def _extract_default_define_candidates(content: str, file_path: Path) -> list[dict]:
+    """Extract string literals from Ren'Py `default`/`define` assignments.
+
+    Ren'Py uses `default VAR = <expr>` / `define VAR = <expr>` for initialization.
+    The RHS is a Python expression that may contain player-visible strings
+    (e.g. `status_text="online"`, `ChatCharacter("Name")`). These lines are NOT
+    python: blocks and are NOT prefixed with $, so extract_python_blocks and the
+    screen-call scanner both miss them. This function fills that gap by parsing
+    the RHS directly as a Python AST and walking for string constants.
+
+    Handles multi-line RHS (Ren'Py implicit continuation inside brackets).
+    """
+    candidates: list[dict] = []
+    lines = content.split("\n")
+
+    # Matches the START of a default/define line:
+    #   default mc = ChatCharacter("Name", ...)
+    #   default -5 mc = ChatCharacter("Name", ...)
+    #   define -501 TUTORIAL = "help"
+    #   init -5 define TUTORIAL = "help"
+    #   define a.b.c = "value"
+    #   default a = "simple string"
+    _DD_START_RE = re.compile(
+        r'^(?P<indent>\s*)(?:init\s+(?:[-0-9]+\s+)?)?(?:default|define)\s+'
+        r'(?:[-0-9]+\s+)?'  # optional init priority after default/define
+        r'(?P<var>[a-zA-Z_][\w.]*(?:\s*,\s*[a-zA-Z_][\w.]*)*)\s*=\s*(?P<rhs>.*)'
+    )
+
+    def _bracket_balance(s: str) -> int:
+        """Return >0 if more open brackets, <0 if more close, 0 if balanced."""
+        opens = s.count("(") + s.count("[") + s.count("{")
+        closes = s.count(")") + s.count("]") + s.count("}")
+        return opens - closes
+
+    for idx, line in enumerate(lines, 1):
+        m = _DD_START_RE.match(line)
+        if not m:
+            continue
+        base_indent = len(m.group("indent"))
+        var_part = m.group("var")
+        rhs = m.group("rhs").strip()
+        # Strip trailing comment
+        rhs = re.sub(r'\s*#.*$', '', rhs)
+        if not rhs:
+            continue
+
+        # Collect continuation lines if brackets are unbalanced
+        if _bracket_balance(rhs) > 0:
+            for ci in range(idx, len(lines)):  # ci = continuation line index (0-based)
+                cl = lines[ci]
+                if not cl.strip():
+                    continue
+                cl_indent = len(cl) - len(cl.lstrip())
+                if cl_indent <= base_indent:
+                    # This line is at or dedented from the default/define line.
+                    # If it's purely a closer (e.g. ")"), include it.
+                    stripped_cl = cl.strip()
+                    if stripped_cl and stripped_cl[0] in ")]}" and _bracket_balance(rhs) > 0:
+                        rhs += "\n" + stripped_cl
+                    break
+                # Continuation line — strip its indent relative to base
+                cl_body = cl[base_indent:] if len(cl) > base_indent else cl.strip()
+                rhs += "\n" + cl_body
+                if _bracket_balance(rhs) <= 0:
+                    break
+
+        # Identify the keyword used
+        stripped = line.strip()
+        kw = "default" if (stripped.startswith("default ") or " default " in stripped[:15]) else "define"
+
+        # Parse the RHS as a Python expression AST
+        try:
+            tree = ast.parse(rhs, mode='eval')
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            val = node.value
+            if not val.strip():
+                continue
+
+            # Find the raw literal in the RHS string
+            raw_literal = None
+            for lm in _STRING_LITERAL_RE.finditer(rhs):
+                try:
+                    if ast.literal_eval(lm.group(0)) == val:
+                        raw_literal = lm.group(0)
+                        break
+                except Exception:
+                    pass
+            if not raw_literal:
+                continue
+
+            candidates.append({
+                "value": val,
+                "line": idx,
+                "end_line": idx,
+                "context_function": kw,
+                "context_variable": var_part.split(",")[0].strip().split(".")[0],
+                "context_param": None,
+                "raw_literal": raw_literal,
+                "raw_line": line.strip(),
+                "file_path": file_path,
+            })
+
+    return candidates
+
+
+def _dedent(text: str) -> str:
+    """Like textwrap.dedent, but ignores truly empty lines (length 0) and
+    comment-only lines when computing the common leading whitespace.
+
+    The stdlib dedent also ignores whitespace-only lines, but a blank line
+    emitted by unrpyc inside a multi-line string may be genuinely empty
+    (length 0, not whitespace), causing dedent to return the text unchanged
+    — and then ast.parse fails on the indented code.
+
+    Also skips comment lines (starting with # after strip), because
+    extract_python_blocks greedily appends comment lines at ANY indent level
+    (the stripped.startswith('#') rule), so a stray unrpyc footer comment at
+    column 0 inside a deeply-indented block would set min_indent=0."""
+    lines = text.split("\n")
+    indents = [
+        len(line) - len(line.lstrip())
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not indents:
+        return text
+    min_indent = min(indents)
+    if min_indent == 0:
+        return text
+    return "\n".join(
+        line[min_indent:] if len(line) - len(line.lstrip()) >= min_indent else line
+        for line in lines
+    )
+
+
 def parse_and_extract_candidates(file_path: Path, content: str) -> list[dict]:
     raw_lines = content.split("\n")
     blocks = extract_python_blocks(content)
 
     candidates = []
     for block in blocks:
-        dedented_code = textwrap.dedent(block["code"])
+        dedented_code = _dedent(block["code"])
         try:
             tree = ast.parse(dedented_code)
             populate_parents(tree)
@@ -1482,6 +1622,9 @@ def parse_and_extract_candidates(file_path: Path, content: str) -> list[dict]:
 
     # Pull literals from show/call screen statements (not python: blocks).
     candidates.extend(_extract_screen_call_candidates(content))
+
+    # Pull literals from default/define statements (not python: blocks).
+    candidates.extend(_extract_default_define_candidates(content, file_path))
 
     # Add file path to each candidate
     for cand in candidates:

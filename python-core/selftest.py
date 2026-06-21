@@ -3808,6 +3808,89 @@ def check_renpy_python_cache() -> None:
           "dialogue-tl/ dup exclusion)")
 
 
+def check_renpy_inline_extraction() -> None:
+    """Regression: `init python:` (no priority) now matches, default/define
+    with priority numbers are scanned, and unrpyc footer comments (indent 0
+    inside blocks) don't break dedent → ast.parse."""
+    from renpy_python_translator import (
+        extract_python_blocks, _extract_default_define_candidates,
+        parse_and_extract_candidates, _dedent,
+    )
+    from pathlib import Path
+    F = Path("test_extract.rpy")
+
+    # --- Bug 1: init python: without a number ---
+    code1 = "init python:\n    x = \"inside init python\"\n"
+    blocks = extract_python_blocks(code1)
+    assert len(blocks) == 1, f"init python: must match, got {len(blocks)} block(s)"
+
+    #   also test with a number (must still work)
+    code1b = "init -5 python:\n    x = \"inside init -5\"\n"
+    blocks = extract_python_blocks(code1b)
+    assert len(blocks) == 1, f"init -5 python: must match, got {len(blocks)} block(s)"
+
+    # --- Bug 2: default/define with priority number ---
+    code2 = 'default -5 mc = ChatCharacter("Name", status_text="online")\n'
+    cands = _extract_default_define_candidates(code2, F)
+    vals = [c["value"] for c in cands]
+    assert "Name" in vals, f"default -5: Name missing from {vals}"
+    assert "online" in vals, f"default -5: online missing from {vals}"
+
+    #   define with init prefix
+    code2b = 'init -10 define TUTORIAL = "click here"\n'
+    cands = _extract_default_define_candidates(code2b, F)
+    vals = [c["value"] for c in cands]
+    assert "click here" in vals, f"define with init prefix: missing from {vals}"
+
+    #   default WITHOUT priority (plain, must still work)
+    code2c = 'default a = "simple string"\n'
+    cands = _extract_default_define_candidates(code2c, F)
+    vals = [c["value"] for c in cands]
+    assert "simple string" in vals, f"plain default: missing from {vals}"
+
+    # --- Bug 2b: multi-line default/define ---
+    code_multi = '''default -5 mc = ChatCharacter(
+    name="Lord Sugar",
+    status_text="online",
+)
+'''
+    cands = _extract_default_define_candidates(code_multi, F)
+    vals = [c["value"] for c in cands]
+    assert "Lord Sugar" in vals, f"multi-line default: missing from {vals}"
+    assert "online" in vals, f"multi-line default: online missing from {vals}"
+
+    # --- Bug 2c: comment line at indent 0 inside block ---
+    # unrpyc appends a `# Decompiled by unrpyc: ...` at column 0 after the
+    # last dedented line of a block. Our _dedent must not strip it.
+    code_dedent = """    class Foo:
+        def bar(self):
+            return "hello"
+# Decompiled by unrpyc
+"""
+    result = _dedent(code_dedent)
+    # After dedent, the comment must still start with '#'
+    lines = result.split("\n")
+    comment_lines = [l for l in lines if "Decompiled" in l]
+    assert len(comment_lines) == 1, f"Decompiled comment lost: {comment_lines}"
+    assert comment_lines[0].startswith("#"), \
+        f"Comment must keep #, got {comment_lines[0]!r}"
+
+    # --- End-to-end: parse_and_extract_candidates ---
+    code_e2e = '''init -10 define MAX = 100
+default -5 mc = ChatCharacter("TestName")
+init python:
+    a = "from init python block"
+'''
+    cands = parse_and_extract_candidates(F, code_e2e)
+    vals = [c["value"] for c in cands]
+    assert "TestName" in vals, f"e2e: TestName missing from {vals}"
+    assert "from init python block" in vals, f"e2e: init python string missing from {vals}"
+    assert "100" not in vals, "e2e: numeric literal must NOT be extracted"
+
+    print("OK — renpy inline extraction: init python: no-priority, default/define "
+          "with priority, multi-line default, unrpyc comment dedent, end-to-end")
+
+
 def main() -> int:
     check_epic_games()
     check_steam_games()
@@ -3819,6 +3902,7 @@ def main() -> int:
     check_renpy_keystring_safety()
     check_renpy_keystring_promotion()
     check_renpy_python_cache()
+    check_renpy_inline_extraction()
     check_csharp()
     check_unity()
     check_unity_localization()

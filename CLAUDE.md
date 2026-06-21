@@ -396,6 +396,41 @@ CONTRACT with the UI grid regexes (`App.tsx`) — keep them exact. `main()` take
 `--api-key` still works. Verified offline by `check_renpy_python_pool` in
 `selftest.py` (all-success, auth-failover, rate-recover, all-keys-dead-terminates).
 
+### Candidate extraction — `init python:`, `default`/`define`, unrpyc artifact resilience
+
+`extract_python_blocks()` (`renpy_python_translator.py:1368`) was missing two common
+Ren'Py source patterns:
+
+1. **`init python:` without a priority number** (e.g. `init python:`, not just
+   `init -5 python:`). The regex `(?:init\s+[-0-9]+\s+)?` required a number after
+   `init`. Fixed to `(?:init\s+(?:[-0-9]+\s+)?)?`.
+2. **`default`/`define` statements** are NOT python: blocks (they're top-level
+   Ren'Py statements) and were never scanned. The new `_extract_default_define_candidates()`
+   (`renpy_python_translator.py:1467`) handles:
+   - `default mc = ChatCharacter("Name")` — plain
+   - `default -5 mc = ChatCharacter("Name")` — with init priority
+   - `init -5 define TUTORIAL = "help"` — with init prefix
+   - **Multi-line RHS** (e.g. `ChatCharacter(\n    status_text="online",\n)`):
+     continuation lines are collected until brackets balance.
+   The RHS is parsed via `ast.parse(mode='eval')` so only real string constants
+   are extracted (numeric/boolean literals are ignored upstream).
+
+Two unrpyc-decompilation artifacts required additional resilience:
+- **Blank lines at column 0 inside docstrings** (unrpyc emits truly empty
+  `""` lines inside `"""..."""` blocks), which made `textwrap.dedent` return the
+  text unchanged → `ast.parse` failed with "unexpected indent". Fixed by replacing
+  `textwrap.dedent` with `_dedent()` (`renpy_python_translator.py:1577`), which
+  ignores empty/comment-only lines when computing the common leading whitespace.
+- **`# Decompiled by unrpyc:` footer** at column 0 appended by unrpyc after the
+  last dedented line of a block. `_dedent` strips only from lines that actually
+  have enough leading whitespace (indent ≥ min), so a column-0 comment is never
+  truncated.
+
+Without these fixes, inline-Python translator silently skipped every file that
+used `init python:` or `default -5` syntax — common patterns shipped by Ren'Py
+game devs. Verified on Killer Chat: 4 previously-missing strings now reach
+classification/translation pipeline.
+
 ### Translation cache + no-API write-back
 - **`_TranslationCache`** (`.interprex_python_translations.json`, keyed by
   `_candidate_cache_key`, versioned by TARGET LANGUAGE) stores the actual inline
