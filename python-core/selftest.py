@@ -302,13 +302,27 @@ def check_renpy_font() -> None:
         interface_text_font = "AnalogueOS-Regular.ttf"  # direct file — must be repointed
     
     calls = []
+    # Build translate_string with ZERO freevars (resolve `calls` from its own
+    # globals, not a closure) so it mirrors the REAL renpy.translation.
+    # translate_string (a module function). The pickle-safe fix patches it in
+    # place via a __code__ swap, which CPython refuses when freevar counts
+    # differ — a closure-capturing mock would force the defensive skip path and
+    # hide whether the real in-place patch works (same rationale as the
+    # add_ping_hyperlinks mock below).
+    _ts_ns = {"calls": calls}
+    exec(
+        "def translate_string(s):\n"
+        "    calls.append(('trans', s))\n"
+        "    if s.startswith('1. '):\n"
+        "        return s  # simulate translation missing\n"
+        "    return 'translated:' + s\n",
+        _ts_ns,
+    )
+    _mock_translate_string = _ts_ns["translate_string"]
+    assert not _mock_translate_string.__code__.co_freevars, \
+        "test mock translate_string must have no freevars (mirrors the real module function)"
     class _Translation:
-        @staticmethod
-        def translate_string(s):
-            calls.append(("trans", s))
-            if s.startswith("1. "):
-                return s  # simulate translation missing
-            return "translated:" + s
+        translate_string = staticmethod(_mock_translate_string)
     class _Game:
         lint = False
     class _Renpy:
