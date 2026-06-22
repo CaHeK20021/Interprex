@@ -738,31 +738,73 @@ Three sources, tried in order:
 `_extract_from_uassets` ALWAYS runs (not just as fallback) — a mod with locres
 in one path may have uasset TextProperty strings in another.
 
-### Inject (`_inject_into_uassets`)
+### Inject (`_inject_into_uassets`) — VERIFIED against the engine oracle
 Generates ContentLib JSON patch files. **Cache-aware**: uses extraction cache
 from the same run (avoids re-running `retoc to-legacy` during inject).
 
-ContentLib patch format (verified against docs.ficsit.app):
-```
-//Game/Mods/ModName/AssetName.AssetName_C
-{
-    "Name": "Translated display name",
-    "Description": "Translated description"
-}
-```
+**THE GROUND TRUTH for "did the patch apply" is the game's own log**, NOT web
+search (which hallucinates the format): `%LOCALAPPDATA%/FactoryGame/Saved/Logs/
+FactoryGame.log`. It prints every patch load + exact reject reason + a final
+`[CL] Processed /Configs/ ItemPatches Successful: N/M`. The authoritative format
+docs are a repo, NOT the (403/404-walled) website: `git clone
+github.com/budak7273/ContentLib_Documentation` → `Features/{Patching,CDOs}.adoc`,
+`BackgroundInfo/FolderNames.adoc`, `JsonSchemas/Tests/{ItemPatch,CDO}_*.json`.
 
-The `//` comment line is the patch target (full Blueprint class path). The JSON
-body uses standard ContentLib fields. **Unknown property names are SKIPPED**
-(not injected as raw keys) — prevents injecting enum values like "Auto"/"Simple"
-that aren't valid ContentLib fields.
+**Four load-bearing rules — breaking ANY of 1–3 rejects 100% of patches, breaking
+4 silently drops every buildable. All four were real shipped bugs (Satisfactory,
+2026-06), each hidden behind the previous, all with symptom `Successful: 0/615`
+but different inner log lines — read the INNER line, not the count:**
 
-Mapped fields: `mDisplayName` → `Name`, `mDescription` → `Description`,
-`mTooltip` → `Tooltip`, `mFlavor`/`mLongDescription` → `LongDescription`,
-`mPreUnlockDisplayName`, `mPreUnlockDescription`, `mPostUnlockDescription`.
+1. **Marker slash.** The first line is a `//`-comment "patch target" = the class
+   path with the `_C` suffix and EXACTLY ONE extra leading slash → `//<path>`.
+   `internal_path` already starts with `/`, so emit `"//" + path.lstrip("/")`.
+   `///…` (3 slashes) → `"Detected a double slash in a class path … could not be
+   loaded"`.
+2. **Mount path.** Satisfactory mods are UE PLUGINS mounted at the virtual root
+   `/<ModName>/...`, NOT `/Game/Mods/<ModName>/...` (log: `Loading Assets of Mod:
+   /AB_FluidExtras`). UAssetExtractor (`Program.cs:140-142`) wrongly prepends
+   `/Game/Mods`, so `internal_path` ships as `/Game/Mods/<Mod>/…`. Strip that
+   prefix in Python (NOT C# — keeps InternalPath→id stable so existing
+   translations stay valid): `if path.startswith("/Game/Mods/"): path = "/" +
+   path[len("/Game/Mods/"):]`. Wrong path → `LogStreaming: SkipPackage … does not
+   exist` + `could not be loaded`.
+3. **CRLF line endings.** ContentLib mis-parses the first-line target with LF-only
+   files — it drags the JSON's `{`/`"Name"` INTO the class name (log:
+   `Failed to find object '<path>{ "Name"'`; docs Troubleshooting "Always Use CRLF
+   Line Endings", telltale = curly braces in class names). JSON can be valid and
+   STILL fail. The frozen sidecar's text-mode `open` did NOT translate `\n`→`\r\n`
+   (worked in dev venv → classic build trap). Fix: build body then
+   `.replace("\r\n","\n").replace("\n","\r\n")`, write `open(...,newline="")`.
+4. **Patch TYPE per asset class (the "all mods" rule).** ContentLib `ItemPatch`
+   accepts ONLY `FGItemDescriptor` (= `Desc_*`); a `Build_*` BUILDABLE → rejected
+   `"Was not FGItemDescriptor after loading"` (485/550 of ours). Each buildable has
+   BOTH `Build_*` (buildable; sometimes a junk `mDisplayName` like "Build_AIPacker")
+   and a sibling `Desc_*` (descriptor; the real name); WHICH drives the in-game name
+   varies per mod (`Desc_ABFlareTower` is EMPTY → name from `Build_`; FluidPacker's
+   real name is in `Desc_`). So route by asset-leaf prefix:
+   - `Recipe_*` → `RecipePatches/` (FGRecipe), ItemPatch-style file
+   - `Desc_*`   → `ItemPatches/`   (FGItemDescriptor), ItemPatch-style file
+   - `Build_*` + anything else → `CDOs/` (the catch-all)
 
-Patch files go to `FactoryGame/Configs/ContentLib/{ItemPatches,RecipePatches}/`.
-Registered in `.interprex_backups/metadata.json` as `type: created` for
-clean removal on backup restore.
+   **CDO file format is DIFFERENT** (`Configs/ContentLib/CDOs/`, a supported
+   folder): NO first-line comment — the target is the JSON `Class` field — and
+   edits use **RAW UE property names** (`mDisplayName`/`mDescription`), NOT the
+   ItemPatch schema keys (`Name`/`Description`):
+   ```json
+   { "Class": "/<Mod>/.../X.X_C",
+     "Edits": [ { "Property": "mDisplayName", "Value": "…" } ] }
+   ```
+   CDO patches ANY class with no type gate and REUSES the same Build_* translations
+   (no re-translate). ItemPatch/RecipePatch bodies still map UE props → schema keys
+   (`mDisplayName`→`Name`, `mDescription`→`Description`, `mTooltip`→`Tooltip`,
+   `mFlavor`/`mLongDescription`→`LongDescription`, `mPreUnlock*`, `mPostUnlock*`);
+   **unknown props are SKIPPED** in ItemPatch/RecipePatch (enum/struct noise like
+   DoorMode/Frame/Sound) but kept verbatim in CDO.
+
+Patch files go to BOTH `Configs/ContentLib/<Folder>/` AND
+`FactoryGame/Configs/ContentLib/<Folder>/` (SML version compat). Registered in
+`.interprex_backups/metadata.json` as `type: created` for clean removal on
+backup restore.
 
 ### `detect_mods` and game root resolution
 When the user selects `FactoryGame/Mods` in mods mode, the sidecar needs the

@@ -129,7 +129,15 @@ def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
                 safe_path = _sanitize_extracted_path(tmp_output, uasset)
                 if safe_path is None:
                     continue
-                if not _is_translatable_uasset(safe_path):
+                # Content-gate: read raw bytes and keep only assets that reference a
+                # translatable text property. Catches text-bearing buildables named
+                # without a `Build_` prefix (e.g. `MegaPump`) that the old
+                # filename heuristic skipped.
+                try:
+                    raw = uasset.read_bytes()
+                except OSError:
+                    continue
+                if not _is_translatable_uasset(safe_path, raw):
                     continue
                 try:
                     extracted = _run_uasset_extractor(str(uasset))
@@ -570,7 +578,11 @@ def _detect_ue_version(utoc_path: str, retoc_bin: str) -> str:
     """Run 'retoc info' to detect the UE version by reading Toc version.
     Returns string like 'UE5_4', 'UE5_5', 'UE5_6'. Defaults to 'UE5_4'."""
     try:
-        res = _run_cmd([retoc_bin, "info", "--path", utoc_path], capture_output=True, text=True, check=True)
+        # `retoc info` takes the path POSITIONALLY (`info <PATH>`), NOT `--path`
+        # (unlike `list`, which accepts `--path`). Passing `--path` errors out and
+        # the UE version always fell back to UE5_4 — fine for UE5_4 mods but wrong
+        # for UE5_5/5_6.
+        res = _run_cmd([retoc_bin, "info", utoc_path], capture_output=True, text=True, check=True)
         info_text = res.stdout
         if "ReplaceIoChunkHashWithIoHash" in info_text:
             return "UE5_6"
@@ -646,20 +658,50 @@ def _is_descendant_of_any(path_str: str, parent_set: set[str]) -> bool:
     return False
 
 
-def _is_translatable_uasset(inner_path: str) -> bool:
-    """Check if this uasset is likely a recipe, item or buildable description."""
+# Property names whose presence in a .uasset's name table means it carries
+# user-visible translatable text. Stored as UTF-8 bytes for a cheap substring scan
+# of the raw file (the FName strings are ASCII in the asset's name table).
+_TEXT_PROP_MARKERS = (
+    b"mDisplayName", b"mDescription", b"mTooltip", b"mFlavor",
+    b"mLongDescription", b"mPreUnlockDisplayName", b"mPreUnlockDescription",
+    b"mPostUnlockDescription", b"mAbbreviatedDisplayName", b"mMenuName",
+)
+
+
+def _uasset_has_text(data: bytes) -> bool:
+    """True if the raw .uasset bytes reference any translatable text property.
+    The C# extractor is what actually reads the values; this is a cheap pre-gate
+    (bytes substring) so we only spawn it for assets that can possibly have text —
+    far more reliable than a filename-prefix whitelist (which missed buildables
+    named without a `Build_` prefix, e.g. BigStorageTank's `MegaPump`, and item
+    buffers like `Glass_Buffer` / `B_Berry`)."""
+    return any(m in data for m in _TEXT_PROP_MARKERS)
+
+
+def _is_translatable_uasset(inner_path: str, data: bytes | None = None) -> bool:
+    """Decide whether to run the extractor on this uasset.
+
+    PREFERRED: content-based — if we have the raw bytes, keep it iff it references
+    a translatable text property (`_uasset_has_text`). This is the accurate path.
+
+    FALLBACK (data is None): the old filename/folder heuristic, kept only for
+    callers that don't have the bytes handy. It UNDER-matches (misses text-bearing
+    assets with non-standard names), so prefer passing `data`."""
+    if data is not None:
+        return _uasset_has_text(data)
+
     path_lower = inner_path.lower()
     name = path_lower.split("/")[-1]
-    
+
     # Check prefixes
     if name.startswith(("recipe_", "desc_", "build_", "schem_", "rec_")):
         return True
-        
+
     # Check folder segments
     segments = set(path_lower.split("/"))
     if segments.intersection({"recipes", "items", "buildable", "schematics"}):
         return True
-        
+
     return False
 
 
@@ -931,7 +973,8 @@ class UnrealEngine4_5Parser(BaseParser):
                 continue
                 
             for inf in inner_files:
-                if not _is_translatable_uasset(inf.path):
+                # Content-gate on the in-memory bytes (see _is_translatable_uasset).
+                if not _is_translatable_uasset(inf.path, inf.data):
                     continue
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     temp_uasset = Path(tmp_dir) / Path(inf.path).name
@@ -1037,89 +1080,150 @@ class UnrealEngine4_5Parser(BaseParser):
             self._uasset_cache_key = cache_key
         uasset_strings = self._uasset_cache
         
-        # Group by mod and asset target path
-        # mod_name -> { "recipes": { internal_path -> patch_dict }, "items": { internal_path -> patch_dict } }
+        # Group translations by (mod, asset, ContentLib kind). We emit THREE kinds:
+        #   - RecipePatches : Recipe_* assets (FGRecipe)               -> docs ItemPatch-style file
+        #   - ItemPatches   : Desc_*   assets (FGItemDescriptor)       -> docs ItemPatch-style file
+        #   - CDOs          : EVERYTHING ELSE incl. Build_* buildables -> CDO file
+        # WHY CDO for Build_*: ContentLib's ItemPatch loader rejects any class that
+        # is `Was not FGItemDescriptor` — Build_* buildables are NOT descriptors, so
+        # 485/550 item patches failed. The CDO feature patches ANY class by raw UE
+        # property name (mDisplayName/mDescription), with no type restriction, so it
+        # reaches buildables and reuses the SAME translations (no re-translate).
+        # mod_name -> kind("recipes"|"items"|"cdos") -> internal_path -> patch_dict
         patches_by_mod = {}
-        
+
+        # ContentLib ItemPatch/RecipePatch schema keys, by UE property name.
+        def _schema_key(prop_lower: str) -> str | None:
+            if "displayname" in prop_lower or prop_lower == "name":
+                return "Name"
+            if "tooltip" in prop_lower:
+                return "Tooltip"
+            if "flavor" in prop_lower or "longdescription" in prop_lower:
+                return "LongDescription"
+            if "preunlock" in prop_lower and "name" in prop_lower:
+                return "PreUnlockDisplayName"
+            if "preunlock" in prop_lower and "desc" in prop_lower:
+                return "PreUnlockDescription"
+            if "postunlock" in prop_lower and "desc" in prop_lower:
+                return "PostUnlockDescription"
+            if "description" in prop_lower:
+                return "Description"
+            return None
+
         written_count = 0
         for s in uasset_strings:
             string_id = make_id(self.engine, s.file, s.path, s.original)
-            if string_id in translations:
-                translated_text = translations[string_id]
-                if s.file.startswith("uasset://"):
-                    parts = s.file[9:].split(PAK_SEP)
-                    mod_rel = parts[0]
-                    mod_name = mod_rel.split("/")[-1]
-                    
-                    if mod_name not in patches_by_mod:
-                        patches_by_mod[mod_name] = {
-                            "recipes": {},
-                            "items": {}
-                        }
-                        
-                    internal_path = s.path[0]
-                    prop_name = s.path[1]
-                    
-                    # Decide folder category (RecipePatches vs ItemPatches)
-                    is_recipe = "recipe" in internal_path.lower()
-                    category = "recipes" if is_recipe else "items"
-                    
-                    target_map = patches_by_mod[mod_name][category]
-                    if internal_path not in target_map:
-                        # ContentLib full class path: /Game/.../AssetName.AssetName_C
-                        asset_name = internal_path.split("/")[-1]
-                        target_map[internal_path] = {
-                            "_target_comment": f"//{internal_path}.{asset_name}_C"
-                        }
-                        
-                    # Map to ContentLib schema keys
-                    prop_lower = prop_name.lower()
-                    if "displayname" in prop_lower or prop_lower == "name":
-                        target_map[internal_path]["Name"] = translated_text
-                    elif "description" in prop_lower:
-                        target_map[internal_path]["Description"] = translated_text
-                    elif "tooltip" in prop_lower:
-                        target_map[internal_path]["Tooltip"] = translated_text
-                    elif "flavor" in prop_lower or "longdescription" in prop_lower:
-                        target_map[internal_path]["LongDescription"] = translated_text
-                    elif "preunlock" in prop_lower and "name" in prop_lower:
-                        target_map[internal_path]["PreUnlockDisplayName"] = translated_text
-                    elif "preunlock" in prop_lower and "desc" in prop_lower:
-                        target_map[internal_path]["PreUnlockDescription"] = translated_text
-                    elif "postunlock" in prop_lower and "desc" in prop_lower:
-                        target_map[internal_path]["PostUnlockDescription"] = translated_text
-                    # else: skip unknown props (enum values, struct fields like DoorMode/Frame/Sound)
-                        
+            if string_id not in translations:
+                continue
+            translated_text = translations[string_id]
+            if not s.file.startswith("uasset://"):
+                continue
+
+            parts = s.file[9:].split(PAK_SEP)
+            mod_rel = parts[0]
+            mod_name = mod_rel.split("/")[-1]
+            internal_path = s.path[0]
+            prop_name = s.path[1]
+            asset_leaf = internal_path.split("/")[-1].lower()
+
+            # Recover the real plugin mount path (see notes below) and class path.
+            #   1. MOUNT PATH: extractor reports `/Game/Mods/<Mod>/...` but mods are
+            #      UE plugins mounted at `/<Mod>/...`; drop `/Game/Mods` or the
+            #      package "does not exist".
+            #   2. The class path used by BOTH the ItemPatch first-line target AND
+            #      the CDO `Class` field is `<mountpath>.<AssetName>_C`.
+            mount_path = internal_path
+            if mount_path.startswith("/Game/Mods/"):
+                mount_path = "/" + mount_path[len("/Game/Mods/"):]
+            clean_path = mount_path.lstrip("/")
+            asset_name = clean_path.split("/")[-1]
+            class_path = f"/{clean_path}.{asset_name}_C"
+
+            patches_by_mod.setdefault(mod_name, {"recipes": {}, "items": {}, "cdos": {}})
+
+            if asset_leaf.startswith("recipe_") or "recipe" in internal_path.lower():
+                kind = "recipes"
+            elif asset_leaf.startswith("desc_"):
+                kind = "items"
+            else:
+                kind = "cdos"   # Build_* and anything else not a descriptor/recipe
+
+            target_map = patches_by_mod[mod_name][kind]
+
+            if kind == "cdos":
+                # CDO file: { "Class": "<path>_C", "Edits": [ {Property, Value} ] }.
+                # Patch by RAW UE property name; no first-line comment, no type gate.
+                entry = target_map.setdefault(internal_path, {
+                    "Class": class_path, "Edits": [], "_seen": set(),
+                })
+                if prop_name not in entry["_seen"]:
+                    entry["_seen"].add(prop_name)
+                    entry["Edits"].append({"Property": prop_name, "Value": translated_text})
                     written_count += 1
-                    
+            else:
+                # ItemPatch / RecipePatch file: first-line `//`+class-path target,
+                # body uses ContentLib schema keys. `//`+clean_path (one leading
+                # slash) avoids the "double slash in a class path" rejection.
+                key = _schema_key(prop_name.lower())
+                if key is None:
+                    continue   # skip enum/struct fields (DoorMode/Frame/Sound/...)
+                entry = target_map.setdefault(internal_path, {
+                    "_target_comment": f"//{clean_path}.{asset_name}_C"
+                })
+                entry[key] = translated_text
+                written_count += 1
+
         # 2. Write patch files and register in backups as 'created'
-        for mod_name, categories in patches_by_mod.items():
-            for category, target_map in categories.items():
-                folder_name = "RecipePatches" if category == "recipes" else "ItemPatches"
-                dest_dir = os.path.join(root, "FactoryGame", "Configs", "ContentLib", folder_name)
-                os.makedirs(dest_dir, exist_ok=True)
-                
+        FOLDER = {"recipes": "RecipePatches", "items": "ItemPatches", "cdos": "CDOs"}
+        for mod_name, kinds in patches_by_mod.items():
+            for kind, target_map in kinds.items():
+                if not target_map:
+                    continue
+                folder_name = FOLDER[kind]
+                dirs = [
+                    os.path.join(root, "Configs", "ContentLib", folder_name),
+                    os.path.join(root, "FactoryGame", "Configs", "ContentLib", folder_name)
+                ]
+                for dest_dir in dirs:
+                    os.makedirs(dest_dir, exist_ok=True)
+
                 for internal_path, patch_data in target_map.items():
-                    # Generate safe file name from internal path
                     asset_name = internal_path.split("/")[-1]
                     file_name = f"Patch_{mod_name}_{asset_name}.json"
-                    file_path = os.path.join(dest_dir, file_name)
-                    rel_to_root = os.path.relpath(file_path, root).replace("\\", "/")
-                    
+
                     try:
+                        # Strip internal bookkeeping and build the comment line.
                         comment = patch_data.pop("_target_comment", "")
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            if comment:
-                                f.write(comment + "\n")
-                            json.dump(patch_data, f, indent=4, ensure_ascii=False)
-                                
-                        # Register in backup system as 'created' (to support Restore Backup)
-                        mod_bytes = (comment + "\n" + json.dumps(patch_data, ensure_ascii=False)).encode("utf-8")
-                        mod_sha = hashlib.sha256(mod_bytes).hexdigest()
-                        update_metadata(root, rel_to_root, "", mod_sha, "created")
+                        patch_data.pop("_seen", None)
+
+                        # Build the file body and force CRLF line endings.
+                        # ContentLib REQUIRES CRLF: with LF-only files it mis-reads
+                        # the first-line patch target and drags the JSON's `{` /
+                        # `"Name"` into the class name, so the engine logs
+                        # `Failed to find object '<path>{ "Name"'` and the patch is
+                        # rejected (docs: Troubleshooting "Always Use CRLF Line
+                        # Endings" — telltale sign is curly braces in class names).
+                        # CDO files have no comment line (target is the `Class`
+                        # field); they still need CRLF for consistency/safety.
+                        body = json.dumps(patch_data, indent=4, ensure_ascii=False)
+                        if comment:
+                            body = comment + "\n" + body
+                        body = body.replace("\r\n", "\n").replace("\n", "\r\n")
+
+                        # Write to both configs locations to ensure compatibility with all SML/game versions
+                        for dest_dir in dirs:
+                            file_path = os.path.join(dest_dir, file_name)
+                            rel_to_root = os.path.relpath(file_path, root).replace("\\", "/")
+
+                            with open(file_path, "w", encoding="utf-8", newline="") as f:
+                                f.write(body)
+
+                            # Register in backup system as 'created' (to support Restore Backup)
+                            mod_sha = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                            update_metadata(root, rel_to_root, "", mod_sha, "created")
                     except Exception as e:
                         logger.error(f"Failed to write ContentLib patch {file_name}: {e}")
-                        
+
         return written_count
 
     def _inject_into_paks(self, root: str, translations: dict[str, str],

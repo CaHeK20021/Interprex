@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import sys
 import threading
@@ -911,10 +912,176 @@ def detect_mods(req: DetectModsReq) -> dict:
 
 
 
+def calculate_source_hash(root: str) -> str:
+    """Вычисляет быстрый хэш структуры файлов игры для кэширования извлечения.
+    Учитывает относительные пути файлов, их размеры и даты изменения (mtime).
+    Исключает папки Interprex, .interprex_backups и технические лог-файлы.
+    """
+    import os
+    import hashlib
+    
+    ignored_dirs = {"interprex", ".interprex_backups", ".git", "node_modules", "venv", "__pycache__"}
+    ignored_files = {"interprex.log", "test_run.log", "sidecar.log", "sidecar-err.log", ".interprex.json"}
+    
+    file_data = []
+    
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Исключаем технические папки из обхода на месте
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignored_dirs]
+        
+        for fname in filenames:
+            if fname.lower() in ignored_files:
+                continue
+                
+            fpath = os.path.join(dirpath, fname)
+            try:
+                stat = os.stat(fpath)
+                rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+                # Для хэша используем путь, размер и время изменения
+                file_data.append(f"{rel_path}:{stat.st_size}:{int(stat.st_mtime)}")
+            except Exception:
+                pass
+                
+    if not file_data:
+        return ""
+        
+    file_data.sort()
+    
+    hasher = hashlib.sha256()
+    hasher.update("\n".join(file_data).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def calculate_code_hash() -> str:
+    """Вычисляет хэш кода sidecar'а для сброса кэша при обновлениях."""
+    import os
+    import sys
+    import hashlib
+
+    hasher = hashlib.sha256()
+
+    if getattr(sys, "frozen", False):
+        # Frozen (production): хэшируем только имя файла, размер и mtime бинарника
+        try:
+            exe_path = sys.executable
+            stat = os.stat(exe_path)
+            hasher.update(f"frozen:{os.path.basename(exe_path)}:{stat.st_size}:{int(stat.st_mtime)}".encode("utf-8"))
+            return hasher.hexdigest()
+        except Exception as e:
+            logger.warning(f"Failed to hash executable in frozen mode: {e}")
+            return "frozen-fallback"
+
+    # Dev-режим: хэшируем только файлы бизнес-логики и требований
+    try:
+        core_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Определяем список файлов и папок для хэширования
+        targets = [
+            ("main.py", os.path.join(core_dir, "main.py")),
+            ("scheduler.py", os.path.join(core_dir, "scheduler.py")),
+            ("requirements.txt", os.path.join(core_dir, "requirements.txt")),
+        ]
+        
+        # Сканируем папки parsers и providers
+        for sub in ("parsers", "providers"):
+            sub_dir = os.path.join(core_dir, sub)
+            if os.path.isdir(sub_dir):
+                for fname in os.listdir(sub_dir):
+                    if fname.endswith(".py"):
+                        targets.append((f"{sub}/{fname}", os.path.join(sub_dir, fname)))
+
+        # Сортируем цели для детерминированного хэширования
+        targets.sort(key=lambda x: x[0])
+
+        for rel_path, fpath in targets:
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "rb") as f:
+                        hasher.update(rel_path.encode("utf-8"))
+                        hasher.update(f.read())
+                except Exception:
+                    pass
+
+        return hasher.hexdigest()
+    except Exception as e:
+        logger.warning(f"Failed to calculate code hash: {e}")
+        return "dev-fallback"
+
+
+# Версия формата/логики кэша извлечения. Бампайте её при обновлении парсеров,
+# чтобы принудительно сбросить кэш у пользователей и запустить повторное извлечение.
+EXTRACT_CACHE_VERSION = 1
+
+
 @app.post("/extract")
 def extract(req: ExtractReq) -> dict:
     parser = get_parser(req.engine)
+    
+    # 1. Считаем текущий хэш структуры файлов игры и хэш кода
+    current_hash = ""
+    try:
+        current_hash = calculate_source_hash(req.root)
+    except Exception as e:
+        logger.error(f"Failed to calculate source hash for root {req.root}: {e}")
+        
+    code_hash = ""
+    try:
+        code_hash = calculate_code_hash()
+    except Exception as e:
+        logger.error(f"Failed to calculate code hash: {e}")
+        
+    cache_path = os.path.join(req.root, "Interprex", "extract_cache.json")
+    
+    # 2. Пытаемся прочитать кэш извлечения
+    if current_hash and not req.sub_paths:
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                
+                # Если совпадает хэш игры, версия кэша, хэш кода и в кэше есть строки
+                if (cache_data.get("source_hash") == current_hash and 
+                        cache_data.get("cache_version") == EXTRACT_CACHE_VERSION and 
+                        cache_data.get("code_hash") == code_hash and
+                        "strings" in cache_data):
+                    logger.info(f"Extract cache hit for {req.root}! Loaded {len(cache_data['strings'])} strings in milliseconds.")
+                    return {"strings": cache_data["strings"]}
+        except Exception as e:
+            logger.warning(f"Failed to load extract cache: {e}")
+            
+    # 3. Кэш промахнулся — выполняем реальное тяжелое извлечение
     strings = [s.to_dict() for s in parser.extract(req.root, req.sub_paths)]
+    
+    # 4. Записываем результат в кэш (только если извлекали всё, без sub_paths)
+    if current_hash and not req.sub_paths:
+        try:
+            cache_dir = os.path.dirname(cache_path)
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            # Сохраняем атомарно через temp-файл
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", dir=cache_dir, prefix="tmp_cache_", delete=False, encoding="utf-8") as f:
+                json.dump({
+                    "source_hash": current_hash,
+                    "cache_version": EXTRACT_CACHE_VERSION,
+                    "code_hash": code_hash,
+                    "strings": strings
+                }, f, ensure_ascii=False)
+                temp_path = f.name
+            
+            import time
+            delays = [0.1, 0.2, 0.4, 0.8]
+            for attempt, delay in enumerate(delays):
+                try:
+                    os.replace(temp_path, cache_path)
+                    break
+                except PermissionError:
+                    if attempt == len(delays) - 1:
+                        raise
+                    time.sleep(delay)
+        except Exception as e:
+            logger.warning(f"Failed to save extract cache: {e}")
+            
     return {"strings": strings}
 
 
