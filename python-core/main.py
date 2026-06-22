@@ -832,22 +832,12 @@ def detect_mods(req: DetectModsReq) -> dict:
         if not mod_engine:
             return 0, 0
         try:
-            parser = get_parser(mod_engine)
-            # Extract strings using GAME ROOT (needed for global.utoc, Paks, etc.)
-            extracted = parser.extract(game_root, [mod_rel_path])
-            if not extracted:
-                return 0, 0
-            
-            n = len(extracted)
-            x = 0
-            proj_strings = project_data.get("strings", {})
-            for s in extracted:
-                entry = proj_strings.get(s.id)
-                if entry and entry.get("translated"):
-                    x += 1
-            return x, n
-        except Exception as ex:
-            logger.error(f"Error extracting stats for mod {mod_rel_path}: {ex}")
+            mod_full = os.path.join(root, *mod_rel_path.split("/")) if os.path.isdir(root) else mod_rel_path
+            for ext in (".utoc", ".pak", ".uasset", ".locres"):
+                for _ in Path(mod_full).rglob(f"*{ext}"):
+                    return 1, 1
+            return 0, 0
+        except Exception:
             return 0, 0
 
     if os.path.isdir(mods_dir):

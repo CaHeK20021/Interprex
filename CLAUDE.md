@@ -49,10 +49,11 @@ Tauri (thin Rust shell)         src-tauri/    window + launches the sidecar
 | `src/lib/project.ts` | load/save `.interprex.json`, translation-memory merge |
 | `src/lib/settings.ts` | persisted prefs (localStorage): UI lang, target lang, provider config, max context |
 | `src/i18n/` | UI localization: `en.ts`/`ru.ts` (same keys, enforced by `Strings` type), `index.ts` store + `t()` |
-| `python-core/main.py` | sidecar endpoints: ping, detect, extract, inject, providers, translate, validate, autofix, backup/*, fs/* |
-| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity`, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
+| `python-core/main.py` | sidecar endpoints: ping, detect, extract, inject, detect_mods (with game_root resolution), providers, translate, validate, autofix, backup/*, fs/* |
+| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity`, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`, `unreal4_5`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
 | `python-core/providers/` | `base.py` (provider ABC, prompt, parse, **Calibrator**, batching), `openai_compat.py` (Ollama + LM Studio), `gemini.py`, registry |
 | `python-core/validators/` | post-translation validators (`get_validator(engine)`); `renpy.py` `ast.parse`-checks `python:`/`$` blocks — catches a broken translated literal WITHOUT the `renpy` binary (works on a Steam player's machine) |
+| `python-core/uasset-extractor/` | C# tool (`Program.cs`, UAssetAPI) compiled to `python-core/bin/UAssetExtractor.exe`. Extracts translatable strings from `.uasset` files for ContentLib patching. |
 
 ## Auto-update (tauri-plugin-updater)
 
@@ -564,6 +565,13 @@ the full app only to *see* it.
     `.locres` (extracted from its `.pak`). NOTE: shipped UE5 games pack `.locres`
     inside `.pak`/`.utoc`/`.ucas` IoStore containers — the parser works on
     on-disk `.locres`; unpacking the containers is a separate (future) step.
+  - **Unreal Engine 5 mods** (`unreal4_5`, ContentLib): translates translatable
+    strings inside Satisfactory mod `.uasset` files via ContentLib JSON patches.
+    Extracts `TextPropertyData` (FText) + top-level `StrPropertyData` (FString)
+    from `.uasset` files assembled by `retoc to-legacy`. Generates ContentLib
+    JSON patches in `FactoryGame/Configs/ContentLib/{ItemPatches,RecipePatches}/`.
+    `detect_mods` walks up from the mods folder to resolve the game root (needed
+    for `global.utoc`/`global.ucas`). Tested on 17 real mods (805 strings).
 - Sidecar (FastAPI) + IPC seam + project store + minimal UI.
 - i18n (en + ru), language switcher, persisted prefs.
 - LLM translation via pluggable providers (Ollama, LM Studio, Gemini), batched
@@ -670,7 +678,9 @@ We re-emit the same version we read. Bonus: the namespace/key tree is fixed-size
 ### Not yet
 Shipped UE5 games pack `.locres` inside `.pak`/`.utoc`/`.ucas` IoStore
 containers (Satisfactory has no loose `.locres` on disk). The parser works on
-on-disk `.locres`; unpacking those containers is a separate future step.
+on-disk `.locres`; unpacking those containers is now handled by `unreal4_5.py`
+for mod translation via ContentLib. Base-game locres inside IoStore are still
+a separate step (the `unreal4.py` locres parser handles loose `.locres` only).
 
 ### Reference impls
 - Epic: `Engine/Source/Runtime/Core/Private/Internationalization/TextLocalizationResource.cpp`

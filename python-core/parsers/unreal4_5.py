@@ -805,68 +805,66 @@ class UnrealEngine4_5Parser(BaseParser):
             retoc_bin = _find_retoc()
         except RuntimeError:
             return
-            
-        list_re = re.compile(r"^(?:\S+\s+)?(?P<chunk_id>[0-9a-fA-F]{16,32})\s+.*?\s+(?P<inner_path>.*\.uasset)$")
 
-        # Pre-stage global containers once — they're huge and every mod needs them.
         root_path = Path(root)
         global_utoc = root_path / "FactoryGame" / "Content" / "Paks" / "global.utoc"
         global_ucas = root_path / "FactoryGame" / "Content" / "Paks" / "global.ucas"
 
-        for uf in utocs:
-            utoc_rel = uf.relative_to(root).as_posix()
-            mod_rel = get_mod_rel_path(uf)
-            try:
-                res = _run_cmd([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
-            except Exception as e:
-                logger.error(f"Failed to list utoc {utoc_rel} for uassets: {e}")
-                continue
-                
-            entries = []
-            for line in res.stdout.splitlines():
-                m = list_re.match(line.strip())
-                if m:
-                    gd = m.groupdict()
-                    if _is_translatable_uasset(gd["inner_path"]):
-                        entries.append(gd)
-                        
-            if not entries:
-                continue
-                
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_input = Path(tmp_dir) / "input"
-                tmp_output = Path(tmp_dir) / "output"
-                tmp_input.mkdir()
-                tmp_output.mkdir()
+        # Batch ALL mods into ONE retoc to-legacy call — avoids N slow copies of global containers.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_input = Path(tmp_dir) / "input"
+            tmp_output = Path(tmp_dir) / "output"
+            tmp_input.mkdir()
+            tmp_output.mkdir()
 
-                # Symlink global containers (instant, no copy)
-                for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
-                    dst = tmp_input / name
+            # Symlink or copy global containers once
+            for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
+                dst = tmp_input / name
+                if src.is_file():
                     try:
                         os.symlink(str(src), str(dst))
                     except OSError:
                         shutil.copy2(str(src), str(dst))
 
-                # Copy mod's utoc+ucas (small files, ~1KB-1MB)
+            # Collect all mod .utoc/.ucas into one input dir
+            utoc_map: dict[str, Path] = {}  # utoc filename -> original path (for relative lookup)
+            for uf in utocs:
                 shutil.copy2(str(uf), str(tmp_input / uf.name))
-                ucas_counterpart = uf.with_suffix(".ucas")
-                if ucas_counterpart.is_file():
-                    shutil.copy2(str(ucas_counterpart), str(tmp_input / ucas_counterpart.name))
+                utoc_map[uf.name] = uf
+                ucas = uf.with_suffix(".ucas")
+                if ucas.is_file():
+                    shutil.copy2(str(ucas), str(tmp_input / ucas.name))
 
-                ue_ver = _detect_ue_version(str(uf), retoc_bin)
+            if not utoc_map:
+                pass  # no utocs, skip
+            else:
+                # Detect UE version from first utoc
+                first_utoc = next(iter(utoc_map.values()))
+                ue_ver = _detect_ue_version(str(first_utoc), retoc_bin)
+
                 try:
                     _run_cmd([
                         retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
                         "--version", ue_ver, "--verbose"
                     ], check=True, capture_output=True)
                 except Exception as e:
-                    logger.error(f"retoc to-legacy failed for {utoc_rel}: {e}")
-                    continue
+                    logger.error(f"retoc to-legacy failed for batch: {e}")
+                    return
 
+                # Map extracted uassets back to their source mod
                 for extracted_uasset in tmp_output.rglob("*.uasset"):
                     inner_path = extracted_uasset.relative_to(tmp_output).as_posix()
                     if not _is_translatable_uasset(inner_path):
                         continue
+                    # Compute mod_rel from the inner_path (retoc preserves directory structure)
+                    # e.g. "FactoryGame/Mods/ModName/Content/File.uasset" -> "FactoryGame/Mods/ModName"
+                    mod_rel = inner_path.rsplit("/", 1)[0] if "/" in inner_path else inner_path
+                    # Walk up to find the mod root (parent of "Content" or similar)
+                    parts = inner_path.split("/")
+                    for i, part in enumerate(parts):
+                        if part.lower() == "content" and i > 0:
+                            mod_rel = "/".join(parts[:i])
+                            break
                     try:
                         extracted = _run_uasset_extractor(str(extracted_uasset))
                         for item in extracted:
