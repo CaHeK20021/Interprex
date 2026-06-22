@@ -738,6 +738,39 @@ Three sources, tried in order:
 `_extract_from_uassets` ALWAYS runs (not just as fallback) — a mod with locres
 in one path may have uasset TextProperty strings in another.
 
+**Speed (extraction 117s → 25s on 36 real mods, ~4.7×; inject shares this path so
+it speeds up too). Two levers, both string-set-safe:**
+1. **One extractor process per MOD, not per asset.** `UAssetExtractor` has a
+   `--input-dir <dir>` batch mode (`Program.cs`): one process walks every
+   `*.uasset` under the assembled dir and emits ONE combined JSON array (each item
+   carries `AssetPath`). The old `--input <file>` path spawned the .NET CLR once
+   per asset — hundreds of starts per mod, the dominant cost. Python calls
+   `_run_uasset_extractor_dir` once over `tmp_output` (utoc, `_process_utoc_worker`)
+   or over a temp dir of in-memory pak assets. The C# content-gate replaces the old
+   Python `_uasset_has_text` byte-gate (still kept for the `data is None` fallback).
+   `--input` is retained for back-compat.
+2. **`retoc to-legacy --no-shaders --no-script-objects`.** Skips GPU shader
+   libraries + script objects (no text). ~50% faster, the produced `.uasset` set is
+   byte-identical (verified: 284→284 assets). NOTE: `--filter` is REJECTED — it
+   filters by name substring, the same whitelist trap that drops prefixless assets.
+
+**Translatable-property filter lives in C# (`Program.cs`), verified against the
+golden set.** Batch mode surfaced ~1034 real UI strings the old Python byte-gate
+missed (mod-config `DisplayName`/`ToolTip`/`Text`/`Desc`/`Name`, `DisplayCategory`
+like "Mods"/"Smart!", `SelectedOption`). To keep those while dropping code keys:
+- `TechnicalProps` blacklist (case-insensitive): `StrId`, `CommandName`,
+  `UniqueEmitterName`, `DeveloperComment`, `SourceFilename`, `RulePrefix`,
+  `MapName`, `CurrentStartingLocation`, bool-ish configs. Each verified to have
+  ZERO overlap with user-visible text. **DO NOT add `DisplayCategory` or
+  `SelectedOption`** — they ARE shown in mod-config UI (regression: dropped
+  "Smart! Mod Controls"/"Mods"/"All Sources").
+- `LooksLikeIdentifier`: a namespaced code key has **2+ dots** (`A.B.C`, e.g.
+  `EnhancedConveyors.BeltMk1.Cost`) or a `_<16+hex>` suffix. A SINGLE dot is NOT
+  enough — real captions `4NUMER.CNT3R` / `Decoration.` have one and must survive.
+- Plus auto-generated Blueprint pin names (`<Name>_<idx>_<32hex>`) via `IsTechnicalProp`.
+Invariant check after any change: re-extract all mods, assert the golden id set is
+a SUBSET (no regression) and residual `StrId`/2-dot values == 0.
+
 **Which uassets to run the extractor on — CONTENT-gate, not filename
 (`_is_translatable_uasset`, `unreal4_5.py`).** The old gate was a filename/folder
 whitelist (`Build_`/`Desc_`/`Recipe_`/`Schem_`/`Rec_` prefixes, or `recipes/items/
