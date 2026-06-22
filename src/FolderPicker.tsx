@@ -46,9 +46,12 @@ interface Props {
   startPath?: string;
   onPick: (path: string) => void;
   onClose: () => void;
+  remember?: boolean;
+  onRememberChange?: (val: boolean) => void;
+  rememberTooltip?: string;
 }
 
-export default function FolderPicker({ engineClass, startPath, onPick, onClose }: Props) {
+export default function FolderPicker({ engineClass, startPath, onPick, onClose, remember, onRememberChange, rememberTooltip }: Props) {
   const { t } = useT();
   const [cwd, setCwd] = useState(""); // "" = drive list
   const [parent, setParent] = useState<string | null>(null);
@@ -299,6 +302,16 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose }
 
         {/* actions */}
         <div className="fp-actions">
+          {onRememberChange !== undefined && (
+            <label className="fp-remember" title={rememberTooltip}>
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(e) => onRememberChange(e.target.checked)}
+              />
+              <span>{t("fpRemember") as string}</span>
+            </label>
+          )}
           <button className="btn-secondary" onClick={onClose}>
             {t("fpCancel")}
           </button>

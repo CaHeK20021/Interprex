@@ -1069,6 +1069,10 @@ def check_renpy_risk() -> None:
     assert _rt("{size=+4}big{/sizeQ}") == "{size=+4}big{/size}"
     # Second pair corrupted, first intact.
     assert _rt("{i}a{/i}{i}b{/iQ}") == "{i}a{/i}{i}b{/i}"
+    # Nested tag mismatch order repair
+    assert _rt("{i}{b}Умрёт.{/i}{/b}") == "{i}{b}Умрёт.{/b}{/i}"
+    assert _rt("Он женится. {w}{i}{b}Умрёт.{/i}{/b}") == "Он женится. {w}{i}{b}Умрёт.{/b}{/i}"
+    assert _rt("{i}{b}{u}text{/i}{/b}{/u}") == "{i}{b}{u}text{/u}{/b}{/i}"
     # VALID markup is left byte-verbatim (no false positives).
     for ok in ("{i}hi{/i}", "plain text", "{size=+4}big{/size}",
                "{b}{i}x{/i}{/b}", "text{/}", "{w=0.5}wait", "no tags at all"):
@@ -1077,7 +1081,7 @@ def check_renpy_risk() -> None:
     assert _rt("{w=0.5}wait{/i}weird") == "{w=0.5}wait{/i}weird"
     assert _rt("no close {i}open") == "no close {i}open"
     # Idempotent: re-running never re-mangles a fixed string.
-    for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain"):
+    for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain", "{i}{b}test.{/i}{/b}"):
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 

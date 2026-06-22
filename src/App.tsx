@@ -546,21 +546,6 @@ export default function App() {
     setHasBackup(false);
     setPage(0);
     setError(null);
-
-    // Auto-load saved folder for the selected mode if preferred
-    if (mode === "game") {
-      const shouldSave = loadSetting("saveLastGameFolder", "true") === "true";
-      const saved = loadSetting("lastGameFolder", "");
-      if (shouldSave && saved) {
-        pickFolder(saved);
-      }
-    } else {
-      const shouldSave = loadSetting("saveLastModsFolder", "true") === "true";
-      const saved = loadSetting("lastModsFolder", "");
-      if (shouldSave && saved) {
-        pickModsFolder(saved);
-      }
-    }
   };
 
   const [pythonLogs, setPythonLogs] = useState<string[]>([]);
@@ -611,22 +596,6 @@ export default function App() {
         // re-decide direct-vs-proxy silently and re-apply per provider.
         const savedProxy = loadSetting("proxyUrl", "");
         if (savedProxy) void runProxyAutocheck(savedProxy, true);
-
-        // Auto-load last folder if preferred
-        const mode = loadSetting("lastFolderMode", "game") as "game" | "mods";
-        if (mode === "game") {
-          const shouldSave = loadSetting("saveLastGameFolder", "true") === "true";
-          const saved = loadSetting("lastGameFolder", "");
-          if (shouldSave && saved) {
-            pickFolder(saved);
-          }
-        } else {
-          const shouldSave = loadSetting("saveLastModsFolder", "true") === "true";
-          const saved = loadSetting("lastModsFolder", "");
-          if (shouldSave && saved) {
-            pickModsFolder(saved);
-          }
-        }
       }
     });
   }, []);
@@ -868,9 +837,21 @@ export default function App() {
       const res = await detectMods(picked);
       setModsDir(res.mods_dir);
       setGameRoot(res.game_root);
-      setDetectedMods(res.mods);
+      const sortedMods = [...res.mods].sort((a, b) => {
+        const aCount = a.total_count ?? 0;
+        const bCount = b.total_count ?? 0;
+        if (aCount === 0 && bCount > 0) return 1;
+        if (bCount === 0 && aCount > 0) return -1;
+        if (aCount > 0 && bCount > 0) {
+          if (bCount !== aCount) {
+            return bCount - aCount;
+          }
+        }
+        return a.name.localeCompare(b.name);
+      });
+      setDetectedMods(sortedMods);
       
-      if (res.mods.length === 0) {
+      if (sortedMods.length === 0) {
         setPhase("idle");
         setError(t("noModsDetected") as string);
         return;
@@ -884,20 +865,20 @@ export default function App() {
       }
 
       // select only mods that have strings by default
-      const defaultPaths = res.mods
+      const defaultPaths = sortedMods
         .filter(m => m.total_count !== undefined && m.total_count > 0)
         .map(m => m.path);
       setSelectedModPaths(defaultPaths);
 
       // Check engines
-      const engines = Array.from(new Set(res.mods.map(m => m.engine).filter(Boolean)));
+      const engines = Array.from(new Set(sortedMods.map(m => m.engine).filter(Boolean)));
       if (engines.length > 1) {
         setPhase("idle");
         setError(t("errMixedEngines") as string);
         return;
       }
 
-      await scanSelectedMods(defaultPaths, res.mods, res.game_root);
+      await scanSelectedMods(defaultPaths, sortedMods, res.game_root);
     } catch (e) {
       fail(e);
     }
@@ -1001,7 +982,11 @@ export default function App() {
       });
 
       // Record translating IDs so they are pinned and highlighted
-      setJustTranslatedIds(new Set(todo.map((s) => s.id)));
+      if (targetIds) {
+        setJustTranslatedIds(new Set(todo.map((s) => s.id)));
+      } else {
+        setJustTranslatedIds(new Set());
+      }
 
       // Calculate unique representatives matching the backend de-duplication
       const uniqueKeys = new Set(strings.map((s) => `${s.original}\x00${s.context}`));
@@ -1729,7 +1714,7 @@ export default function App() {
         // Check if this string belongs to any HIDDEN mod
         const isHidden = Array.from(filterHiddenModPaths).some((hiddenPath) => {
           const modAbs = norm(`${modsDir}/${hiddenPath}`);
-          return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
         });
         return !isHidden;
       });
@@ -2004,53 +1989,13 @@ export default function App() {
 
       <div className="controls">
         {translationMode === "game" ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <button onClick={() => setFolderPickerKind("game")} disabled={busy}>
-              {t("openFolder")}
-            </button>
-            <label className="save-path-checkbox" title="Сохранять выбранный путь к игре для автоматического открытия">
-              <input
-                type="checkbox"
-                checked={saveLastGameFolder}
-                onChange={(e) => {
-                  const val = e.target.checked;
-                  setSaveLastGameFolder(val);
-                  saveSetting("saveLastGameFolder", String(val));
-                  if (!val) {
-                    saveSetting("lastGameFolder", "");
-                  } else if (root) {
-                    saveSetting("lastGameFolder", root);
-                  }
-                }}
-                disabled={busy}
-              />
-              <span>Запоминать путь</span>
-            </label>
-          </div>
+          <button onClick={() => setFolderPickerKind("game")} disabled={busy}>
+            {t("openFolder")}
+          </button>
         ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <button onClick={() => setFolderPickerKind("mods")} disabled={busy}>
-              {t("openModsFolder")}
-            </button>
-            <label className="save-path-checkbox" title="Сохранять выбранный путь к модам для автоматического открытия">
-              <input
-                type="checkbox"
-                checked={saveLastModsFolder}
-                onChange={(e) => {
-                  const val = e.target.checked;
-                  setSaveLastModsFolder(val);
-                  saveSetting("saveLastModsFolder", String(val));
-                  if (!val) {
-                    saveSetting("lastModsFolder", "");
-                  } else if (modsDir) {
-                    saveSetting("lastModsFolder", modsDir);
-                  }
-                }}
-                disabled={busy}
-              />
-              <span>Запоминать путь</span>
-            </label>
-          </div>
+          <button onClick={() => setFolderPickerKind("mods")} disabled={busy}>
+            {t("openModsFolder")}
+          </button>
         )}
         <label className="field">
           <span>{t("targetLanguage")}</span>
@@ -2576,7 +2521,7 @@ export default function App() {
                 const modStrings = strings.filter((str) => {
                   const filePath = str.file.startsWith("uasset://") ? str.file.substring(9) : str.file;
                   const strAbs = norm(`${gameRoot || ""}/${filePath}`);
-                  return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+                  return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
                 });
                 total = modStrings.length;
                 translated = modStrings.filter((str) => {
@@ -2751,33 +2696,36 @@ export default function App() {
                   <>
                     <div className="filter-dropdown-divider" />
                     <div className="filter-dropdown-section-title">Фильтр модов:</div>
-                    <div className="filter-dropdown-mods-list" style={{ maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column" }}>
-                      {selectedModsInfo.map((mod) => {
-                        const isHidden = filterHiddenModPaths.has(mod.path);
-                        return (
-                          <label key={mod.path} className="filter-dropdown-item">
-                            <input
-                              type="checkbox"
-                              checked={!isHidden}
-                              onChange={(e) => {
-                                setPage(0);
-                                setFilterHiddenModPaths((prev) => {
-                                  const next = new Set(prev);
-                                  if (e.target.checked) {
-                                    next.delete(mod.path);
-                                  } else {
-                                    next.add(mod.path);
-                                  }
-                                  return next;
-                                });
-                              }}
-                            />
-                            <span title={mod.name} style={{ textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", maxWidth: "160px" }}>
-                              {mod.name}
-                            </span>
-                          </label>
-                        );
-                      })}
+                    <div className="filter-dropdown-select-wrap">
+                      <select
+                        className="filter-dropdown-select"
+                        value={
+                          selectedModsInfo.length === 0
+                            ? "all"
+                            : selectedModsInfo.every(m => !filterHiddenModPaths.has(m.path))
+                              ? "all"
+                              : selectedModsInfo.find(m => !filterHiddenModPaths.has(m.path))?.path || "all"
+                        }
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setPage(0);
+                          if (val === "all") {
+                            setFilterHiddenModPaths(new Set());
+                          } else {
+                            // Hide all mods except the selected one
+                            const nextHidden = new Set(selectedModsInfo.map(m => m.path));
+                            nextHidden.delete(val);
+                            setFilterHiddenModPaths(nextHidden);
+                          }
+                        }}
+                      >
+                        <option value="all">{t("allMods") as string}</option>
+                        {selectedModsInfo.map((mod) => (
+                          <option key={mod.path} value={mod.path}>
+                            {mod.name}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   </>
                 )}
@@ -2994,13 +2942,43 @@ export default function App() {
       {folderPickerKind && (
         <FolderPicker
           engineClass={`engine-${engine || "none"}`}
-          startPath={(folderPickerKind === "mods" ? modsDir : root) || ""}
+          startPath={
+            (folderPickerKind === "mods"
+              ? modsDir || (saveLastModsFolder ? loadSetting("lastModsFolder", "") : "")
+              : root || (saveLastGameFolder ? loadSetting("lastGameFolder", "") : "")
+            ) || ""
+          }
           onClose={() => setFolderPickerKind(null)}
           onPick={(p) => {
             const kind = folderPickerKind;
             setFolderPickerKind(null);
             if (kind === "mods") pickModsFolder(p);
             else pickFolder(p);
+          }}
+          remember={folderPickerKind === "mods" ? saveLastModsFolder : saveLastGameFolder}
+          rememberTooltip={
+            folderPickerKind === "mods"
+              ? (t("fpRememberModsTooltip") as string)
+              : (t("fpRememberGameTooltip") as string)
+          }
+          onRememberChange={(val) => {
+            if (folderPickerKind === "mods") {
+              setSaveLastModsFolder(val);
+              saveSetting("saveLastModsFolder", String(val));
+              if (!val) {
+                saveSetting("lastModsFolder", "");
+              } else if (modsDir) {
+                saveSetting("lastModsFolder", modsDir);
+              }
+            } else {
+              setSaveLastGameFolder(val);
+              saveSetting("saveLastGameFolder", String(val));
+              if (!val) {
+                saveSetting("lastGameFolder", "");
+              } else if (root) {
+                saveSetting("lastGameFolder", root);
+              }
+            }
           }}
         />
       )}

@@ -791,17 +791,18 @@ _TEXT_TAG_RE = re.compile(r'\{(/?)([^{}]*)\}')
 
 def _repair_text_tags(s: str) -> str:
     """Fix a closing text tag whose name the LLM corrupted by appending junk —
-    e.g. `{i}…{/iR}` -> `{i}…{/i}`. A real shipped bug: the engine rejects
-    "Close text tag '{/iR}' does not match open text tag '{i}'" and the line breaks.
+    e.g. `{i}…{/iR}` -> `{i}…{/i}`, or fix invalid tag nesting order:
+    e.g. `{i}{b}…{/i}{/b}` -> `{i}{b}…{/b}{/i}`.
 
     Ren'Py matches a closing tag `{/name}` against the most-recently-opened tag of
-    the same name (LIFO). We walk the string keeping a stack of open tag names; when
-    a closing tag's name does NOT match the stack top but DOES start with it (the
-    append-junk corruption: open `i` / close `iR`), we snap the close back to the
-    open name. Conservative: anything else (valid match, the bare `{/}` close-last
-    form, an unrelated mismatch we can't safely guess) is left byte-verbatim, so
-    valid markup is never touched. Idempotent. The tag NAME is everything before an
-    optional `=arg` (`{size=+4}` opens "size", closes `{/size}`)."""
+    the same name (LIFO). We walk the string keeping a stack of open tag names.
+    When a closing tag's name does not match the stack top:
+    1. If it exists somewhere lower in the stack, we close all intervening tags
+       first in LIFO order and keep track of them so we can ignore their redundant
+       closing tags later.
+    2. If it starts with the top tag name (LLM corrupted name: open `i` / close `iR`),
+       we snap it back to the open tag name.
+    Conservative: anything else is left byte-verbatim. Idempotent."""
     if "{" not in s:
         return s
 
@@ -809,20 +810,23 @@ def _repair_text_tags(s: str) -> str:
         # Tag name = text before '=' (args) and without surrounding spaces.
         return body.split("=", 1)[0].strip()
 
+    from collections import Counter
     open_stack: list[str] = []
+    early_closed = Counter()
     out: list[str] = []
     pos = 0
     changed = False
+
     for m in _TEXT_TAG_RE.finditer(s):
         out.append(s[pos:m.start()])
         pos = m.end()
         closing, body = m.group(1), m.group(2)
         name = _name(body)
+
         if not closing:
             # Opening tag (or a standalone like {w=0.5}/{p}/{nw}/{clear}); we only
             # need real paired tags on the stack. Push the name so a later close
-            # can match it; standalones simply never get a matching close, which is
-            # harmless (they stay on the stack but we never force-close them).
+            # can match it.
             open_stack.append(name)
             out.append(m.group(0))
         else:
@@ -832,20 +836,57 @@ def _repair_text_tags(s: str) -> str:
                     open_stack.pop()
                 out.append(m.group(0))
             elif open_stack and open_stack[-1] == name:
+                # Perfect match
                 open_stack.pop()
                 out.append(m.group(0))
             elif open_stack and name.startswith(open_stack[-1]) and len(open_stack[-1]) > 0:
-                # Corrupted close: name has junk appended to the real tag name.
+                # Corrupted close of the top tag (e.g. {i}...{/iR})
                 fixed = open_stack.pop()
                 out.append("{/%s}" % fixed)
                 changed = True
-            else:
-                # Can't safely guess — leave verbatim (don't risk valid markup).
+            elif open_stack and name in open_stack:
+                # Nested mismatch: closing tag is in the stack but not at the top.
+                # E.g. {i}{b}...{/i} -> we must close 'b' first.
+                nested_closes = []
+                while open_stack and open_stack[-1] != name:
+                    popped = open_stack.pop()
+                    nested_closes.append("{/%s}" % popped)
+                    early_closed[popped] += 1
+                # Now pop 'name' itself
+                if open_stack:
+                    open_stack.pop()
+                
+                out.append("".join(nested_closes))
                 out.append(m.group(0))
-                if name in open_stack:
-                    # Pop down to it so the stack stays sane for later tags.
-                    while open_stack and open_stack.pop() != name:
-                        pass
+                changed = True
+            elif open_stack and any(name.startswith(t) and len(t) > 0 for t in open_stack):
+                # Corrupted close of a nested tag (e.g. {i}{b}...{/iR})
+                target_tag = next(t for t in reversed(open_stack) if name.startswith(t) and len(t) > 0)
+                nested_closes = []
+                while open_stack and open_stack[-1] != target_tag:
+                    popped = open_stack.pop()
+                    nested_closes.append("{/%s}" % popped)
+                    early_closed[popped] += 1
+                if open_stack:
+                    open_stack.pop()
+                out.append("".join(nested_closes))
+                out.append("{/%s}" % target_tag)
+                changed = True
+            else:
+                # Not in stack or no open tags.
+                # If this tag was already closed early by us, discard the redundant close tag.
+                if early_closed[name] > 0:
+                    early_closed[name] -= 1
+                    changed = True
+                else:
+                    # Check if any early closed tag starts with this name (prefixed corrupted name)
+                    matched_early = next((k for k in early_closed if early_closed[k] > 0 and name.startswith(k) and len(k) > 0), None)
+                    if matched_early:
+                        early_closed[matched_early] -= 1
+                        changed = True
+                    else:
+                        out.append(m.group(0))
+
     out.append(s[pos:])
     return "".join(out) if changed else s
 
@@ -877,6 +918,58 @@ def _match_newlines(translation: str, original: str) -> str:
     while len(t_lines) > 1 and t_lines[0].strip() == "" and not o_lead:
         t_lines.pop(0)
     return "\n".join(t_lines)
+
+
+def _escape_invalid_brackets(s: str) -> str:
+    """Escape square brackets that are NOT valid Python expressions/variables,
+    e.g. `[в её лице]` -> `[[в её лице]`. This prevents Ren'Py from attempting
+    to compile them as interpolation variables, which raises SyntaxError and
+    crashes the game. Already escaped brackets `[[` are ignored."""
+    if "[" not in s:
+        return s
+
+    out = []
+    i = 0
+    n = len(s)
+    changed = False
+
+    while i < n:
+        if s[i:i+2] == "[[":
+            out.append("[[")
+            i += 2
+        elif s[i] == "[":
+            start = i
+            depth = 1
+            j = i + 1
+            while j < n and depth > 0:
+                if s[j:j+2] == "[[":
+                    j += 2
+                elif s[j] == "[":
+                    depth += 1
+                    j += 1
+                elif s[j] == "]":
+                    depth -= 1
+                    j += 1
+                else:
+                    j += 1
+
+            if depth == 0:
+                content = s[start+1 : j-1]
+                try:
+                    compile(content, "<string>", "eval")
+                    out.append(s[start:j])
+                except SyntaxError:
+                    out.append("[[" + content + "]")
+                    changed = True
+                i = j
+            else:
+                out.append("[")
+                i += 1
+        else:
+            out.append(s[i])
+            i += 1
+
+    return "".join(out) if changed else s
 
 
 def iter_logical_lines(text: str):
@@ -2006,6 +2099,8 @@ class RenPyParser(BaseParser):
                     # a phantom 2nd line → button text jams to the top + false
                     # box-fit shrink). Compared against the UNESCAPED original. No API.
                     tr = _match_newlines(tr, _unescape_translation(rec["original"]))
+                    # Escape invalid square bracket substitutions to prevent runtime syntax errors
+                    tr = _escape_invalid_brackets(tr)
 
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],
