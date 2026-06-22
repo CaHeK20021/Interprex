@@ -762,6 +762,7 @@ def renpy_lint(req: RenpyLintReq) -> dict:
 @app.post("/detect_mods")
 def detect_mods(req: DetectModsReq) -> dict:
     import os
+    import json
     root = req.root
     
     # 1. Locate the mods directory
@@ -790,32 +791,96 @@ def detect_mods(req: DetectModsReq) -> dict:
             mods_dir = curr
             break
 
-    # 2. List direct subdirectories inside mods_dir
+    # 2. Load project file (if any) to look up translations
+    project_path = os.path.join(root, ".interprex", "project.json")
+    project_data = {}
+    if os.path.isfile(project_path):
+        try:
+            with open(project_path, "r", encoding="utf-8") as f:
+                project_data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to read project json for stats: {e}")
+
+    # 3. List direct subdirectories inside mods_dir
     ignore_dirs = {
         "bin", "obj", ".vs", "node_modules", "venv", ".git", ".interprex_backups",
         "appdata", "temp"
     }
     
     mods_list = []
+    
+    def count_mod_strings(mod_engine: str | None, mod_rel_path: str) -> tuple[int, int]:
+        if not mod_engine:
+            return 0, 0
+        try:
+            parser = get_parser(mod_engine)
+            # Extract strings from the specific mod subpath
+            extracted = parser.extract(root, [mod_rel_path])
+            if not extracted:
+                return 0, 0
+            
+            n = len(extracted)
+            x = 0
+            proj_strings = project_data.get("strings", {})
+            for s in extracted:
+                entry = proj_strings.get(s.id)
+                if entry and entry.get("translated"):
+                    x += 1
+            return x, n
+        except Exception as ex:
+            logger.error(f"Error extracting stats for mod {mod_rel_path}: {ex}")
+            return 0, 0
+
     if os.path.isdir(mods_dir):
         try:
             for name in os.listdir(mods_dir):
                 full_path = os.path.join(mods_dir, name)
-                if os.path.isdir(full_path) and name.lower() not in ignore_dirs and not name.startswith("."):
-                    engine = detect_engine(full_path)
-                    rel_path = os.path.relpath(full_path, root).replace("\\", "/")
-                    mods_list.append({
-                        "name": name,
-                        "path": rel_path,
-                        "engine": engine
-                    })
+                if not os.path.isdir(full_path) or name.startswith("."):
+                    continue
+                if name.lower() in ignore_dirs:
+                    continue
+                    
+                # If this is the "GameFeatures" directory, scan its subdirectories instead of the folder itself
+                if name.lower() == "gamefeatures":
+                    try:
+                        for sub_name in os.listdir(full_path):
+                            sub_full_path = os.path.join(full_path, sub_name)
+                            if os.path.isdir(sub_full_path) and not sub_name.startswith(".") and sub_name.lower() not in ignore_dirs:
+                                engine = detect_engine(sub_full_path)
+                                rel_path = os.path.relpath(sub_full_path, root).replace("\\", "/")
+                                x, n = count_mod_strings(engine, rel_path)
+                                mods_list.append({
+                                    "name": sub_name,
+                                    "path": rel_path,
+                                    "engine": engine,
+                                    "translated_count": x,
+                                    "total_count": n
+                                })
+                    except Exception as e:
+                        logger.error(f"Error scanning GameFeatures directory {full_path}: {e}")
+                    continue
+                    
+                engine = detect_engine(full_path)
+                rel_path = os.path.relpath(full_path, root).replace("\\", "/")
+                x, n = count_mod_strings(engine, rel_path)
+                mods_list.append({
+                    "name": name,
+                    "path": rel_path,
+                    "engine": engine,
+                    "translated_count": x,
+                    "total_count": n
+                })
         except Exception as e:
             logger.error(f"Error scanning mods directory {mods_dir}: {e}")
             
+    # 4. Sort: mods with total_count > 0 first (descending by total_count, then name), then total_count == 0
+    mods_list.sort(key=lambda m: (m["total_count"] == 0, -m["total_count"], m["name"].lower()))
+
     return {
         "mods_dir": mods_dir.replace("\\", "/"),
         "mods": mods_list
     }
+
 
 
 @app.post("/extract")

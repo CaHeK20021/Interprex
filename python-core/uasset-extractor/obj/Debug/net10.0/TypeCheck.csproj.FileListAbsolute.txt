@@ -1,0 +1,6 @@
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.csproj.AssemblyReference.cache
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.AssemblyInfoInputs.cache
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.AssemblyInfo.cs
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.csproj.CoreCompileInputs.cache
+C:\Users\Alexandr\Desktop\Interprex\python-core\uasset-extractor\obj\Debug\net10.0\TypeCheck.sourcelink.json

@@ -506,6 +506,62 @@ def _is_satisfactory_base_game_file(root: str, file_path: Path) -> bool:
     return is_sub_of_base and not is_sub_of_mods and not in_mods_folder
 
 
+def _is_descendant_of_any(path_str: str, parent_set: set[str]) -> bool:
+    """Check if path_str (e.g. 'FactoryGame/Mods/GameFeatures/ModA/...') starts with
+    or equals any path in parent_set."""
+    return any(path_str == p or path_str.startswith(p + "/") for p in parent_set)
+
+
+def _is_translatable_uasset(inner_path: str) -> bool:
+    """Check if this uasset is likely a recipe, item or buildable description."""
+    path_lower = inner_path.lower()
+    name = path_lower.split("/")[-1]
+    
+    # Check prefixes
+    if name.startswith(("recipe_", "desc_", "build_", "schem_", "rec_")):
+        return True
+        
+    # Check folder segments
+    segments = set(path_lower.split("/"))
+    if segments.intersection({"recipes", "items", "buildable", "schematics"}):
+        return True
+        
+    return False
+
+
+def _run_uasset_extractor(uasset_path: str) -> list[dict]:
+    """Run UAssetExtractor.exe on a single file or directory and return JSON list."""
+    import sys
+    import json
+    
+    ext = ".exe" if sys.platform.startswith("win") else ""
+    parser_dir = Path(__file__).resolve().parent
+    core_dir = parser_dir.parent
+    extractor_bin = core_dir / "bin" / f"UAssetExtractor{ext}"
+    
+    if not extractor_bin.is_file():
+        logger.warning(f"UAssetExtractor not found at {extractor_bin}")
+        return []
+        
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_json = Path(tmp_dir) / "extracted.json"
+        try:
+            _run_cmd([
+                str(extractor_bin),
+                "--input", uasset_path,
+                "--output", str(out_json),
+                "--engine", "VER_UE5_4"
+            ], check=True, capture_output=True, timeout=10)
+            
+            if out_json.is_file():
+                with open(out_json, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"UAssetExtractor failed on {uasset_path}: {e}")
+            
+    return []
+
+
 class UnrealEngine4_5Parser(BaseParser):
     engine = "unreal4_5"
 
@@ -523,6 +579,14 @@ class UnrealEngine4_5Parser(BaseParser):
 
     @staticmethod
     def detect(root: str) -> bool:
+        # Unreal signatures: if it contains any .uplugin, .pak, or .uasset, it's Unreal.
+        try:
+            for f in Path(root).rglob("*"):
+                if f.is_file() and f.suffix.lower() in (".uplugin", ".pak", ".uasset"):
+                    return True
+        except Exception:
+            pass
+
         # Loose .locres on disk.
         for f in iter_locres_files(root):
             try:
@@ -586,7 +650,7 @@ class UnrealEngine4_5Parser(BaseParser):
         files = list(iter_locres_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            files = [f for f in files if f.relative_to(root).as_posix() in wanted]
+            files = [f for f in files if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)]
 
         strings: list[TranslationString] = []
         for f in files:
@@ -602,6 +666,10 @@ class UnrealEngine4_5Parser(BaseParser):
         if not files:
             self._extract_from_paks(root, sub_paths, strings)
             self._extract_from_utocs(root, sub_paths, strings)
+
+        # uassets are ALWAYS extracted — mods without locres (pure TextProperty uassets)
+        # need this path even when other mods contributed locres strings above.
+        self._extract_from_uassets(root, sub_paths, strings)
         return strings
 
     def _extract_from_utocs(self, root: str, sub_paths, out: list[TranslationString]) -> None:
@@ -615,9 +683,9 @@ class UnrealEngine4_5Parser(BaseParser):
         utocs = list(iter_utoc_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            utocs = [u for u in utocs if u.relative_to(root).as_posix() in wanted]
+            utocs = [u for u in utocs if _is_descendant_of_any(u.relative_to(root).as_posix(), wanted)]
             
-        list_re = re.compile(r"^(?P<chunk_id>[0-9a-fA-F]+)\s+.*?\s+(?P<inner_path>.*\.locres)$")
+        list_re = re.compile(r"^(?:\S+\s+)?(?P<chunk_id>[0-9a-fA-F]{16,32})\s+.*?\s+(?P<inner_path>.*\.locres)$")
         
         for uf in utocs:
             utoc_rel = uf.relative_to(root).as_posix()
@@ -660,7 +728,7 @@ class UnrealEngine4_5Parser(BaseParser):
         paks = list(iter_pak_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            paks = [p for p in paks if p.relative_to(root).as_posix() in wanted]
+            paks = [p for p in paks if _is_descendant_of_any(p.relative_to(root).as_posix(), wanted)]
         for pf in paks:
             pak_rel = pf.relative_to(root).as_posix()
             try:
@@ -680,6 +748,137 @@ class UnrealEngine4_5Parser(BaseParser):
                     continue
                 self._extract_model(m, f"{pak_rel}{PAK_SEP}{inf.path}", out)
 
+    def _extract_from_uassets(self, root: str, sub_paths, out: list[TranslationString]) -> None:
+        """Extract translatable strings from .uasset files inside .pak or .utoc containers."""
+        from . import pak as pakmod
+        import tempfile
+        import re
+        
+        paks = list(iter_pak_files(root))
+        utocs = list(iter_utoc_files(root))
+        
+        if sub_paths:
+            wanted = {Path(p).as_posix() for p in sub_paths}
+            paks = [p for p in paks if _is_descendant_of_any(p.relative_to(root).as_posix(), wanted)]
+            utocs = [u for u in utocs if _is_descendant_of_any(u.relative_to(root).as_posix(), wanted)]
+
+        def get_mod_rel_path(fpath: Path) -> str:
+            # Check if this is a nested game feature or general mod
+            for parent in fpath.parents:
+                parent_name = parent.name.lower()
+                if parent_name == "mods" or parent_name == "gamefeatures":
+                    child = fpath
+                    for p in fpath.parents:
+                        if p == parent:
+                            return child.relative_to(root).as_posix()
+                        child = p
+            return fpath.parent.relative_to(root).as_posix()
+
+        # 1. Extract from .pak files
+        for pf in paks:
+            pak_rel = pf.relative_to(root).as_posix()
+            mod_rel = get_mod_rel_path(pf)
+            try:
+                inner_files = pakmod.read_pak(str(pf), want_suffix=".uasset")
+            except Exception as e:
+                logger.error(f"Failed to read pak {pak_rel} for uassets: {e}")
+                continue
+                
+            for inf in inner_files:
+                if not _is_translatable_uasset(inf.path):
+                    continue
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    temp_uasset = Path(tmp_dir) / Path(inf.path).name
+                    temp_uasset.write_bytes(inf.data)
+                    
+                    extracted = _run_uasset_extractor(str(temp_uasset))
+                    for item in extracted:
+                        out.append(self._mk(
+                            file=f"uasset://{mod_rel}{PAK_SEP}{inf.path}",
+                            path=[item["InternalPath"], item["PropName"]],
+                            original=item["Value"],
+                            context=f"Class: {item['AssetClass']} | Property: {item['PropName']}"
+                        ))
+
+        # 2. Extract from .utoc/ucas files via retoc to-legacy (assembles proper .uasset files)
+        try:
+            retoc_bin = _find_retoc()
+        except RuntimeError:
+            return
+            
+        list_re = re.compile(r"^(?:\S+\s+)?(?P<chunk_id>[0-9a-fA-F]{16,32})\s+.*?\s+(?P<inner_path>.*\.uasset)$")
+
+        # Pre-stage global containers once — they're huge and every mod needs them.
+        root_path = Path(root)
+        global_utoc = root_path / "FactoryGame" / "Content" / "Paks" / "global.utoc"
+        global_ucas = root_path / "FactoryGame" / "Content" / "Paks" / "global.ucas"
+
+        for uf in utocs:
+            utoc_rel = uf.relative_to(root).as_posix()
+            mod_rel = get_mod_rel_path(uf)
+            try:
+                res = _run_cmd([retoc_bin, "list", "--path", str(uf)], capture_output=True, text=True, check=True)
+            except Exception as e:
+                logger.error(f"Failed to list utoc {utoc_rel} for uassets: {e}")
+                continue
+                
+            entries = []
+            for line in res.stdout.splitlines():
+                m = list_re.match(line.strip())
+                if m:
+                    gd = m.groupdict()
+                    if _is_translatable_uasset(gd["inner_path"]):
+                        entries.append(gd)
+                        
+            if not entries:
+                continue
+                
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_input = Path(tmp_dir) / "input"
+                tmp_output = Path(tmp_dir) / "output"
+                tmp_input.mkdir()
+                tmp_output.mkdir()
+
+                # Symlink global containers (instant, no copy)
+                for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
+                    dst = tmp_input / name
+                    try:
+                        os.symlink(str(src), str(dst))
+                    except OSError:
+                        shutil.copy2(str(src), str(dst))
+
+                # Copy mod's utoc+ucas (small files, ~1KB-1MB)
+                shutil.copy2(str(uf), str(tmp_input / uf.name))
+                ucas_counterpart = uf.with_suffix(".ucas")
+                if ucas_counterpart.is_file():
+                    shutil.copy2(str(ucas_counterpart), str(tmp_input / ucas_counterpart.name))
+
+                ue_ver = _detect_ue_version(str(uf), retoc_bin)
+                try:
+                    _run_cmd([
+                        retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
+                        "--version", ue_ver, "--verbose"
+                    ], check=True, capture_output=True)
+                except Exception as e:
+                    logger.error(f"retoc to-legacy failed for {utoc_rel}: {e}")
+                    continue
+
+                for extracted_uasset in tmp_output.rglob("*.uasset"):
+                    inner_path = extracted_uasset.relative_to(tmp_output).as_posix()
+                    if not _is_translatable_uasset(inner_path):
+                        continue
+                    try:
+                        extracted = _run_uasset_extractor(str(extracted_uasset))
+                        for item in extracted:
+                            out.append(self._mk(
+                                file=f"uasset://{mod_rel}{PAK_SEP}{inner_path}",
+                                path=[item["InternalPath"], item["PropName"]],
+                                original=item["Value"],
+                                context=f"Class: {item['AssetClass']} | Property: {item['PropName']}"
+                            ))
+                    except Exception as e:
+                        logger.error(f"Failed to run UAssetExtractor on {inner_path}: {e}")
+
     def _target_path(self, source: Path, lang_code: str) -> Path:
         """Sibling language folder: .../Localization/<Target>/<lang>/<file>.locres.
         Only the language directory (the file's parent) changes."""
@@ -695,7 +894,7 @@ class UnrealEngine4_5Parser(BaseParser):
         files = list(iter_locres_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            files = [f for f in files if f.relative_to(root).as_posix() in wanted]
+            files = [f for f in files if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)]
 
         if not files:
             sml_files: dict[str, bytes] = {}
@@ -705,7 +904,9 @@ class UnrealEngine4_5Parser(BaseParser):
             if sml_files:
                 self._write_sml_plugin(root, sml_files)
                 
-            return paks_written + utocs_written
+            written = paks_written + utocs_written
+            written += self._inject_into_uassets(root, translations, sub_paths)
+            return written
 
         written = 0
         for f in files:
@@ -722,6 +923,106 @@ class UnrealEngine4_5Parser(BaseParser):
                 logger.error(f"Failed to inject into {rel}: {e}")
         return written
 
+    def _inject_into_uassets(self, root: str, translations: dict[str, str], sub_paths) -> int:
+        """Generate ContentLib JSON patch files based on translated uasset strings."""
+        import json
+        import hashlib
+        from .base import update_metadata, make_id
+        
+        # 1. Re-extract strings to know their IDs and metadata.
+        # Use a cache to avoid running retoc to-legacy a second time.
+        cache_key = (root, tuple(sub_paths) if sub_paths else None)
+        if not hasattr(self, '_uasset_cache') or self._uasset_cache_key != cache_key:
+            self._uasset_cache = []
+            self._extract_from_uassets(root, sub_paths, self._uasset_cache)
+            self._uasset_cache_key = cache_key
+        uasset_strings = self._uasset_cache
+        
+        # Group by mod and asset target path
+        # mod_name -> { "recipes": { internal_path -> patch_dict }, "items": { internal_path -> patch_dict } }
+        patches_by_mod = {}
+        
+        written_count = 0
+        for s in uasset_strings:
+            string_id = make_id(self.engine, s.file, s.path, s.original)
+            if string_id in translations:
+                translated_text = translations[string_id]
+                if s.file.startswith("uasset://"):
+                    parts = s.file[9:].split(PAK_SEP)
+                    mod_rel = parts[0]
+                    mod_name = mod_rel.split("/")[-1]
+                    
+                    if mod_name not in patches_by_mod:
+                        patches_by_mod[mod_name] = {
+                            "recipes": {},
+                            "items": {}
+                        }
+                        
+                    internal_path = s.path[0]
+                    prop_name = s.path[1]
+                    
+                    # Decide folder category (RecipePatches vs ItemPatches)
+                    is_recipe = "recipe" in internal_path.lower()
+                    category = "recipes" if is_recipe else "items"
+                    
+                    target_map = patches_by_mod[mod_name][category]
+                    if internal_path not in target_map:
+                        # ContentLib full class path: /Game/.../AssetName.AssetName_C
+                        asset_name = internal_path.split("/")[-1]
+                        target_map[internal_path] = {
+                            "_target_comment": f"//{internal_path}.{asset_name}_C"
+                        }
+                        
+                    # Map to ContentLib schema keys
+                    prop_lower = prop_name.lower()
+                    if "displayname" in prop_lower or prop_lower == "name":
+                        target_map[internal_path]["Name"] = translated_text
+                    elif "description" in prop_lower:
+                        target_map[internal_path]["Description"] = translated_text
+                    elif "tooltip" in prop_lower:
+                        target_map[internal_path]["Tooltip"] = translated_text
+                    elif "flavor" in prop_lower or "longdescription" in prop_lower:
+                        target_map[internal_path]["LongDescription"] = translated_text
+                    elif "preunlock" in prop_lower and "name" in prop_lower:
+                        target_map[internal_path]["PreUnlockDisplayName"] = translated_text
+                    elif "preunlock" in prop_lower and "desc" in prop_lower:
+                        target_map[internal_path]["PreUnlockDescription"] = translated_text
+                    elif "postunlock" in prop_lower and "desc" in prop_lower:
+                        target_map[internal_path]["PostUnlockDescription"] = translated_text
+                    # else: skip unknown props (enum values, struct fields like DoorMode/Frame/Sound)
+                        
+                    written_count += 1
+                    
+        # 2. Write patch files and register in backups as 'created'
+        for mod_name, categories in patches_by_mod.items():
+            for category, target_map in categories.items():
+                folder_name = "RecipePatches" if category == "recipes" else "ItemPatches"
+                dest_dir = os.path.join(root, "FactoryGame", "Configs", "ContentLib", folder_name)
+                os.makedirs(dest_dir, exist_ok=True)
+                
+                for internal_path, patch_data in target_map.items():
+                    # Generate safe file name from internal path
+                    asset_name = internal_path.split("/")[-1]
+                    file_name = f"Patch_{mod_name}_{asset_name}.json"
+                    file_path = os.path.join(dest_dir, file_name)
+                    rel_to_root = os.path.relpath(file_path, root).replace("\\", "/")
+                    
+                    try:
+                        comment = patch_data.pop("_target_comment", "")
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            if comment:
+                                f.write(comment + "\n")
+                            json.dump(patch_data, f, indent=4, ensure_ascii=False)
+                                
+                        # Register in backup system as 'created' (to support Restore Backup)
+                        mod_bytes = (comment + "\n" + json.dumps(patch_data, ensure_ascii=False)).encode("utf-8")
+                        mod_sha = hashlib.sha256(mod_bytes).hexdigest()
+                        update_metadata(root, rel_to_root, "", mod_sha, "created")
+                    except Exception as e:
+                        logger.error(f"Failed to write ContentLib patch {file_name}: {e}")
+                        
+        return written_count
+
     def _inject_into_paks(self, root: str, translations: dict[str, str],
                           lang_code: str, sub_paths, sml_files: dict[str, bytes] | None = None) -> int:
         """Write translated .locres into a NEW uncompressed mod-pak per source pak
@@ -731,7 +1032,7 @@ class UnrealEngine4_5Parser(BaseParser):
         paks = list(iter_pak_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            paks = [p for p in paks if p.relative_to(root).as_posix() in wanted]
+            paks = [p for p in paks if _is_descendant_of_any(p.relative_to(root).as_posix(), wanted)]
 
         written = 0
         for pf in paks:
@@ -784,7 +1085,7 @@ class UnrealEngine4_5Parser(BaseParser):
         utocs = list(iter_utoc_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            utocs = [u for u in utocs if u.relative_to(root).as_posix() in wanted]
+            utocs = [u for u in utocs if _is_descendant_of_any(u.relative_to(root).as_posix(), wanted)]
             
         list_re = re.compile(r"^(?P<chunk_id>[0-9a-fA-F]+)\s+.*?\s+(?P<inner_path>.*\.locres)$")
         written = 0

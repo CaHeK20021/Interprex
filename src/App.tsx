@@ -801,8 +801,10 @@ export default function App() {
       saveSetting("lastFolderMode", "mods");
       saveSetting("lastFolder", picked);
 
-      // select all by default
-      const defaultPaths = res.mods.map(m => m.path);
+      // select only mods that have strings by default
+      const defaultPaths = res.mods
+        .filter(m => m.total_count !== undefined && m.total_count > 0)
+        .map(m => m.path);
       setSelectedModPaths(defaultPaths);
 
       // Check engines
@@ -831,7 +833,9 @@ export default function App() {
 
   async function handleSelectAllMods() {
     if (busy) return;
-    const allPaths = detectedMods.map((m) => m.path);
+    const allPaths = detectedMods
+      .filter((m) => m.total_count !== undefined && m.total_count > 0)
+      .map((m) => m.path);
     setSelectedModPaths(allPaths);
     await scanSelectedMods(allPaths);
   }
@@ -2425,8 +2429,7 @@ export default function App() {
 
       {translationMode === "mods" && detectedMods.length > 0 && (
         <div className="mods-panel">
-          <div className="mods-panel-header">
-            <span className="mods-panel-title">{t("detectedModsLabel")}</span>
+          <div className="mods-panel-actions-row">
             <div className="mods-panel-actions">
               <button onClick={handleSelectAllMods} disabled={busy}>
                 {t("selectAll")}
@@ -2436,27 +2439,75 @@ export default function App() {
               </button>
             </div>
           </div>
+          <div className="mods-list-header">
+            <span className="col-checkbox"></span>
+            <span className="col-name">{t("modNameHeader")}</span>
+            <span className="col-strings">{t("modStringsHeader")}</span>
+            <span className="col-progress">{t("modProgressHeader")}</span>
+            <span className="col-status">{t("modStatusHeader")}</span>
+          </div>
           <div className="mods-list">
             {detectedMods.map((mod) => {
-              const isSelected = selectedModPaths.includes(mod.path);
+              const total = mod.total_count ?? 0;
+              const translated = mod.translated_count ?? 0;
+              const hasStrings = total > 0;
+              const isSelected = hasStrings && selectedModPaths.includes(mod.path);
+              const isDisabled = !hasStrings;
+              const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
+
+              let statusText = t("statusNoStrings");
+              let statusClass = "status-empty";
+              if (hasStrings) {
+                if (translated === 0) {
+                  statusText = t("statusNotStarted");
+                  statusClass = "status-todo";
+                } else if (translated === total) {
+                  statusText = t("statusCompleted");
+                  statusClass = "status-done";
+                } else {
+                  statusText = t("statusInProgress");
+                  statusClass = "status-progress";
+                }
+              }
+
               return (
                 <div
                   key={mod.path}
-                  className={`mod-item ${isSelected ? "selected" : ""}`}
-                  onClick={() => handleToggleMod(mod.path)}
+                  className={`mod-item ${isSelected ? "selected" : ""} ${isDisabled ? "disabled" : ""}`}
+                  onClick={(!isDisabled && !busy) ? () => handleToggleMod(mod.path) : undefined}
                 >
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    readOnly
-                    disabled={busy}
-                  />
-                  <span className="mod-name" title={mod.name}>
+                  <span className="col-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      readOnly
+                      disabled={isDisabled || busy}
+                    />
+                  </span>
+                  <span className="mod-name col-name" title={mod.name}>
                     {mod.name}
                   </span>
-                  {mod.engine && (
-                    <span className={`mod-engine-badge engine-${mod.engine}`}>{mod.engine}</span>
-                  )}
+                  <span className={`col-strings ${hasStrings ? `engine-${mod.engine}` : "status-empty"}`}>
+                    {hasStrings ? `${translated}/${total}` : "—"}
+                  </span>
+                  <span className="col-progress">
+                    {hasStrings ? (
+                      <div className="mod-progress-wrap">
+                        <div className="mod-progress-bar">
+                          <div
+                            className="mod-progress-fill"
+                            style={{ width: `${percent}%` }}
+                          />
+                        </div>
+                        <span className="mod-progress-percent">{percent}%</span>
+                      </div>
+                    ) : (
+                      "—"
+                    )}
+                  </span>
+                  <span className={`col-status ${statusClass}`}>
+                    {statusText}
+                  </span>
                 </div>
               );
             })}

@@ -19,6 +19,10 @@ if errorlevel 1 (
     if errorlevel 1 ( echo  [ERROR] PyInstaller install failed. & exit /b 1 )
 )
 
+echo  Building UAssetExtractor (C#)...
+dotnet build python-core\uasset-extractor\UAssetExtractor.csproj -c Release -o python-core\bin
+if errorlevel 1 ( echo  [ERROR] Dotnet build for UAssetExtractor failed. & exit /b 1 )
+
 echo  Building Python sidecar...
 %PYTHON% -m PyInstaller --distpath python-core\dist --workpath python-core\build --noconfirm python-core\sidecar.spec
 if errorlevel 1 ( echo  [ERROR] PyInstaller failed. & exit /b 1 )

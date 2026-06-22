@@ -1,0 +1,10 @@
+[
+  {
+    "AssetPath": "c:\\Users\\Alexandr\\Desktop\\Interprex\\tmp_output\\FactoryGame\\Mods\\InstantCraftBench\\Content\\Build_InstantCraftBench.uasset",
+    "InternalPath": "/Game/Mods/InstantCraftBench/Build_InstantCraftBench",
+    "PropName": "mDisplayName",
+    "Value": "Instant Crafting Bench",
+    "Type": "Text",
+    "AssetClass": "Build_InstantCraftBench_C"
+  }
+]

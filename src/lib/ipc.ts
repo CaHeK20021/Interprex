@@ -83,6 +83,8 @@ export interface ModInfo {
   name: string;
   path: string;
   engine: Engine | null;
+  translated_count?: number;
+  total_count?: number;
 }
 
 /** Detect and list mods in a game or mods directory. */

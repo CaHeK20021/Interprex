@@ -560,52 +560,101 @@ button.btn-danger:hover:not(:disabled) {
   padding: 12px;
   margin-top: 4px;
 }
-.mods-panel-header {
+.mods-panel-actions-row {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 10px;
+  justify-content: flex-end;
+  margin-bottom: 6px;
 }
-.mods-panel-title {
-  font-size: 14px;
+.mods-list-header {
+  display: grid;
+  grid-template-columns: 32px 1fr 1fr 1fr 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 24px 8px 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0;
+  font-size: 11px;
   font-weight: 600;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.35);
+}
+.col-checkbox {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.col-name {
+  min-width: 0;
+}
+.col-strings {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
   color: var(--text);
+}
+.col-strings.status-empty {
+  color: var(--muted);
+  font-weight: 500;
+}
+.col-status {
+  font-size: 13px;
+  font-weight: 500;
+}
+.col-status.status-todo {
+  color: var(--muted);
+}
+.col-status.status-progress {
+  color: var(--text);
+}
+.col-status.status-done {
+  color: #32e06b;
+}
+.col-status.status-empty {
+  color: var(--muted);
 }
 .mods-panel-actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
 }
 .mods-panel-actions button {
-  padding: 4px 10px;
-  font-size: 12px;
-  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 4px;
 }
 .mods-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 8px;
-  max-height: 150px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: none;
   overflow-y: auto;
   padding-right: 4px;
+  scrollbar-gutter: stable;
 }
 .mod-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: 32px 1fr 1fr 1fr 1fr;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
+  gap: 12px;
+  padding: 8px 12px;
+  background: transparent;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   cursor: pointer;
   user-select: none;
-  transition: border-color 0.15s, background 0.15s;
+  transition: background 0.15s, opacity 0.15s;
 }
-.mod-item:hover {
-  border-color: var(--accent);
-  background: rgba(255, 255, 255, 0.01);
+.mod-item:not(.disabled):hover {
+  background: rgba(255, 255, 255, 0.035);
 }
 .mod-item.selected {
-  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.015);
+}
+.mod-item.disabled {
+  opacity: 0.35;
+  cursor: default;
+  user-select: text;
+}
+.mod-item.disabled input[type="checkbox"] {
+  cursor: default;
 }
 .mod-item input[type="checkbox"] {
   cursor: pointer;
@@ -620,6 +669,36 @@ button.btn-danger:hover:not(:disabled) {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+.mod-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mod-progress-bar {
+  flex: 1;
+  height: 6px;
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.06),
+    rgba(255, 255, 255, 0.06) 2px,
+    transparent 2px,
+    transparent 4px
+  );
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+  max-width: 70px;
+}
+.mod-progress-fill {
+  height: 100%;
+  background: #ffffff;
+  border-radius: 1px;
+}
+.mod-progress-percent {
+  font-size: 12px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
 .mod-engine-badge {
   font-size: 10px;
@@ -697,11 +776,30 @@ button.btn-danger:hover:not(:disabled) {
   background: rgba(251, 113, 133, 0.06);
 }
 .badge.engine-qsp, .mod-engine-badge.engine-qsp {
-.badge.engine-twine, .mod-engine-badge.engine-twine { background: rgba(217, 70, 239, 0.15); color: #d946ef; border: 1px solid rgba(217, 70, 239, 0.3); }
   color: #f97316;
   border-color: rgba(249, 115, 22, 0.3);
   background: rgba(249, 115, 22, 0.06);
 }
+.badge.engine-twine, .mod-engine-badge.engine-twine {
+  color: #d946ef;
+  border-color: rgba(217, 70, 239, 0.3);
+  background: rgba(217, 70, 239, 0.15);
+}
+
+/* Col-strings engine colors (text color only) */
+.col-strings.engine-rpgmaker { color: #ffa033; }
+.col-strings.engine-renpy { color: #ff66a0; }
+.col-strings.engine-godot { color: #3cd4ff; }
+.col-strings.engine-gamemaker { color: #32e06b; }
+.col-strings.engine-unity { color: #c084fc; }
+.col-strings.engine-unreal { color: #eab308; }
+.col-strings.engine-unreal4_5 { color: #f0883e; }
+.col-strings.engine-csharp { color: #818cf8; }
+.col-strings.engine-i18n { color: #5b8cff; }
+.col-strings.engine-fusion { color: #2dd4bf; }
+.col-strings.engine-mmf2 { color: #fb7185; }
+.col-strings.engine-qsp { color: #f97316; }
+.col-strings.engine-twine { color: #d946ef; }
 
 /* Engine specific progress fill colors */
 .progressfill.engine-rpgmaker { background: #ffa033; }

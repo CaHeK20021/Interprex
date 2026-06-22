@@ -351,6 +351,15 @@ class UnityParser(BaseParser):
     @staticmethod
     def detect(root: str) -> bool:
         """True if there are any non-system .dll files, level* / *.assets / *.prefab, or Addressables localization bundles."""
+        # Unreal signature protection: if it's an Unreal mod/plugin, do not detect as Unity.
+        from pathlib import Path
+        try:
+            for f in Path(root).rglob("*"):
+                if f.is_file() and f.suffix.lower() in (".uplugin", ".pak", ".uasset"):
+                    return False
+        except Exception:
+            pass
+
         # 1. Check for StreamingAssets/aa
         aa_dir = find_aa_dir(root)
         if aa_dir:
