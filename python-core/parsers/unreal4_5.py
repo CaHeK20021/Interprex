@@ -392,24 +392,39 @@ def _is_translatable(value: str) -> bool:
 
 def _find_retoc() -> str:
     """Find the retoc executable.
-    First checks python-core/bin/ directory, then falls back to the system PATH.
-    Also verifies that the found binary supports the 'to-zen' command."""
+    Checks (in order):
+      1. sys._MEIPASS/bin/  — PyInstaller ONEFILE unpacks datas/ here; __file__
+         resolves into the same temp tree but its .parent.parent path is
+         unreliable across Python versions, so we prefer the explicit _MEIPASS.
+      2. python-core/bin/ relative to this source file — dev / editable installs.
+      3. System PATH.
+    Also verifies the found binary supports the 'to-zen' command."""
     import sys
     ext = ".exe" if sys.platform.startswith("win") else ""
     binary_name = f"retoc{ext}"
-    
-    # 1. Check python-core/bin/
+
+    candidates: list[Path] = []
+
+    # 1. Frozen ONEFILE: _MEIPASS is the unpacked temp directory
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "bin" / binary_name)
+
+    # 2. Dev mode: bin/ sits next to the python-core/ package root
     parser_dir = Path(__file__).resolve().parent
     core_dir = parser_dir.parent
-    local_bin = core_dir / "bin" / binary_name
-    if local_bin.is_file():
-        path_to_try = str(local_bin)
-    else:
-        # 2. Fall back to system PATH
-        path_to_try = shutil.which("retoc")
-        if not path_to_try:
-            path_to_try = shutil.which(binary_name)
-            
+    candidates.append(core_dir / "bin" / binary_name)
+
+    path_to_try: str | None = None
+    for c in candidates:
+        if c.is_file():
+            path_to_try = str(c)
+            break
+
+    if not path_to_try:
+        # 3. System PATH
+        path_to_try = shutil.which("retoc") or shutil.which(binary_name)
+
     if not path_to_try:
         raise RuntimeError(
             "The 'retoc' executable is required for Unreal Engine 5 IoStore support but was not found. "
