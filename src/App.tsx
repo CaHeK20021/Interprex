@@ -494,6 +494,7 @@ export default function App() {
   const [folderPickerKind, setFolderPickerKind] = useState<null | "game" | "mods">(null);
   const [translationMode, setTranslationMode] = useState<"game" | "mods">("game");
   const [modsDir, setModsDir] = useState<string | null>(null);
+  const [gameRoot, setGameRoot] = useState<string | null>(null);
   const [detectedMods, setDetectedMods] = useState<ModInfo[]>([]);
   const [selectedModPaths, setSelectedModPaths] = useState<string[]>([]);
   const [showProxyPanel, setShowProxyPanel] = useState(false);
@@ -728,7 +729,7 @@ export default function App() {
   }
 
   async function scanSelectedMods(paths: string[], currentMods?: ModInfo[], currentDir?: string) {
-    const activeDir = currentDir || modsDir;
+    const activeDir = (currentDir || gameRoot) ?? modsDir;
     const activeMods = currentMods || detectedMods;
     if (!activeDir) return;
     if (paths.length === 0) {
@@ -791,6 +792,7 @@ export default function App() {
       setPhase("detecting");
       const res = await detectMods(picked);
       setModsDir(res.mods_dir);
+      setGameRoot(res.game_root);
       setDetectedMods(res.mods);
       
       if (res.mods.length === 0) {
@@ -815,7 +817,7 @@ export default function App() {
         return;
       }
 
-      await scanSelectedMods(defaultPaths, res.mods, res.mods_dir);
+      await scanSelectedMods(defaultPaths, res.mods, res.game_root);
     } catch (e) {
       fail(e);
     }
@@ -1051,7 +1053,7 @@ export default function App() {
 
   async function writeBack(proj?: ProjectFile): Promise<boolean> {
     const p = proj ?? project;
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!p || !engine || !activeRoot) return false;
     if (abortController) {
       abortController.abort();
@@ -1429,7 +1431,7 @@ export default function App() {
   // everything. Each step short-circuits the chain if the user aborts or it fails;
   // autofix is best-effort (its own try/catch) and never blocks completion.
   async function handleTranslate(targetIds?: string[]) {
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!project || !engine || !activeRoot) return;
 
     // 0. If a proxy is saved but the startup check never resolved (offline at
@@ -1489,7 +1491,7 @@ export default function App() {
   }
 
   async function handleRestoreBackup() {
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!activeRoot) return;
     try {
       setPhase("restoring");
@@ -1510,7 +1512,7 @@ export default function App() {
   }
 
   async function handleExportZip() {
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!activeRoot || !engine) return;
     try {
       setError(null);
@@ -1526,13 +1528,13 @@ export default function App() {
   }
 
   function handleDiscardBackup() {
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!activeRoot) return;
     setShowDiscardConfirm(true);
   }
 
   async function confirmAndDiscardBackup() {
-    const activeRoot = translationMode === "mods" ? modsDir : root;
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
     setShowDiscardConfirm(false);
     if (!activeRoot) return;
     try {
@@ -1615,7 +1617,7 @@ export default function App() {
   const selectedModsInfo = detectedMods.filter((m) => selectedModPaths.includes(m.path));
   const selectedEngines = Array.from(new Set(selectedModsInfo.map((m) => m.engine).filter(Boolean)));
   const hasMixedEngines = selectedEngines.length > 1;
-  const activeRoot = translationMode === "mods" ? modsDir : root;
+  const activeRoot = translationMode === "mods" ? gameRoot : root;
 
 
   const translateDisabled =
@@ -1756,6 +1758,7 @@ export default function App() {
               setTranslationMode("game");
               setRoot(null);
               setModsDir(null);
+              setGameRoot(null);
               setEngine(null);
               setStrings([]);
               setProject(null);
@@ -1776,6 +1779,7 @@ export default function App() {
               setTranslationMode("mods");
               setRoot(null);
               setModsDir(null);
+              setGameRoot(null);
               setEngine(null);
               setStrings([]);
               setProject(null);

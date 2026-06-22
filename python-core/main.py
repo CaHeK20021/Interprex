@@ -791,6 +791,25 @@ def detect_mods(req: DetectModsReq) -> dict:
             mods_dir = curr
             break
 
+    # Compute game root: the directory that CONTAINS "FactoryGame" (or equivalent).
+    # The parser needs game root to find global.utoc, Paks, etc.
+    game_root = root
+    # Walk up from mods_dir to find the game root (parent of FactoryGame).
+    candidate = mods_dir
+    while True:
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        # Check if this parent contains "FactoryGame" directory
+        if os.path.isdir(os.path.join(parent, "FactoryGame")):
+            game_root = parent
+            break
+        # Also check if THIS dir is FactoryGame
+        if os.path.basename(candidate).lower() == "factorygame":
+            game_root = parent
+            break
+        candidate = parent
+
     # 2. Load project file (if any) to look up translations
     project_path = os.path.join(root, ".interprex", "project.json")
     project_data = {}
@@ -814,8 +833,8 @@ def detect_mods(req: DetectModsReq) -> dict:
             return 0, 0
         try:
             parser = get_parser(mod_engine)
-            # Extract strings from the specific mod subpath
-            extracted = parser.extract(root, [mod_rel_path])
+            # Extract strings using GAME ROOT (needed for global.utoc, Paks, etc.)
+            extracted = parser.extract(game_root, [mod_rel_path])
             if not extracted:
                 return 0, 0
             
@@ -878,6 +897,7 @@ def detect_mods(req: DetectModsReq) -> dict:
 
     return {
         "mods_dir": mods_dir.replace("\\", "/"),
+        "game_root": game_root.replace("\\", "/"),
         "mods": mods_list
     }
 

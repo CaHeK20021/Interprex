@@ -90,7 +90,7 @@ export interface ModInfo {
 /** Detect and list mods in a game or mods directory. */
 export function detectMods(
   root: string,
-): Promise<{ mods_dir: string; mods: ModInfo[] }> {
+): Promise<{ mods_dir: string; game_root: string; mods: ModInfo[] }> {
   return callPython("detect_mods", { root });
 }
 

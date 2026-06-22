@@ -677,6 +677,102 @@ on-disk `.locres`; unpacking those containers is a separate future step.
 - [akintos/UnrealLocres](https://github.com/akintos/UnrealLocres) (C#, all versions — the authoritative one)
 - [CUE4Parse](https://github.com/FabianFG/CUE4Parse) `LocResReader`
 
+## Unreal Engine 5 mods — ContentLib translation (`parsers/unreal4_5.py`)
+
+A SEPARATE engine from UE4/5 locres (`unreal4.py`). Translates translatable
+strings inside **Satisfactory mod `.uasset` files** via ContentLib JSON patches.
+The locres pipeline (`unreal4.py`) handles base-game localization; this pipeline
+handles mod content that lives in IoStore containers.
+
+### Why ContentLib
+Satisfactory mods ship as `.utoc`/`.ucas` IoStore containers. Their `.uasset`
+files contain `TextPropertyData` (FText) with `mDisplayName`, `mDescription`,
+etc. — the user-visible strings. ContentLib is a widely-installed Satisfactory
+mod that can patch these properties via JSON files at load time, **without
+touching the mod's binary files**.
+
+### Architecture
+```
+mod .utoc/.ucas ──retoc to-legacy──> assembled .uasset ──UAssetExtractor──> JSON
+                                                                 │
+                                                                 v
+                                              ContentLib JSON patches (.json)
+                                              FactoryGame/Configs/ContentLib/{ItemPatches,RecipePatches}/
+```
+
+### UAssetExtractor (`python-core/uasset-extractor/Program.cs`)
+A C# tool (UAssetAPI + Newtonsoft.Json) compiled to `python-core/bin/UAssetExtractor.exe`.
+Extracts translatable strings from `.uasset` files:
+
+- **`TextPropertyData`** (FText): reads `CultureInvariantString` (preferred) or
+  `Value.Value`. The standard UE4/5 localizable text type.
+- **`StrPropertyData`** (FString): only at TOP LEVEL (not inside structs — struct
+  values are enum/internal identifiers like "Auto"/"Simple"). Filtered by
+  `IsTranslatable()` (must contain letters, not pure technical tokens).
+- **Recursive into `StructPropertyData`/`ArrayPropertyData`**: finds nested
+  `TextPropertyData` inside structs (e.g. SlateBrush children), but skips
+  `StrPropertyData` at nested levels.
+
+Output: UTF-8 JSON array of `{AssetPath, InternalPath, PropName, Value, Type, AssetClass}`.
+
+### Extract (`_extract_from_uassets`)
+Three sources, tried in order:
+
+1. **`.pak` files** (legacy): read via `parsers/pak.py`, extract `.uasset` entries.
+2. **`.utoc`/`.ucas` IoStore** (modern): `retoc list` finds `.uasset` entries,
+   `retoc to-legacy` assembles proper `.uasset` files (requires `global.utoc`+`global.ucas`
+   from the game's `FactoryGame/Content/Paks/`). Symlinks for globals (huge files,
+   no copy). Each mod gets its own temp dir.
+3. **Fallback**: if paks and utocs yield 0 strings, try uassets directly.
+
+`_extract_from_uassets` ALWAYS runs (not just as fallback) — a mod with locres
+in one path may have uasset TextProperty strings in another.
+
+### Inject (`_inject_into_uassets`)
+Generates ContentLib JSON patch files. **Cache-aware**: uses extraction cache
+from the same run (avoids re-running `retoc to-legacy` during inject).
+
+ContentLib patch format (verified against docs.ficsit.app):
+```
+//Game/Mods/ModName/AssetName.AssetName_C
+{
+    "Name": "Translated display name",
+    "Description": "Translated description"
+}
+```
+
+The `//` comment line is the patch target (full Blueprint class path). The JSON
+body uses standard ContentLib fields. **Unknown property names are SKIPPED**
+(not injected as raw keys) — prevents injecting enum values like "Auto"/"Simple"
+that aren't valid ContentLib fields.
+
+Mapped fields: `mDisplayName` → `Name`, `mDescription` → `Description`,
+`mTooltip` → `Tooltip`, `mFlavor`/`mLongDescription` → `LongDescription`,
+`mPreUnlockDisplayName`, `mPreUnlockDescription`, `mPostUnlockDescription`.
+
+Patch files go to `FactoryGame/Configs/ContentLib/{ItemPatches,RecipePatches}/`.
+Registered in `.interprex_backups/metadata.json` as `type: created` for
+clean removal on backup restore.
+
+### `detect_mods` and game root resolution
+When the user selects `FactoryGame/Mods` in mods mode, the sidecar needs the
+**game root** (parent containing `FactoryGame/`) for:
+- `global.utoc`/`global.ucas` in `FactoryGame/Content/Paks/`
+- Relative paths for ContentLib patch output
+
+`detect_mods` in `main.py` walks up from the mods directory to find the parent
+that contains `FactoryGame/`. The computed `game_root` is returned to the frontend
+and used for all extract/inject calls. The frontend stores it in `gameRoot` state.
+
+### Tested on real mods
+Verified extract + inject + backup/restore on 17 Satisfactory mods (805 strings):
+AltRecipeResearch (232), MkPlus (152), GameFeatures locres (144), AB_FluidExtras
+locres (102), Architecture04 (75), LoadBalancers (54), InfiniteNudge locres (42),
+SpaceMarket (24), SpaceShip (22), UniversalMachine (15), bbladerunners (14),
+MultidimensionalFactory (4), counter (6), MinerMk5 (2), InstantCraftBench (2),
+extremewpump (1), RePan_Petroleum (0). 431 ContentLib patches generated. All
+backup/restore cycles clean.
+
 ## Ren'Py native `tl/` format — DONE (see `parsers/renpy.py`)
 
 `inject()` writes Ren'Py's OWN translation format to `game/tl/<lang>/` as
