@@ -258,6 +258,21 @@ class TranslationScheduler:
             self.item_file[c.id] = c.file
         self._prepared_by_file = prepared_by_file
 
+        group_mode = getattr(req, "group_small_files", "auto")
+        if group_mode == "auto":
+            # Смарт-автогруппировка: включаем, если мелких файлов (менее 5 строк) как минимум 8
+            # И они составляют большую часть проекта (не менее 70% всех файлов в текущем запуске).
+            # Это предотвращает группировку сюжетных диалогов больших файлов из-за пары мелких файлов настроек.
+            small_files_count = sum(1 for items in prepared_by_file.values() if len(items) < 5)
+            self.auto_group_small_files = (
+                small_files_count >= 8
+                and small_files_count >= len(prepared_by_file) * 0.7
+            )
+        elif group_mode == "on":
+            self.auto_group_small_files = True
+        else:
+            self.auto_group_small_files = False
+
         # --- worker → key assignment --------------------------------------------
         # Grouped: keys[i // threads]. Killing a key then cleanly retires that
         # key's whole worker group and reclaims their strings to a surviving key.
@@ -459,21 +474,65 @@ class TranslationScheduler:
                         return (_DONE, None)
                     return (_REST, None)
 
-                fname, items = self._next_file_locked()
-                if items is None:
-                    self.cond.wait(timeout=0.5)
-                    continue
+                if self.auto_group_small_files:
+                    # Собираем кандидатов из разных файлов
+                    candidates = []  # список кортежей (fname, item)
+                    budget = cal.input_budget(self.window, req.glossary)
+                    used = 0
+                    max_b = req.max_batch_size
 
-                # Token-pack one batch from the front of this file; never mix files.
-                end = cal.next_batch(items, self.window, req.glossary, 0,
-                                     req.max_batch_size)
-                while (end) > 1 and self._overflows_exact(cal, items[:end], worker_key):
-                    end = end // 2
-                batch = items[:end]
-                del items[:end]
-                if not items:
-                    # Keep the key in the map but emptied; cleaned lazily.
-                    pass
+                    for fn, its in self.pool.items():
+                        for it in its:
+                            if len(candidates) >= max_b:
+                                break
+                            cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                            if len(candidates) > 0 and used + cost > budget:
+                                break
+                            used += cost
+                            candidates.append((fn, it))
+                        if len(candidates) >= max_b:
+                            break
+
+                    if not candidates:
+                        self.cond.wait(timeout=0.5)
+                        continue
+
+                    # Проверяем overflows_exact и уменьшаем кандидатов, если нужно
+                    while len(candidates) > 1:
+                        items_only = [x[1] for x in candidates]
+                        if self._overflows_exact(cal, items_only, worker_key):
+                            candidates = candidates[:len(candidates) // 2]
+                        else:
+                            break
+
+                    # Сгруппируем удаление из pool по файлам
+                    remove_counts = {}
+                    for fn, it in candidates:
+                        remove_counts[fn] = remove_counts.get(fn, 0) + 1
+
+                    for fn, count in remove_counts.items():
+                        del self.pool[fn][:count]
+                        if not self.pool[fn]:
+                            del self.pool[fn]
+
+                    batch = [x[1] for x in candidates]
+                    fname = candidates[0][0]
+                else:
+                    fname, items = self._next_file_locked()
+                    if items is None:
+                        self.cond.wait(timeout=0.5)
+                        continue
+
+                    # Token-pack one batch from the front of this file; never mix files.
+                    end = cal.next_batch(items, self.window, req.glossary, 0,
+                                         req.max_batch_size)
+                    while (end) > 1 and self._overflows_exact(cal, items[:end], worker_key):
+                        end = end // 2
+                    batch = items[:end]
+                    del items[:end]
+                    if not items:
+                        # Keep the key in the map but emptied; cleaned lazily.
+                        pass
                 self.in_flight += 1
                 self.in_flight_workers.add(worker_idx)
                 # Hand this worker its own batch ticket so its grid card shows a

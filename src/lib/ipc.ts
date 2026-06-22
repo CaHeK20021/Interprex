@@ -116,6 +116,7 @@ export interface SidecarTranslateReq {
   engine?: string;
   // "smooth" | "pixel" — measure UI-fit against the same font inject will write.
   font_style?: string;
+  group_small_files?: string;
   items: { id: string; text: string; context: string; file: string; path?: string[] }[];
 }
 

@@ -30,6 +30,7 @@ const KEYS = {
   // Proxy URL, stored globally (not per-provider): after an autocheck a direct
   // provider's base_url is cleared, so the URL itself must persist here.
   proxyUrl: "interprex.proxyUrl",
+  groupSmallFiles: "interprex.groupSmallFiles",
 } as const;
 
 /** Read a stored string, or `fallback` if absent / storage unavailable. */

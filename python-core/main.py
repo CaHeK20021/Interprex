@@ -205,6 +205,7 @@ class TranslateReq(BaseModel):
     # SAME font inject will write ("smooth" Noto vs "pixel" bitmap) so the budget
     # matches what the player sees. Ren'Py menu choices only.
     font_style: str = "smooth"
+    group_small_files: str = "auto"
 
 
 # Default window when the UI doesn't constrain it (cloud models, big local ones).

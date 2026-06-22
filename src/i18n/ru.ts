@@ -68,6 +68,11 @@ const ru: Strings = {
   modelBadKey: "ключ отклонён — моделей для него нет",
   maxBatchSize: "Размер пакета",
   maxBatchSizeHint: "Максимальное количество строк, отправляемых в одном запросе к API",
+  groupSmallFiles: "Группировать мелкие файлы",
+  groupSmallFilesHint: "Смарт-группировка фрагментированных файлов. Авто: объединяет батчи, если есть 8+ файлов с менее чем 5 строками. Вкл: объединять всегда. Выкл: переводить пофайлово.",
+  groupSmallFilesAuto: "Автоматически",
+  groupSmallFilesOn: "Всегда включено",
+  groupSmallFilesOff: "Выключено",
   onlyFreeModels: "Только бесплатные",
   threads: "Потоки",
   threadsHint:

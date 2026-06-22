@@ -61,6 +61,7 @@ export interface TranslateOptions {
   /** Font style for UI-width fitting — measure against the same font inject will
    *  write ("smooth" Noto vs "pixel" bitmap). Ren'Py menu choices only. */
   fontStyle?: string;
+  groupSmallFiles?: string;
 }
 
 /**
@@ -95,6 +96,7 @@ export async function translateBatch(
       root: opts.root ?? "",
       engine: strings[0]?.engine ?? "",
       font_style: opts.fontStyle ?? "smooth",
+      group_small_files: opts.groupSmallFiles ?? "auto",
       items: strings.map((s) => ({
         id: s.id,
         text: s.original,

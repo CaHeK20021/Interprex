@@ -2411,6 +2411,8 @@ export default function App() {
           />
         </label>
 
+
+
         {/* Server URL: shown for local servers (default-backed) and Kaggle
             (ngrok URL, required, no default). Hidden for pure-cloud (Gemini). */}
         {(!providerInfo.needsKey || providerInfo.needsUrl) && (

@@ -70,6 +70,11 @@ const en = {
   modelBadKey: "key rejected — no models for this key",
   maxBatchSize: "Batch size",
   maxBatchSizeHint: "Maximum strings to send in a single API request",
+  groupSmallFiles: "Optimize small files",
+  groupSmallFilesHint: "Smart batching for fragmented files. Auto: merges batches if there are 8+ files with under 5 strings. On: always merge. Off: translate file-by-file.",
+  groupSmallFilesAuto: "Auto (Recommended)",
+  groupSmallFilesOn: "Always On",
+  groupSmallFilesOff: "Off",
   onlyFreeModels: "Only free models",
   threads: "Threads",
   threadsHint:
