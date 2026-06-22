@@ -4,6 +4,7 @@ import {
   ping,
   detectEngine,
   extractStrings,
+  extractStreaming,
   injectStrings,
   listModels,
   getBackupStatus,
@@ -281,6 +282,9 @@ export default function App() {
   const [root, setRoot] = useState<string | null>(null);
   const [engine, setEngine] = useState<Engine | null>(null);
   const [strings, setStrings] = useState<TranslationString[]>([]);
+  // Mod sub_paths whose streaming extract has completed this run. Used to clear
+  // the per-mod "calculating…" state as each mod's strings land (live counter).
+  const [extractedModPaths, setExtractedModPaths] = useState<Set<string>>(new Set());
   const [project, setProject] = useState<ProjectFile | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [hasBackup, setHasBackup] = useState<boolean>(false);
@@ -776,6 +780,7 @@ export default function App() {
     if (!activeDir) return;
     if (paths.length === 0) {
       setStrings([]);
+      setExtractedModPaths(new Set());
       setProject(null);
       setEngine(null);
       setFilterHiddenModPaths(new Set());
@@ -806,9 +811,24 @@ export default function App() {
 
     try {
       setPhase("extracting");
-      // Extract only from the selected sub-paths
-      const { strings: extracted } = await extractStrings(activeDir, detected, paths);
+      // Stream extraction per mod so each mod's counter lights up as it finishes,
+      // instead of all of them waiting for the whole run. Strings accumulate
+      // incrementally; the project merge happens once on the final full array.
+      setStrings([]);
+      setExtractedModPaths(new Set());
+      const { strings: extracted } = await extractStreaming(
+        activeDir, detected, paths,
+        (ev) => {
+          setStrings((prev) => [...prev, ...ev.strings]);
+          setExtractedModPaths((prev) => {
+            const next = new Set(prev);
+            next.add(ev.path);
+            return next;
+          });
+        },
+      );
       const proj = mergeStrings(await loadProject(activeDir, detected), extracted);
+      // Replace the accumulated array with the authoritative final one (dedup-safe).
       setStrings(extracted);
       setProject(proj);
       const { has_backup } = await getBackupStatus(activeDir);
@@ -2536,7 +2556,12 @@ export default function App() {
               const isDisabled = !hasStrings;
               const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
 
-              const isCurrentlyExtracting = phase === "extracting" && selectedModPaths.includes(mod.path);
+              // "calculating…" only until THIS mod's streamed strings have landed;
+              // once it's in extractedModPaths its real counter shows immediately.
+              const isCurrentlyExtracting =
+                phase === "extracting" &&
+                selectedModPaths.includes(mod.path) &&
+                !extractedModPaths.has(mod.path);
 
               let statusText = t("statusNoStrings");
               let statusClass = "status-empty";

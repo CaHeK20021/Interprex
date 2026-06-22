@@ -1011,6 +1011,9 @@ def calculate_code_hash() -> str:
 # Версия формата/логики кэша извлечения. Бампайте её при обновлении парсеров,
 # чтобы принудительно сбросить кэш у пользователей и запустить повторное извлечение.
 EXTRACT_CACHE_VERSION = 1
+# Separate version for the per-mod streaming cache (mod_extract_cache.json) so it
+# can be invalidated independently of the whole-project extract_cache.json.
+MOD_EXTRACT_CACHE_VERSION = 1
 
 
 @app.post("/extract")
@@ -1083,6 +1086,160 @@ def extract(req: ExtractReq) -> dict:
             logger.warning(f"Failed to save extract cache: {e}")
             
     return {"strings": strings}
+
+
+def _mod_cache_path(root: str) -> str:
+    return os.path.join(root, "Interprex", "mod_extract_cache.json")
+
+
+def _load_mod_cache(root: str) -> dict:
+    """Read the per-mod extract cache ({mod_path: {source_hash, code_hash,
+    cache_version, strings}}). Returns {} on any problem."""
+    try:
+        p = _mod_cache_path(root)
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.warning(f"Failed to load mod extract cache: {e}")
+    return {}
+
+
+def _save_mod_cache(root: str, cache: dict) -> None:
+    """Atomically write the per-mod extract cache (temp file + os.replace, with
+    PermissionError retries — mirrors the /extract cache writer)."""
+    try:
+        p = _mod_cache_path(root)
+        cache_dir = os.path.dirname(p)
+        os.makedirs(cache_dir, exist_ok=True)
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", dir=cache_dir, prefix="tmp_modcache_",
+                                         delete=False, encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+            temp_path = f.name
+        import time
+        for attempt, delay in enumerate((0.1, 0.2, 0.4, 0.8)):
+            try:
+                os.replace(temp_path, p)
+                break
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(delay)
+    except Exception as e:
+        logger.warning(f"Failed to save mod extract cache: {e}")
+
+
+def _extract_stream(req: ExtractReq):
+    """NDJSON stream: one event per mod (sub_path) as its strings become ready, so
+    the UI can light up each mod's counter incrementally instead of waiting for the
+    whole run. Falls back to a single whole-root extract when no sub_paths are given.
+
+    Per-mod cache: each mod's strings are cached in Interprex/mod_extract_cache.json
+    keyed by (source_hash of that mod's folder + code_hash + cache_version). A
+    cache hit is emitted INSTANTLY; misses run real extraction in a thread pool.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    parser = get_parser(req.engine)
+    mods = list(req.sub_paths or [])
+
+    # No mod selection -> behave like /extract (single whole-root pass), but still
+    # stream a single mod-event + done so the client path is uniform.
+    if not mods:
+        try:
+            strings = [s.to_dict() for s in parser.extract(req.root, None)]
+        except Exception as e:
+            logger.error(f"extract_stream whole-root failed: {e}")
+            strings = []
+        yield json.dumps({"type": "mod", "path": "", "strings": strings,
+                          "done_mods": 1, "total_mods": 1, "cached": False},
+                         ensure_ascii=False) + "\n"
+        yield json.dumps({"type": "done", "strings": strings},
+                         ensure_ascii=False) + "\n"
+        return
+
+    code_hash = ""
+    try:
+        code_hash = calculate_code_hash()
+    except Exception as e:
+        logger.error(f"Failed to calculate code hash: {e}")
+
+    cache = _load_mod_cache(req.root)
+    total = len(mods)
+    all_strings: list[dict] = []
+    done = 0
+
+    def mod_source_hash(mod_path: str) -> str:
+        mod_full = os.path.join(req.root, *mod_path.split("/"))
+        try:
+            return calculate_source_hash(mod_full)
+        except Exception:
+            return ""
+
+    def real_extract(mod_path: str) -> list[dict]:
+        return [s.to_dict() for s in parser.extract(req.root, [mod_path])]
+
+    # 1. Split mods into cache hits vs misses. Emit hits FIRST (instant), so
+    #    already-known mods light up immediately while misses are still crunching.
+    misses: list[tuple[str, str]] = []  # (mod_path, fresh_source_hash)
+    for mod_path in mods:
+        sh = mod_source_hash(mod_path)
+        entry = cache.get(mod_path)
+        if (entry and sh and entry.get("source_hash") == sh
+                and entry.get("code_hash") == code_hash
+                and entry.get("cache_version") == MOD_EXTRACT_CACHE_VERSION
+                and "strings" in entry):
+            done += 1
+            all_strings.extend(entry["strings"])
+            yield json.dumps({"type": "mod", "path": mod_path,
+                              "strings": entry["strings"], "done_mods": done,
+                              "total_mods": total, "cached": True},
+                             ensure_ascii=False) + "\n"
+        else:
+            misses.append((mod_path, sh))
+
+    # 2. Run misses in parallel; emit each as it finishes; update the cache.
+    if misses:
+        max_workers = min(len(misses), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(real_extract, mp): (mp, sh) for mp, sh in misses}
+            for fut in as_completed(futures):
+                mod_path, sh = futures[fut]
+                err = None
+                try:
+                    strings = fut.result()
+                except Exception as e:
+                    strings = []
+                    err = str(e)
+                    logger.error(f"extract_stream mod {mod_path} failed: {e}")
+                done += 1
+                all_strings.extend(strings)
+                if err is None and sh:
+                    cache[mod_path] = {
+                        "source_hash": sh,
+                        "code_hash": code_hash,
+                        "cache_version": MOD_EXTRACT_CACHE_VERSION,
+                        "strings": strings,
+                    }
+                evt = {"type": "mod", "path": mod_path, "strings": strings,
+                       "done_mods": done, "total_mods": total, "cached": False}
+                if err is not None:
+                    evt["error"] = err
+                yield json.dumps(evt, ensure_ascii=False) + "\n"
+        _save_mod_cache(req.root, cache)
+
+    yield json.dumps({"type": "done", "strings": all_strings},
+                     ensure_ascii=False) + "\n"
+
+
+@app.post("/extract_stream")
+def extract_stream(req: ExtractReq) -> StreamingResponse:
+    # NDJSON: one "mod" event per sub_path as it completes, then a final "done".
+    return StreamingResponse(_extract_stream(req),
+                             media_type="application/x-ndjson")
 
 
 @app.post("/inject")

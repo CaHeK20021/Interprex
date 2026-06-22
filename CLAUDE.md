@@ -738,6 +738,49 @@ Three sources, tried in order:
 `_extract_from_uassets` ALWAYS runs (not just as fallback) — a mod with locres
 in one path may have uasset TextProperty strings in another.
 
+**Which uassets to run the extractor on — CONTENT-gate, not filename
+(`_is_translatable_uasset`, `unreal4_5.py`).** The old gate was a filename/folder
+whitelist (`Build_`/`Desc_`/`Recipe_`/`Schem_`/`Rec_` prefixes, or `recipes/items/
+buildable/schematics` folders). It UNDER-matched and silently dropped text-bearing
+assets named off-pattern: a buildable named `MegaPump` (no `Build_` prefix), item
+buffers `Glass_Buffer`/`B_Berry`, and entire mods whose assets sit at `Content/`
+root with no recognised folder (BigStorageTank → 0 strings extracted). Fix: gate on
+CONTENT — `_uasset_has_text(data)` scans the raw `.uasset` bytes for a translatable
+FName marker (`mDisplayName`/`mDescription`/`mTooltip`/`mFlavor`/`mLongDescription`/
+`mPreUnlock*`/`mPostUnlock*`/...; ASCII in the name table). Pass the bytes:
+`_is_translatable_uasset(path, data)`. This is BOTH more accurate (catches off-name
+assets) AND faster (a cheap byte substring skips meshes/audio/icons before spawning
+the heavy C# extractor). The filename heuristic is kept only as a `data is None`
+fallback. Verified on BigStorageTank: 0 → 9 strings ("Mega Pipeline Pump", "Glass
+Pool Fluid Buffer", etc.).
+
+**`retoc info` takes a POSITIONAL path** (`info <PATH>`), NOT `--path` (unlike
+`list`/`get` which accept `--path`). `_detect_ue_version` used `--path` → errored →
+UE version always fell back to UE5_4 (fine for UE5_4 mods, wrong for UE5_5/5_6).
+
+### Streaming extract — live per-mod counter (`/extract_stream`, `_extract_stream`)
+The mods table shows each mod's string counter as soon as THAT mod is done, instead
+of all mods waiting for the whole run. `/extract` (`callPython`, one blocking call,
+returns all strings at once) is kept for the non-mod whole-folder path; the mod path
+uses `/extract_stream` (`StreamingResponse`, NDJSON, mirrors `/translate`):
+- One `{"type":"mod","path","strings","done_mods","total_mods","cached"}` event per
+  `sub_path` as it finishes (parallel `ThreadPoolExecutor` over mods; cache hits
+  emitted FIRST, instantly), then a final `{"type":"done","strings":[all]}`.
+- Frontend: `extractStreaming()` (`ipc.ts`, mirrors `translateViaSidecar`'s reader/
+  NDJSON loop) → `scanSelectedMods` (`App.tsx`) does `setStrings(prev=>[...prev,
+  ...ev.strings])` per mod and tracks `extractedModPaths` (a `Set`) so each mod's
+  "calculating…" clears the moment its strings land. The table's per-mod `total/
+  translated` is already recomputed from `strings` each render. Final `mergeStrings`
+  + `setProject` run once on the authoritative `done` array.
+- **Per-mod extract cache** (`Interprex/mod_extract_cache.json`, const
+  `MOD_EXTRACT_CACHE_VERSION`): keyed per mod by `calculate_source_hash(<mod dir>)`
+  + `calculate_code_hash()` + version. The whole-project `extract_cache.json` only
+  caches when `sub_paths` is empty (so mod selection never hit it); this fills that
+  gap — a re-scan of unchanged mods is instant (~0.09s vs seconds), counters light
+  up immediately. `code_hash` invalidates on any sidecar code change (so the
+  filter/CDO fixes correctly force a re-extract). Atomic write (temp + `os.replace`
+  with PermissionError retries, same as `/extract`).
+
 ### Inject (`_inject_into_uassets`) — VERIFIED against the engine oracle
 Generates ContentLib JSON patch files. **Cache-aware**: uses extraction cache
 from the same run (avoids re-running `retoc to-legacy` during inject).

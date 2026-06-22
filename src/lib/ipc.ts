@@ -56,6 +56,79 @@ export function extractStrings(
   return callPython("extract", { root, engine, sub_paths: subPaths || [] });
 }
 
+/** One mod's worth of extracted strings from the streaming endpoint. */
+export interface ExtractModEvent {
+  path: string; // the mod's sub_path ("" for a whole-root pass)
+  strings: TranslationString[];
+  doneMods: number; // mods finished so far (incl. this one)
+  totalMods: number;
+  cached: boolean; // true if served from the per-mod cache (instant)
+  error?: string; // set if extraction of this mod failed (strings will be [])
+}
+
+/**
+ * Streaming extract: the sidecar emits one event per mod (sub_path) as its
+ * strings become ready, so the UI can light up each mod's counter incrementally
+ * instead of waiting for the whole run. `onMod` fires per mod; the resolved value
+ * is the full flattened strings array (from the final "done" event). Same HTTP
+ * seam as callPython, but reads the NDJSON body directly (mirrors
+ * translateViaSidecar).
+ */
+export async function extractStreaming(
+  root: string,
+  engine: Engine,
+  subPaths: string[],
+  onMod?: (ev: ExtractModEvent) => void,
+  signal?: AbortSignal,
+): Promise<{ strings: TranslationString[] }> {
+  const res = await fetch(`${BASE}/extract_stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ root, engine, sub_paths: subPaths || [] }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`sidecar extract_stream failed (${res.status}): ${detail}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let all: TranslationString[] = [];
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const evt = JSON.parse(trimmed);
+    if (evt.type === "mod") {
+      onMod?.({
+        path: evt.path,
+        strings: evt.strings ?? [],
+        doneMods: evt.done_mods ?? 0,
+        totalMods: evt.total_mods ?? 0,
+        cached: evt.cached ?? false,
+        error: evt.error,
+      });
+    } else if (evt.type === "done") {
+      all = evt.strings ?? [];
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf("\n")) !== -1) {
+      handleLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+    }
+  }
+  if (buffer.trim()) handleLine(buffer); // last line may arrive without a newline
+  return { strings: all };
+}
+
 /** Write translations back into the engine files. */
 export function injectStrings(
   root: string,
