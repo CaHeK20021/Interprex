@@ -812,7 +812,9 @@ def detect_mods(req: DetectModsReq) -> dict:
         candidate = parent
 
     # 2. Load project file (if any) to look up translations
-    project_path = os.path.join(root, ".interprex", "project.json")
+    project_path = os.path.join(root, "Interprex", "project.json")
+    if not os.path.isfile(project_path):
+        project_path = os.path.join(root, ".interprex", "project.json")
     project_data = {}
     if os.path.isfile(project_path):
         try:

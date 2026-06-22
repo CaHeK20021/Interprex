@@ -1724,7 +1724,8 @@ export default function App() {
       const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
       result = result.filter((s) => {
         if (justTranslatedIds.has(s.id)) return true;
-        const strAbs = norm(`${gameRoot}/${s.file}`);
+        const filePath = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
+        const strAbs = norm(`${gameRoot}/${filePath}`);
         // Check if this string belongs to any HIDDEN mod
         const isHidden = Array.from(filterHiddenModPaths).some((hiddenPath) => {
           const modAbs = norm(`${modsDir}/${hiddenPath}`);
@@ -2573,7 +2574,8 @@ export default function App() {
                 const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
                 const modAbs = norm(`${modsDir || ""}/${mod.path}`);
                 const modStrings = strings.filter((str) => {
-                  const strAbs = norm(`${gameRoot || ""}/${str.file}`);
+                  const filePath = str.file.startsWith("uasset://") ? str.file.substring(9) : str.file;
+                  const strAbs = norm(`${gameRoot || ""}/${filePath}`);
                   return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
                 });
                 total = modStrings.length;
