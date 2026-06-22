@@ -44,6 +44,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import os
+import hashlib
 
 def _run_cmd(args, **kwargs):
     if os.name == 'nt':
@@ -54,6 +55,94 @@ import re
 import functools
 
 from .base import BaseParser, TranslationString
+
+# Security limits
+MAX_UASSET_SIZE = int(1.2 * 1024 * 1024 * 1024)  # 1.2 GB
+
+
+def _sanitize_extracted_path(tmp_output: Path, file_path: Path) -> str | None:
+    """Return the relative path of file_path inside tmp_output, or None if it escapes."""
+    try:
+        resolved = file_path.resolve()
+        base = tmp_output.resolve()
+        if not str(resolved).startswith(str(base)):
+            return None  # path traversal attempt
+        return resolved.relative_to(base).as_posix()
+    except (ValueError, OSError):
+        return None
+
+
+def _mod_path_from_utoc(uf: Path, root: str) -> str:
+    """Derive the mod's relative path (e.g. 'FactoryGame/Mods/ModName') from a .utoc file path."""
+    rel = uf.relative_to(root).as_posix()
+    parts = rel.split("/")
+    for i, part in enumerate(parts):
+        if part.lower() == "content" and i > 0:
+            return "/".join(parts[:i])
+    return str(Path(rel).parent.as_posix())
+
+
+def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
+    """Module-level worker for ProcessPoolExecutor. Extracts uassets from one mod's .utoc.
+    Returns list of dicts (picklable) instead of TranslationString objects."""
+    from .base import make_id
+    uf_str, root, global_utoc_str, global_ucas_str, retoc_bin = args
+    uf = Path(uf_str)
+    global_utoc = Path(global_utoc_str)
+    global_ucas = Path(global_ucas_str)
+    results: list[dict] = []
+    mod_rel = _mod_path_from_utoc(uf, root)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_input = Path(tmp_dir) / "input"
+        tmp_output = Path(tmp_dir) / "output"
+        tmp_input.mkdir()
+        tmp_output.mkdir()
+
+        for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
+            if src.is_file():
+                try:
+                    os.symlink(str(src), str(tmp_input / name))
+                except OSError:
+                    shutil.copy2(str(src), str(tmp_input / name))
+
+        shutil.copy2(str(uf), str(tmp_input / uf.name))
+        ucas = uf.with_suffix(".ucas")
+        if ucas.is_file():
+            shutil.copy2(str(ucas), str(tmp_input / ucas.name))
+
+        ue_ver = _detect_ue_version(str(uf), retoc_bin)
+        try:
+            _run_cmd([
+                retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
+                "--version", ue_ver
+            ], check=True, capture_output=True)
+        except Exception:
+            return results
+
+        for uasset in tmp_output.rglob("*.uasset"):
+            safe_path = _sanitize_extracted_path(tmp_output, uasset)
+            if safe_path is None:
+                continue
+            if not _is_translatable_uasset(safe_path):
+                continue
+            try:
+                extracted = _run_uasset_extractor(str(uasset))
+                for item in extracted:
+                    file_key = f"uasset://{mod_rel}{PAK_SEP}{safe_path}"
+                    path_key = [item["InternalPath"], item["PropName"]]
+                    original_val = item["Value"]
+                    results.append({
+                        "id": make_id("unreal4_5", file_key, path_key, original_val),
+                        "original": original_val,
+                        "context": f"Class: {item['AssetClass']} | Property: {item['PropName']}",
+                        "file": file_key,
+                        "path": path_key,
+                        "engine": "unreal4_5",
+                    })
+            except Exception:
+                pass
+    return results
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +205,13 @@ class FStr:
 
 
 def read_fstring(buf: bytes, pos: int) -> tuple[FStr, int]:
+    if pos + 4 > len(buf):
+        raise LocresParseError(f"Buffer underflow reading FString length at offset {pos}")
     (length,) = struct.unpack_from("<i", buf, pos)
     p = pos + 4
     if length > 0:
+        if p + length > len(buf):
+            raise LocresParseError(f"Buffer underflow reading FString data at offset {p}, need {length} bytes")
         data = buf[p:p + length]
         p += length
         text = data.decode("utf-8", "replace")
@@ -126,6 +219,8 @@ def read_fstring(buf: bytes, pos: int) -> tuple[FStr, int]:
             text = text[:-1]
     elif length < 0:
         n = -length
+        if p + n * 2 > len(buf):
+            raise LocresParseError(f"Buffer underflow reading FString UTF-16 data at offset {p}, need {n * 2} bytes")
         data = buf[p:p + n * 2]
         p += n * 2
         text = data.decode("utf-16-le", "replace")
@@ -139,11 +234,14 @@ def read_fstring(buf: bytes, pos: int) -> tuple[FStr, int]:
 def encode_fstring(s: str) -> bytes:
     """Encode a (new) string the way UE does: ASCII when every char fits in 7
     bits, else UTF-16LE; the trailing null is part of the payload and the count."""
-    t = s + "\x00"
-    if all(ord(c) < 128 for c in t):
-        data = t.encode("ascii")
+    if not s:
+        return struct.pack("<i", 0)
+    if not s.endswith("\x00"):
+        s = s + "\x00"
+    if all(ord(c) < 128 for c in s):
+        data = s.encode("ascii")
         return struct.pack("<i", len(data)) + data
-    data = t.encode("utf-16-le")
+    data = s.encode("utf-16-le")
     return struct.pack("<i", -(len(data) // 2)) + data
 
 
@@ -216,10 +314,16 @@ def parse_locres(buf: bytes) -> LocresModel:
             (st_offset,) = struct.unpack_from("<q", buf, pos)
             pos += 8
 
+            # Sanity check: string table offset must be within buffer
+            if st_offset < 0 or st_offset + 4 > len(buf):
+                raise LocresParseError(f"Invalid string table offset {st_offset} (buffer size {len(buf)})")
+
             # Read the string table out-of-line, then return to the index.
             sp = st_offset
             (st_count,) = struct.unpack_from("<i", buf, sp)
             sp += 4
+            if st_count < 0 or st_count > len(buf):
+                raise LocresParseError(f"Invalid string table count {st_count}")
             string_table = []
             for _ in range(st_count):
                 val, sp = read_fstring(buf, sp)
@@ -279,8 +383,11 @@ def serialize_locres(m: LocresModel) -> bytes:
         offset_pos = len(out)
         out += b"\x00" * 8                  # placeholder int64 string-table offset
         if m.version >= V_OPTIMIZED:
-            total_keys = sum(len(ns.keys) for ns in m.namespaces)
-            out += struct.pack("<i", total_keys)
+            if m.entry_count_raw is not None:
+                out += m.entry_count_raw     # preserve original entry count bytes
+            else:
+                total_keys = sum(len(ns.keys) for ns in m.namespaces)
+                out += struct.pack("<i", total_keys)
 
     out += struct.pack("<i", len(m.namespaces))
     for ns in m.namespaces:
@@ -545,10 +652,18 @@ def _is_translatable_uasset(inner_path: str) -> bool:
 
 
 def _run_uasset_extractor(uasset_path: str) -> list[dict]:
-    """Run UAssetExtractor.exe on a single file or directory and return JSON list."""
+    """Run UAssetExtractor.exe on a single file and return JSON list."""
     import sys
     import json
-    
+
+    # Memory bomb protection: reject oversized files
+    try:
+        if os.path.getsize(uasset_path) > MAX_UASSET_SIZE:
+            logger.warning(f"Skipping oversized uasset ({os.path.getsize(uasset_path)} bytes): {uasset_path}")
+            return []
+    except OSError:
+        return []
+
     ext = ".exe" if sys.platform.startswith("win") else ""
     parser_dir = Path(__file__).resolve().parent
     core_dir = parser_dir.parent
@@ -816,6 +931,7 @@ class UnrealEngine4_5Parser(BaseParser):
                         ))
 
         # 2. Extract from .utoc/ucas files via retoc to-legacy (assembles proper .uasset files)
+        #    Each mod is processed in a separate process for true parallelism.
         try:
             retoc_bin = _find_retoc()
         except RuntimeError:
@@ -825,72 +941,25 @@ class UnrealEngine4_5Parser(BaseParser):
         global_utoc = root_path / "FactoryGame" / "Content" / "Paks" / "global.utoc"
         global_ucas = root_path / "FactoryGame" / "Content" / "Paks" / "global.ucas"
 
-        # Batch ALL mods into ONE retoc to-legacy call — avoids N slow copies of global containers.
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_input = Path(tmp_dir) / "input"
-            tmp_output = Path(tmp_dir) / "output"
-            tmp_input.mkdir()
-            tmp_output.mkdir()
+        if not utocs:
+            return
 
-            # Symlink or copy global containers once
-            for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
-                dst = tmp_input / name
-                if src.is_file():
-                    try:
-                        os.symlink(str(src), str(dst))
-                    except OSError:
-                        shutil.copy2(str(src), str(dst))
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-            # Collect all mod .utoc/.ucas into one input dir
-            utoc_map: dict[str, Path] = {}  # utoc filename -> original path (for relative lookup)
-            for uf in utocs:
-                shutil.copy2(str(uf), str(tmp_input / uf.name))
-                utoc_map[uf.name] = uf
-                ucas = uf.with_suffix(".ucas")
-                if ucas.is_file():
-                    shutil.copy2(str(ucas), str(tmp_input / ucas.name))
+        utoc_args = [
+            (str(uf), root, str(global_utoc), str(global_ucas), retoc_bin)
+            for uf in utocs
+        ]
 
-            if not utoc_map:
-                pass  # no utocs, skip
-            else:
-                # Detect UE version from first utoc
-                first_utoc = next(iter(utoc_map.values()))
-                ue_ver = _detect_ue_version(str(first_utoc), retoc_bin)
-
+        with ProcessPoolExecutor(max_workers=min(len(utocs), os.cpu_count() or 4)) as pool:
+            futures = {pool.submit(_process_utoc_worker, args): args for args in utoc_args}
+            for future in as_completed(futures):
                 try:
-                    _run_cmd([
-                        retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
-                        "--version", ue_ver, "--verbose"
-                    ], check=True, capture_output=True)
+                    dicts = future.result()
+                    for d in dicts:
+                        out.append(TranslationString(**d))
                 except Exception as e:
-                    logger.error(f"retoc to-legacy failed for batch: {e}")
-                    return
-
-                # Map extracted uassets back to their source mod
-                for extracted_uasset in tmp_output.rglob("*.uasset"):
-                    inner_path = extracted_uasset.relative_to(tmp_output).as_posix()
-                    if not _is_translatable_uasset(inner_path):
-                        continue
-                    # Compute mod_rel from the inner_path (retoc preserves directory structure)
-                    # e.g. "FactoryGame/Mods/ModName/Content/File.uasset" -> "FactoryGame/Mods/ModName"
-                    mod_rel = inner_path.rsplit("/", 1)[0] if "/" in inner_path else inner_path
-                    # Walk up to find the mod root (parent of "Content" or similar)
-                    parts = inner_path.split("/")
-                    for i, part in enumerate(parts):
-                        if part.lower() == "content" and i > 0:
-                            mod_rel = "/".join(parts[:i])
-                            break
-                    try:
-                        extracted = _run_uasset_extractor(str(extracted_uasset))
-                        for item in extracted:
-                            out.append(self._mk(
-                                file=f"uasset://{mod_rel}{PAK_SEP}{inner_path}",
-                                path=[item["InternalPath"], item["PropName"]],
-                                original=item["Value"],
-                                context=f"Class: {item['AssetClass']} | Property: {item['PropName']}"
-                            ))
-                    except Exception as e:
-                        logger.error(f"Failed to run UAssetExtractor on {inner_path}: {e}")
+                    logger.error(f"Parallel utoc extraction failed: {e}")
 
     def _target_path(self, source: Path, lang_code: str) -> Path:
         """Sibling language folder: .../Localization/<Target>/<lang>/<file>.locres.
