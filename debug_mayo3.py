@@ -1,23 +1,29 @@
-import hashlib, re
+import os
+import json
 
-what = "\u201cThe mayo in your fridge will expire tomorrow.\u201d"
+root = r"C:\Program Files (x86)\Steam\steamapps\common\Satisfactory"
+project_path = os.path.join(root, "Interprex", "project.json")
+if not os.path.exists(project_path):
+    project_path = os.path.join(root, "FactoryGame", "Mods", "Interprex", "project.json")
+if not os.path.exists(project_path):
+    # Try finding any project.json in subfolders
+    for r_dir, dirs, files in os.walk(root):
+        if "project.json" in files:
+            project_path = os.path.join(r_dir, "project.json")
+            break
 
-# New algorithm hypothesis: md5('speaker|text')
-h1 = hashlib.md5(("None|" + what).encode("utf-8")).hexdigest()[:8]
-print("md5(None|text):", h1)
+print("Found project.json path:", project_path)
 
-h2 = hashlib.md5(("|" + what).encode("utf-8")).hexdigest()[:8]
-print("md5(|text):", h2)
-
-# With encoded quotes
-h3 = hashlib.md5(('None|" ' + what + '"').encode("utf-8")).hexdigest()[:8]
-print('md5(None|"text"):', h3)
-
-# Original algorithm
-s = what.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
-s = re.sub(r'(?<= ) ', '\\ ', s)
-get_code = '"' + s + '"'
-digest = hashlib.md5((get_code + "\r\n").encode("utf-8")).hexdigest()[:8]
-print("Original (get_code):", digest)
-print()
-print("Target: f5004a22")
+if os.path.exists(project_path):
+    with open(project_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    strings = data.get("strings", {})
+    print(f"Total strings in project: {len(strings)}")
+    
+    # Wait, the project.json contains id -> entry. Let's see some keys
+    first_keys = list(strings.keys())[:10]
+    for k in first_keys:
+        print(k, ":", str(strings[k])[:200])
+else:
+    print("project.json not found!")

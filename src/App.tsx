@@ -201,6 +201,23 @@ function getStringType(s: TranslationString) {
   return "Обычная";
 }
 
+// Helper to get the mod name containing this TranslationString
+function getModNameForString(
+  s: TranslationString,
+  detectedMods: any[],
+  gameRoot: string | null,
+  modsDir: string | null,
+): string {
+  if (!modsDir || !gameRoot) return "—";
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+  const strAbs = norm(`${gameRoot}/${s.file}`);
+  const matchingMod = detectedMods.find((mod) => {
+    const modAbs = norm(`${modsDir}/${mod.path}`);
+    return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+  });
+  return matchingMod ? matchingMod.name : "—";
+}
+
 // Highlight foreign words inside translations, ignoring Ren'Py formatting tags and technical tokens.
 function highlightLatin(text: string, targetLang: TargetLang) {
   if (!text) return "";
@@ -352,6 +369,8 @@ export default function App() {
   const [justTranslatedIds, setJustTranslatedIds] = useState<Set<string>>(new Set());
   // Filter strings by source type: all, regular strings (say, screen, define), python (uscore), or none
   const [stringTypeFilter, setStringTypeFilter] = useState<"all" | "regular" | "python" | "none">("all");
+  // In mods mode: set of mod paths to hide from the table list
+  const [filterHiddenModPaths, setFilterHiddenModPaths] = useState<Set<string>>(new Set());
   // Zero-based index of the visible table page (PAGE_SIZE rows each).
   const [page, setPage] = useState(0);
 
@@ -424,6 +443,7 @@ export default function App() {
     setSearchMode("all");
     setStringTypeFilter("all");
     setOnlyLatinInTranslation(false);
+    setFilterHiddenModPaths(new Set());
     setJustTranslatedIds(new Set()); // Clear pinned/highlighted translations
     setPage(0);
   };
@@ -433,6 +453,7 @@ export default function App() {
     if (searchMode !== "all") count++;
     if (stringTypeFilter !== "all") count++;
     if (onlyLatinInTranslation) count++;
+    if (translationMode === "mods" && filterHiddenModPaths.size > 0) count++;
     return count;
   };
 
@@ -492,7 +513,9 @@ export default function App() {
   // Themed in-app folder browser: which picker is open (null = closed). The kind
   // decides whether the chosen path feeds the game or the mods flow.
   const [folderPickerKind, setFolderPickerKind] = useState<null | "game" | "mods">(null);
-  const [translationMode, setTranslationMode] = useState<"game" | "mods">("game");
+  const [translationMode, setTranslationMode] = useState<"game" | "mods">(() => loadSetting("lastFolderMode", "game") as "game" | "mods");
+  const [saveLastGameFolder, setSaveLastGameFolder] = useState<boolean>(() => loadSetting("saveLastGameFolder", "true") === "true");
+  const [saveLastModsFolder, setSaveLastModsFolder] = useState<boolean>(() => loadSetting("saveLastModsFolder", "true") === "true");
   const [modsDir, setModsDir] = useState<string | null>(null);
   const [gameRoot, setGameRoot] = useState<string | null>(null);
   const [detectedMods, setDetectedMods] = useState<ModInfo[]>([]);
@@ -506,6 +529,40 @@ export default function App() {
   const [proxyChecking, setProxyChecking] = useState(false);
   const [proxyCheckResults, setProxyCheckResults] =
     useState<Record<string, ProxyAutocheckResult> | null>(null);
+  const changeTranslationMode = (mode: "game" | "mods") => {
+    if (busy) return;
+    setTranslationMode(mode);
+    saveSetting("lastFolderMode", mode);
+    
+    // Clear all current states first
+    setRoot(null);
+    setModsDir(null);
+    setGameRoot(null);
+    setEngine(null);
+    setStrings([]);
+    setProject(null);
+    setDetectedMods([]);
+    setSelectedModPaths([]);
+    setHasBackup(false);
+    setPage(0);
+    setError(null);
+
+    // Auto-load saved folder for the selected mode if preferred
+    if (mode === "game") {
+      const shouldSave = loadSetting("saveLastGameFolder", "true") === "true";
+      const saved = loadSetting("lastGameFolder", "");
+      if (shouldSave && saved) {
+        pickFolder(saved);
+      }
+    } else {
+      const shouldSave = loadSetting("saveLastModsFolder", "true") === "true";
+      const saved = loadSetting("lastModsFolder", "");
+      if (shouldSave && saved) {
+        pickModsFolder(saved);
+      }
+    }
+  };
+
   const [pythonLogs, setPythonLogs] = useState<string[]>([]);
   const [pythonTranslating, setPythonTranslating] = useState(false);
   const [pythonLogsOpen, setPythonLogsOpen] = useState(false);
@@ -554,6 +611,22 @@ export default function App() {
         // re-decide direct-vs-proxy silently and re-apply per provider.
         const savedProxy = loadSetting("proxyUrl", "");
         if (savedProxy) void runProxyAutocheck(savedProxy, true);
+
+        // Auto-load last folder if preferred
+        const mode = loadSetting("lastFolderMode", "game") as "game" | "mods";
+        if (mode === "game") {
+          const shouldSave = loadSetting("saveLastGameFolder", "true") === "true";
+          const saved = loadSetting("lastGameFolder", "");
+          if (shouldSave && saved) {
+            pickFolder(saved);
+          }
+        } else {
+          const shouldSave = loadSetting("saveLastModsFolder", "true") === "true";
+          const saved = loadSetting("lastModsFolder", "");
+          if (shouldSave && saved) {
+            pickModsFolder(saved);
+          }
+        }
       }
     });
   }, []);
@@ -736,6 +809,7 @@ export default function App() {
       setStrings([]);
       setProject(null);
       setEngine(null);
+      setFilterHiddenModPaths(new Set());
       return;
     }
 
@@ -787,6 +861,7 @@ export default function App() {
     setPage(0);
     setDetectedMods([]);
     setSelectedModPaths([]);
+    setFilterHiddenModPaths(new Set());
 
     try {
       setPhase("detecting");
@@ -802,6 +877,11 @@ export default function App() {
       }
       saveSetting("lastFolderMode", "mods");
       saveSetting("lastFolder", picked);
+      if (saveLastModsFolder) {
+        saveSetting("lastModsFolder", picked);
+      } else {
+        saveSetting("lastModsFolder", "");
+      }
 
       // select only mods that have strings by default
       const defaultPaths = res.mods
@@ -867,6 +947,11 @@ export default function App() {
       }
       saveSetting("lastFolderMode", "game");
       saveSetting("lastFolder", picked);
+      if (saveLastGameFolder) {
+        saveSetting("lastGameFolder", picked);
+      } else {
+        saveSetting("lastGameFolder", "");
+      }
       setEngine(detected);
       setPhase("extracting");
       const { strings: extracted } = await extractStrings(picked, detected);
@@ -1634,6 +1719,21 @@ export default function App() {
   const filteredStrings = useMemo(() => {
     let result = strings;
 
+    // Filter by mod paths if in mods mode and some mods are hidden
+    if (translationMode === "mods" && filterHiddenModPaths.size > 0 && modsDir && gameRoot) {
+      const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        const strAbs = norm(`${gameRoot}/${s.file}`);
+        // Check if this string belongs to any HIDDEN mod
+        const isHidden = Array.from(filterHiddenModPaths).some((hiddenPath) => {
+          const modAbs = norm(`${modsDir}/${hiddenPath}`);
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+        });
+        return !isHidden;
+      });
+    }
+
     // Filter by string type (regular vs python/uscore)
     if (stringTypeFilter === "regular") {
       result = result.filter((s) => !s.path.includes("uscore") || justTranslatedIds.has(s.id));
@@ -1753,42 +1853,14 @@ export default function App() {
           <button
             className={`mode-btn ${translationMode === "game" ? "active" : ""}`}
             disabled={busy}
-            onClick={() => {
-              if (busy) return;
-              setTranslationMode("game");
-              setRoot(null);
-              setModsDir(null);
-              setGameRoot(null);
-              setEngine(null);
-              setStrings([]);
-              setProject(null);
-              setDetectedMods([]);
-              setSelectedModPaths([]);
-              setHasBackup(false);
-              setPage(0);
-              setError(null);
-            }}
+            onClick={() => changeTranslationMode("game")}
           >
             {t("modeGame")}
           </button>
           <button
             className={`mode-btn ${translationMode === "mods" ? "active" : ""}`}
             disabled={busy}
-            onClick={() => {
-              if (busy) return;
-              setTranslationMode("mods");
-              setRoot(null);
-              setModsDir(null);
-              setGameRoot(null);
-              setEngine(null);
-              setStrings([]);
-              setProject(null);
-              setDetectedMods([]);
-              setSelectedModPaths([]);
-              setHasBackup(false);
-              setPage(0);
-              setError(null);
-            }}
+            onClick={() => changeTranslationMode("mods")}
           >
             {t("modeMods")}
           </button>
@@ -1931,13 +2003,53 @@ export default function App() {
 
       <div className="controls">
         {translationMode === "game" ? (
-          <button onClick={() => setFolderPickerKind("game")} disabled={busy}>
-            {t("openFolder")}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button onClick={() => setFolderPickerKind("game")} disabled={busy}>
+              {t("openFolder")}
+            </button>
+            <label className="save-path-checkbox" title="Сохранять выбранный путь к игре для автоматического открытия">
+              <input
+                type="checkbox"
+                checked={saveLastGameFolder}
+                onChange={(e) => {
+                  const val = e.target.checked;
+                  setSaveLastGameFolder(val);
+                  saveSetting("saveLastGameFolder", String(val));
+                  if (!val) {
+                    saveSetting("lastGameFolder", "");
+                  } else if (root) {
+                    saveSetting("lastGameFolder", root);
+                  }
+                }}
+                disabled={busy}
+              />
+              <span>Запоминать путь</span>
+            </label>
+          </div>
         ) : (
-          <button onClick={() => setFolderPickerKind("mods")} disabled={busy}>
-            {t("openModsFolder")}
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button onClick={() => setFolderPickerKind("mods")} disabled={busy}>
+              {t("openModsFolder")}
+            </button>
+            <label className="save-path-checkbox" title="Сохранять выбранный путь к модам для автоматического открытия">
+              <input
+                type="checkbox"
+                checked={saveLastModsFolder}
+                onChange={(e) => {
+                  const val = e.target.checked;
+                  setSaveLastModsFolder(val);
+                  saveSetting("saveLastModsFolder", String(val));
+                  if (!val) {
+                    saveSetting("lastModsFolder", "");
+                  } else if (modsDir) {
+                    saveSetting("lastModsFolder", modsDir);
+                  }
+                }}
+                disabled={busy}
+              />
+              <span>Запоминать путь</span>
+            </label>
+          </div>
         )}
         <label className="field">
           <span>{t("targetLanguage")}</span>
@@ -2003,7 +2115,7 @@ export default function App() {
             {isPaused ? t("btnResume") : t("btnPause")}
           </button>
         )}
-        {engine && <span className={`badge engine-${engine}`}>{engine}</span>}
+        {engine && <span className={`badge engine-${engine}`}>{engine === "unreal4_5" ? "unreal4/5" : engine}</span>}
         {busy && <span className="phase">{phaseLabel}…</span>}
         {hasBackup && (
           <div className="backup-group">
@@ -2452,16 +2564,37 @@ export default function App() {
           </div>
           <div className="mods-list">
             {detectedMods.map((mod) => {
-              const total = mod.total_count ?? 0;
-              const translated = mod.translated_count ?? 0;
+              const isSelected = (mod.total_count ?? 0) > 0 && selectedModPaths.includes(mod.path);
+              
+              let total = mod.total_count ?? 0;
+              let translated = mod.translated_count ?? 0;
+
+              if (isSelected && strings.length > 0) {
+                const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+                const modAbs = norm(`${modsDir || ""}/${mod.path}`);
+                const modStrings = strings.filter((str) => {
+                  const strAbs = norm(`${gameRoot || ""}/${str.file}`);
+                  return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+                });
+                total = modStrings.length;
+                translated = modStrings.filter((str) => {
+                  const entry = project?.strings[str.id];
+                  return entry && entry.translated && entry.translated.trim() !== "";
+                }).length;
+              }
+
               const hasStrings = total > 0;
-              const isSelected = hasStrings && selectedModPaths.includes(mod.path);
               const isDisabled = !hasStrings;
               const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
 
+              const isCurrentlyExtracting = phase === "extracting" && selectedModPaths.includes(mod.path);
+
               let statusText = t("statusNoStrings");
               let statusClass = "status-empty";
-              if (hasStrings) {
+              if (isCurrentlyExtracting) {
+                statusText = t("statusExtracting");
+                statusClass = "status-progress";
+              } else if (hasStrings) {
                 if (translated === 0) {
                   statusText = t("statusNotStarted");
                   statusClass = "status-todo";
@@ -2492,14 +2625,20 @@ export default function App() {
                     {mod.name}
                   </span>
                   <span className={`col-strings ${hasStrings ? `engine-${mod.engine}` : "status-empty"}`}>
-                    {hasStrings ? `${translated}/${total}` : "—"}
+                    {isCurrentlyExtracting ? (
+                      t("stringsCalculating")
+                    ) : hasStrings ? (
+                      `${translated}/${total}`
+                    ) : (
+                      "—"
+                    )}
                   </span>
                   <span className="col-progress">
                     {hasStrings ? (
                       <div className="mod-progress-wrap">
                         <div className="mod-progress-bar">
                           <div
-                            className="mod-progress-fill"
+                            className={`mod-progress-fill engine-${mod.engine || "none"}`}
                             style={{ width: `${percent}%` }}
                           />
                         </div>
@@ -2521,7 +2660,7 @@ export default function App() {
               {t("errMixedEngines")}
             </div>
           )}
-          {selectedModPaths.length === 0 && !hasMixedEngines && (
+          {selectedModPaths.length === 0 && !hasMixedEngines && phase === "idle" && (
             <div className="mods-warn">
               {t("errNoModsSelected")}
             </div>
@@ -2583,25 +2722,63 @@ export default function App() {
                   <span>Перевод</span>
                 </label>
                 
-                <div className="filter-dropdown-divider" />
+                {engine === "renpy" && (
+                  <>
+                    <div className="filter-dropdown-divider" />
+                    <div className="filter-dropdown-section-title">Тип строк:</div>
+                    <label className="filter-dropdown-item">
+                      <input
+                        type="checkbox"
+                        checked={stringTypeFilter === "regular" || stringTypeFilter === "all"}
+                        onChange={(e) => handleStringTypeCheckbox("regular", e.target.checked)}
+                      />
+                      <span>Обычные строки</span>
+                    </label>
+                    <label className="filter-dropdown-item">
+                      <input
+                        type="checkbox"
+                        checked={stringTypeFilter === "python" || stringTypeFilter === "all"}
+                        onChange={(e) => handleStringTypeCheckbox("python", e.target.checked)}
+                      />
+                      <span>Python-код</span>
+                    </label>
+                  </>
+                )}
                 
-                <div className="filter-dropdown-section-title">Тип строк:</div>
-                <label className="filter-dropdown-item">
-                  <input
-                    type="checkbox"
-                    checked={stringTypeFilter === "regular" || stringTypeFilter === "all"}
-                    onChange={(e) => handleStringTypeCheckbox("regular", e.target.checked)}
-                  />
-                  <span>Обычные строки</span>
-                </label>
-                <label className="filter-dropdown-item">
-                  <input
-                    type="checkbox"
-                    checked={stringTypeFilter === "python" || stringTypeFilter === "all"}
-                    onChange={(e) => handleStringTypeCheckbox("python", e.target.checked)}
-                  />
-                  <span>Python-код</span>
-                </label>
+                {translationMode === "mods" && selectedModsInfo.length > 0 && (
+                  <>
+                    <div className="filter-dropdown-divider" />
+                    <div className="filter-dropdown-section-title">Фильтр модов:</div>
+                    <div className="filter-dropdown-mods-list" style={{ maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column" }}>
+                      {selectedModsInfo.map((mod) => {
+                        const isHidden = filterHiddenModPaths.has(mod.path);
+                        return (
+                          <label key={mod.path} className="filter-dropdown-item">
+                            <input
+                              type="checkbox"
+                              checked={!isHidden}
+                              onChange={(e) => {
+                                setPage(0);
+                                setFilterHiddenModPaths((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.target.checked) {
+                                    next.delete(mod.path);
+                                  } else {
+                                    next.add(mod.path);
+                                  }
+                                  return next;
+                                });
+                              }}
+                            />
+                            <span title={mod.name} style={{ textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", maxWidth: "160px" }}>
+                              {mod.name}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
                 
                 <div className="filter-dropdown-divider" />
                 
@@ -2641,7 +2818,7 @@ export default function App() {
               </th>
               <th>{t("colOriginal")}</th>
               <th>{t("colTranslation")}</th>
-              <th>Тип строки</th>
+              <th>{translationMode === "mods" ? "Мод" : "Тип строки"}</th>
             </tr>
           </thead>
           <tbody>
@@ -2687,7 +2864,9 @@ export default function App() {
                     )}
                   </td>
                   <td className="where" title={`${s.file}\n${s.path.join(" › ")}`}>
-                    {getStringType(s)}
+                    {translationMode === "mods"
+                      ? getModNameForString(s, detectedMods, gameRoot, modsDir)
+                      : getStringType(s)}
                   </td>
                 </tr>
               );

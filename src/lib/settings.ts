@@ -23,6 +23,10 @@ const KEYS = {
   openrouterUsageCount: "interprex.openrouterUsageCount",
   lastFolderMode: "interprex.lastFolderMode",
   lastFolder: "interprex.lastFolder",
+  lastGameFolder: "interprex.lastGameFolder",
+  lastModsFolder: "interprex.lastModsFolder",
+  saveLastGameFolder: "interprex.saveLastGameFolder",
+  saveLastModsFolder: "interprex.saveLastModsFolder",
   // Proxy URL, stored globally (not per-provider): after an autocheck a direct
   // provider's base_url is cleared, so the URL itself must persist here.
   proxyUrl: "interprex.proxyUrl",

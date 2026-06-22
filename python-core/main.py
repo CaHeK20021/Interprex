@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 import time
+from pathlib import Path
 
 is_frozen = getattr(sys, "frozen", False)
 
@@ -767,7 +768,7 @@ def detect_mods(req: DetectModsReq) -> dict:
     
     # 1. Locate the mods directory
     mods_dir = root
-    common_subdirs = ["Mods", "BepInEx/plugins", "game/mods"]
+    common_subdirs = ["Mods", "FactoryGame/Mods", "BepInEx/plugins", "game/mods"]
     for sub in common_subdirs:
         parts = sub.split("/")
         curr = root
@@ -833,11 +834,25 @@ def detect_mods(req: DetectModsReq) -> dict:
             return 0, 0
         try:
             mod_full = os.path.join(root, *mod_rel_path.split("/")) if os.path.isdir(root) else mod_rel_path
-            for ext in (".utoc", ".pak", ".uasset", ".locres"):
-                for _ in Path(mod_full).rglob(f"*{ext}"):
-                    return 1, 1
+            p = Path(mod_full)
+            logger.info(f"count_mod_strings: root={root}, rel={mod_rel_path}, full={mod_full}, exists={p.exists()}")
+            uplugins = list(p.glob("*.uplugin"))
+            logger.info(f"uplugins found: {uplugins}")
+            for uplugin in uplugins:
+                return 0, 1
+            paks = p / "Content" / "Paks"
+            if paks.is_dir():
+                for _ in paks.rglob("*.utoc"):
+                    return 0, 1
+                for _ in paks.rglob("*.pak"):
+                    return 0, 1
+            for _ in p.rglob("*.uasset"):
+                return 0, 1
+            for _ in p.rglob("*.locres"):
+                return 0, 1
             return 0, 0
-        except Exception:
+        except Exception as e:
+            logger.error(f"count_mod_strings error: {e}")
             return 0, 0
 
     if os.path.isdir(mods_dir):
@@ -1395,6 +1410,24 @@ def gather_translation_files(root: str, engine: str, target_lang: str) -> list[s
                     files.add(rel_path)
         except Exception:
             pass
+
+    # 3. Add all files from the Interprex directory (project.json, glossary, caches, etc.)
+    interprex_dir = os.path.join(root, "Interprex")
+    if os.path.isdir(interprex_dir):
+        for dirpath, _, filenames in os.walk(interprex_dir):
+            for fname in filenames:
+                abs_path = os.path.join(dirpath, fname)
+                rel = os.path.relpath(abs_path, root).replace("\\", "/")
+                files.add(rel)
+
+    # 4. Support legacy .interprex directory if present
+    dot_interprex_dir = os.path.join(root, ".interprex")
+    if os.path.isdir(dot_interprex_dir):
+        for dirpath, _, filenames in os.walk(dot_interprex_dir):
+            for fname in filenames:
+                abs_path = os.path.join(dirpath, fname)
+                rel = os.path.relpath(abs_path, root).replace("\\", "/")
+                files.add(rel)
             
     return sorted(list(files))
 
@@ -1529,6 +1562,8 @@ def renpy_translate_python(req: RenpyPythonReq) -> StreamingResponse:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     import sys
     import uvicorn
     import threading

@@ -204,6 +204,8 @@ const en = {
   statusInProgress: "In progress",
   statusCompleted: "Done",
   statusNoStrings: "No strings",
+  statusExtracting: "Extracting",
+  stringsCalculating: "counting",
   noModsDetected: "No mods detected in this folder.",
   selectAll: "Select All",
   deselectAll: "Deselect All",

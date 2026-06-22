@@ -201,6 +201,8 @@ const ru: Strings = {
   statusInProgress: "В процессе",
   statusCompleted: "Готово",
   statusNoStrings: "Нет строк",
+  statusExtracting: "Извлечение",
+  stringsCalculating: "подсчёт",
   noModsDetected: "Моды в этой папке не обнаружены.",
   selectAll: "Выбрать все",
   deselectAll: "Снять все",

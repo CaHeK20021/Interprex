@@ -84,65 +84,72 @@ def _mod_path_from_utoc(uf: Path, root: str) -> str:
 
 def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
     """Module-level worker for ProcessPoolExecutor. Extracts uassets from one mod's .utoc.
-    Returns list of dicts (picklable) instead of TranslationString objects."""
-    from .base import make_id
+    Returns list of dicts (picklable) instead of TranslationString objects.
+    NEVER raises — returns empty list on any error to prevent pool crash."""
+    try:
+        from .base import make_id
+    except ImportError:
+        from parsers.base import make_id
     uf_str, root, global_utoc_str, global_ucas_str, retoc_bin = args
-    uf = Path(uf_str)
-    global_utoc = Path(global_utoc_str)
-    global_ucas = Path(global_ucas_str)
-    results: list[dict] = []
-    mod_rel = _mod_path_from_utoc(uf, root)
+    try:
+        uf = Path(uf_str)
+        global_utoc = Path(global_utoc_str)
+        global_ucas = Path(global_ucas_str)
+        results: list[dict] = []
+        mod_rel = _mod_path_from_utoc(uf, root)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_input = Path(tmp_dir) / "input"
-        tmp_output = Path(tmp_dir) / "output"
-        tmp_input.mkdir()
-        tmp_output.mkdir()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_input = Path(tmp_dir) / "input"
+            tmp_output = Path(tmp_dir) / "output"
+            tmp_input.mkdir()
+            tmp_output.mkdir()
 
-        for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
-            if src.is_file():
-                try:
-                    os.symlink(str(src), str(tmp_input / name))
-                except OSError:
-                    shutil.copy2(str(src), str(tmp_input / name))
+            for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
+                if src.is_file():
+                    try:
+                        os.symlink(str(src), str(tmp_input / name))
+                    except OSError:
+                        shutil.copy2(str(src), str(tmp_input / name))
 
-        shutil.copy2(str(uf), str(tmp_input / uf.name))
-        ucas = uf.with_suffix(".ucas")
-        if ucas.is_file():
-            shutil.copy2(str(ucas), str(tmp_input / ucas.name))
+            shutil.copy2(str(uf), str(tmp_input / uf.name))
+            ucas = uf.with_suffix(".ucas")
+            if ucas.is_file():
+                shutil.copy2(str(ucas), str(tmp_input / ucas.name))
 
-        ue_ver = _detect_ue_version(str(uf), retoc_bin)
-        try:
-            _run_cmd([
-                retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
-                "--version", ue_ver
-            ], check=True, capture_output=True)
-        except Exception:
-            return results
-
-        for uasset in tmp_output.rglob("*.uasset"):
-            safe_path = _sanitize_extracted_path(tmp_output, uasset)
-            if safe_path is None:
-                continue
-            if not _is_translatable_uasset(safe_path):
-                continue
+            ue_ver = _detect_ue_version(str(uf), retoc_bin)
             try:
-                extracted = _run_uasset_extractor(str(uasset))
-                for item in extracted:
-                    file_key = f"uasset://{mod_rel}{PAK_SEP}{safe_path}"
-                    path_key = [item["InternalPath"], item["PropName"]]
-                    original_val = item["Value"]
-                    results.append({
-                        "id": make_id("unreal4_5", file_key, path_key, original_val),
-                        "original": original_val,
-                        "context": f"Class: {item['AssetClass']} | Property: {item['PropName']}",
-                        "file": file_key,
-                        "path": path_key,
-                        "engine": "unreal4_5",
-                    })
+                _run_cmd([
+                    retoc_bin, "to-legacy", str(tmp_input), str(tmp_output),
+                    "--version", ue_ver
+                ], check=True, capture_output=True, timeout=60)
             except Exception:
-                pass
-    return results
+                return results
+
+            for uasset in tmp_output.rglob("*.uasset"):
+                safe_path = _sanitize_extracted_path(tmp_output, uasset)
+                if safe_path is None:
+                    continue
+                if not _is_translatable_uasset(safe_path):
+                    continue
+                try:
+                    extracted = _run_uasset_extractor(str(uasset))
+                    for item in extracted:
+                        file_key = f"uasset://{mod_rel}{PAK_SEP}{safe_path}"
+                        path_key = [item["InternalPath"], item["PropName"]]
+                        original_val = item["Value"]
+                        results.append({
+                            "id": make_id("unreal4_5", file_key, path_key, original_val),
+                            "original": original_val,
+                            "context": f"Class: {item['AssetClass']} | Property: {item['PropName']}",
+                            "file": file_key,
+                            "path": path_key,
+                            "engine": "unreal4_5",
+                        })
+                except Exception:
+                    pass
+        return results
+    except Exception:
+        return []
 
 logger = logging.getLogger(__name__)
 
@@ -629,9 +636,14 @@ def _is_satisfactory_base_game_file(root: str, file_path: Path) -> bool:
 
 
 def _is_descendant_of_any(path_str: str, parent_set: set[str]) -> bool:
-    """Check if path_str (e.g. 'FactoryGame/Mods/GameFeatures/ModA/...') starts with
-    or equals any path in parent_set."""
-    return any(path_str == p or path_str.startswith(p + "/") for p in parent_set)
+    """Check if path_str (e.g. 'FactoryGame/Mods/GameFeatures/ModA/...') starts with,
+    contains as a segment, or equals any path in parent_set."""
+    for p in parent_set:
+        if path_str == p or path_str.startswith(p + "/"):
+            return True
+        if f"/{p}/" in f"/{path_str}/":
+            return True
+    return False
 
 
 def _is_translatable_uasset(inner_path: str) -> bool:
@@ -709,15 +721,20 @@ class UnrealEngine4_5Parser(BaseParser):
 
     @staticmethod
     def detect(root: str) -> bool:
-        # Unreal signatures: if it contains any .uplugin, .pak, or .uasset, it's Unreal.
-        try:
-            for f in Path(root).rglob("*"):
-                if f.is_file() and f.suffix.lower() in (".uplugin", ".pak", ".uasset"):
-                    return True
-        except Exception:
-            pass
+        # Fast path: check common mod locations first (no full rglob)
+        r = Path(root)
+        for p in r.glob("*.uplugin"):
+            return True
+        for p in r.glob("*.pak"):
+            return True
+        for p in (r / "Content" / "Paks").rglob("*.pak"):
+            return True
+        for p in (r / "Content" / "Paks").rglob("*.utoc"):
+            return True
+        for p in r.rglob("*.uasset"):
+            return True
 
-        # Loose .locres on disk.
+        # Loose .locres on disk
         for f in iter_locres_files(root):
             try:
                 content = f.read_bytes()
@@ -725,13 +742,12 @@ class UnrealEngine4_5Parser(BaseParser):
                 continue
             if content[:16] == LOCRES_MAGIC:
                 return True
-            # Legacy (v0) files have no magic; accept if it parses cleanly.
             try:
                 parse_locres(content)
                 return True
             except Exception:
                 continue
-        # Packed: a .pak containing .locres (shipped UE4/5 games like Satisfactory).
+        # Packed: a .pak containing .locres
         from . import pak as pakmod
         for pf in iter_pak_files(root):
             try:
@@ -951,11 +967,12 @@ class UnrealEngine4_5Parser(BaseParser):
             for uf in utocs
         ]
 
-        with ProcessPoolExecutor(max_workers=min(len(utocs), os.cpu_count() or 4)) as pool:
+        max_workers = min(len(utocs), os.cpu_count() or 4)
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_process_utoc_worker, args): args for args in utoc_args}
             for future in as_completed(futures):
                 try:
-                    dicts = future.result()
+                    dicts = future.result(timeout=120)
                     for d in dicts:
                         out.append(TranslationString(**d))
                 except Exception as e:
