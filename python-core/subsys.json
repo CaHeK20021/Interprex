@@ -1,0 +1,442 @@
+[
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Constructor/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Constructor/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Smelter/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Smelter/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Assembler/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Assembler/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Foundry/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Foundry/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Manufacturer/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Manufacturer/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Packager/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Packager/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Refinery/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Refinery/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Blender/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Blender/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Extracts water from the body of water it is built on.\r\nNote: the water needs to be sufficiently deep, and rivers are generally not deep enough.\r\n\r\nDefault Extraction Rate: {Volume} m³ of water per minute.\r\nHead Lift: 10 m\r\n(Allows fluids to be transported 10 meters upwards.)",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Extracts Crude Oil when built on an oil node. Extraction rates vary based on node purity.\r\n\r\nDefault Extraction Rate: {Volume} m³ of oil per minute.\r\nHead Lift: 10 m\r\n(Allows fluids to be transported 10 meters upwards.)",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Extracts solid resources from the resource node it is built on. \r\nDefault extraction rate is {Volume} resources per minute. \r\nExtraction rate varies based on resource node purity. Outputs all extracted resources onto connected Conveyor Belts.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Activates a Resource Well by pressurizing the underground resource. Must be placed on a Resource Well.\r\nOnce activated, Resource Well Extractors can be placed on the surrounding sub-nodes to extract the resource.\r\nRequires power. Overclocking increases the output potential of the entire Resource Well.\r\n\r\nOverclocking Mode: {Mode}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Collects pressurized resources when placed on the activated sub-nodes of a Resource Well. Does not require power.\r\n\r\nDefault Extraction Rate: {Volume} m³ of fluid per minute.\r\nHead Lift: 10 m\r\n(Allows fluids to be transported 10 meters upwards.)\r\n\r\nProduction Multiplier: {Multiplier}x",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/ParticleAccelerator/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/ParticleAccelerator/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Converter/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/Converter/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/QuantumEncoder/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Production/QuantumEncoder/Description",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Burns various forms of Biomass to generate electricity for the power grid.\r\nHas a Conveyor Belt input port that allows the Biomass supply to be automated.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Burns Coal to boil Water. The steam produced rotates turbines that generate electricity for the power grid.\r\nHas Conveyor Belt and Pipeline input ports that allow the Coal and Water supply to be automated.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Burns Coal to boil Water. The steam produced rotates turbines that generate electricity for the power grid.\r\nHas Conveyor Belt and Pipeline input ports that allow the Coal and Water supply to be automated.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Consumes Fuel to generate electricity for the power grid.\r\nHas a Pipeline input port that allows the Fuel supply to be automated.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Consumes Fuel to generate electricity for the power grid.\r\nHas a Pipeline input port that allows the Fuel supply to be automated.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Consumes Nuclear Fuel Rods and Water to produce electricity for the power grid.\r\n\r\nProduces Nuclear Waste, which is extracted via the Conveyor Belt output.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Consumes Nuclear Fuel Rods and Water to produce electricity for the power grid.\r\n\r\nProduces Nuclear Waste, which is extracted via the Conveyor Belt output.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Harnesses geothermal energy to generate power. Must be built on a Geyser.\r\n\r\nCaution: Power production fluctuates.\r\nVariable Production Cycle: {Cycle}s\r\n\r\nPower Production:\r\nImpure {Value1}-{Value2} MW ({Value3} MW average)\r\nNormal {Value3}-{Value4} MW ({Value5} MW average)\r\nPure {Value5}-{Value6} MW ({Value7} MW average)",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Traverses rough terrain, including near-vertical surfaces. A fast and nimble exploration vehicle.\r\n\r\nHas {Slot} inventory slots and a built-in Crafting Bench.\r\n\r\nFuel: Any fuel type\r\nBurn rate: {Fuel} MW",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Picks up and delivers resources at Truck Stations. This process can be automated. Nicknamed 'Sugarcube' by FICSIT pioneers with the justification “It’s pretty sweet, y’know”.\r\n\r\nHas {Slot} inventory slots and a built-in Crafting Bench.\r\n\r\nFuel: Any fuel type\r\nBurn rate: {Fuel} MW",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Picks up and delivers resources at Truck Stations. This process can be automated. Nicknamed 'The Unit' by FICSIT pioneers because of its massive frame.\r\n\r\nHas {Slot} inventory slots and a built-in Crafting Bench.\r\n\r\nFuel: Any fuel type\r\nBurn rate: {Fuel} MW",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Sends or receives resources to/from vehicles.\r\n\r\nHas {Slot} inventory slots.\r\n\r\nTransfers up to 240 stacks per minute to/from docked vehicles. \r\nAlways refuels vehicles if it has access to a matching fuel type.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Loads and unloads Freight Cars that stop at the Freight Platform.\r\nLoading and unloading options can be set by configuring the building.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Loads Freight Cars that stop at the Freight Platform.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Unloads Freight Cars that stop at the Freight Platform.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Loads and unloads Freight Cars that stop at the Freight Platform.\r\nLoading and unloading options can be set by configuring the building.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Loads Freight Cars that stop at the Freight Platform.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Unloads Freight Cars that stop at the Freight Platform.\r\nSnaps to other Platforms and Stations.\r\nNeeds to be connected to a powered Railway to function.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Attaches to an Electric Locomotive or other Freight Car to transport resources. Must be built on a Railway.\r\nResources are loaded and unloaded at Freight Platforms.\r\nHas a {Fluid} m³ or {Solid}-slot capacity, depending on whether resources are liquid or solid.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Functions as home Port to a single Drone, which transports available input back and forth between its home Port and destination Port.\r\nDrone Ports can have one other Port assigned as their transport destination.\r\n\r\nThe Drone Port interface provides delivery details and allows management of Port connections.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Functions as home Port to a single Drone, which transports available input back and forth between its home Port and destination Port.\r\nDrone Ports can have one other Port assigned as their transport destination.\r\n\r\nThe Drone Port interface provides delivery details and allows management of Port connections.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Functions as home Port to a single Drone, which transports available input back and forth between its home Port and destination Port.\r\nDrone Ports can have one other Port assigned as their transport destination.\r\n\r\nThe Drone Port interface provides delivery details and allows management of Port connections.\r\n\r\n{Inventory}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Transports available input back and forth between its home Port and destination Ports. Drone Status and other details can be viewed at a Drone's home Port.\r\nMust be built on a Drone Port Mk.2.\r\n\r\nHas {Inventory} inventory slots.\r\n\r\n{Footnote}",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Contains {Size} slots for storing large amounts of items.\r\nHas 1 Conveyor Belt input port and 1 Conveyor Belt output port.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Contains {Size} slots for storing large amounts of items.\r\nHas 2 Conveyor Belt input ports and 2 Conveyor Belt output ports.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Holds up to {Size} m³ of fluid.\r\nHas Pipeline input and output ports.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Holds up to {Size} m³ of fluid.\r\nHas Pipeline input and output ports.",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  },
+  {
+    "AssetPath": "C:/Users/Alexandr/AppData/Local/Temp/tmp.e02zlzBoVb/out/FactoryGame/Mods/GameFeatures/MkPlus/Content/BP_MkPlusSubsystem.uasset",
+    "InternalPath": "/Game/Mods/MkPlus/BP_MkPlusSubsystem",
+    "PropName": "Desc",
+    "Value": "Connects to a power grid to store excess power produced. The stored power can be harnessed if power grid consumption exceeds production.\r\n\r\nStorage Capacity: {Inventory} MWh ({Inventory} MW for 1 hour)\r\nMaximum Charge Rate: {Charge} MW\r\nMaximum Discharge Rate: Unlimited",
+    "Type": "Text",
+    "AssetClass": "BP_MkPlusSubsystem_C"
+  }
+]

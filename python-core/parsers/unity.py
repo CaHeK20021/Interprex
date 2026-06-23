@@ -10,6 +10,7 @@ import os
 import sys
 import re
 import json
+import struct
 import tempfile
 import subprocess
 from typing import Any
@@ -154,6 +155,249 @@ def _is_game_text(text: str) -> bool:
         return True
 
     return False
+
+
+# ── Length-prefix fallback: stricter filter for raw MonoBehaviour bytes ──────
+
+# Compiled patterns for raw extraction
+_REPEATED_CHAR_RE  = re.compile(r'^(.)\1{4,}')        # 5+ same char at start: "aaaaa", "DESCDES"
+_REPEATED_WORD_RE  = re.compile(r'(\b\w+\b)(\s+\1){2,}') # word repeated 3+ times
+_CREDIT_LIST_RE    = re.compile(
+    r'^[A-Za-z0-9_.]{2,}(?:\s*,\s*[A-Za-z0-9_.]{2,}){3,}$'  # 4+ comma-separated tokens
+)
+_ASSET_SUFFIX_RE   = re.compile(
+    r'\b(SDF|_cl|_op|_default|Profile|Track|Clip|Behaviour|Component'
+    r'|Controller|Renderer|Filter|Canvas|Mesh|Sprite|Asset'
+    r'|Font|Material|Shader|Animation|Animator|AudioSource'
+    r'|TMP_|TextMesh)\b', re.I
+)
+_PLACEHOLDER_WORD_RE = re.compile(
+    r'^(New Text|Option [A-C]|Test\d*|test|PLACEHOLDER|TODO|FIXME'
+    r'|asdasd|descdesc|lorem|ipsum|dummy|sample|foo|bar|baz'
+    r'|qwe|zxc|asd|fff|xxx|zzz|aaa|bbb|ccc|ddd|eee|ggg|hhh|iii|jjj|kkk'
+    r'|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|yyy)+$'
+)
+_VERSION_RAW_RE    = re.compile(
+    r'^v\d+(\.\d+){1,3}(\s*\(.*\))?$'
+)
+_INTERNAL_ID_RE    = re.compile(
+    r'^\d+[.,]\s*\w+$'        # "1, LetsGo" type
+    r'|^\w+(?:Morph|State|Node|Event|Step|Phase)\s*\d*$'  # "GamePlayerLostMorph 1"
+)
+_FONT_NAME_RE = re.compile(
+    r'^(Roboto|Lato|Kinkie|Liberation\s+Sans|Open\s+Sans|Montserrat'
+    r'|Poppins|Oswald|Anton|Bangers|Electronic\s+Highway\s+Sign'
+    r'|Noto\s+Sans|Droid\s+Sans|Source\s+Sans|Fira\s+Sans'
+    r'|Raleway|Merriweather|Ubuntu|PT\s+Serif|PT\s+Sans'
+    r'|Play\s+Display|Playfair|Nunito|Quicksand|Work\s+Sans'
+    r'|Barlow|Inter|DM\s+Sans|Manrope|Lexend|Outfit|Space\s+Grotesk'
+    r'|Redacted|Comic\s+Neue|Grandstander|Fugaz|Bungee|Rubik'
+    r'|Comfortaa|Righteous|Volkhov|Vollkorn|Alegreya|Gentium'
+    r'|Cormorant|Crimson|EB\s+Garamond|Libre\s+Baskerville'
+    r'|Spectral|Bitter|Zilla|IBM\s+Plex|Fira|Inconsolata'
+    r'|JetBrains|Source\s+Code|Hack|Consolas|Courier|Courier\s+New'
+    r'|Times|Georgia|Garamond|Palatino|Book\s+Antiqua'
+    r'|Calibri|Cambria|Candara|Corbel|Segoe)\b', re.I
+)
+_UNITY_INTERNAL_RE = re.compile(
+    r'^(UnityEngine|UnityEditor|Unity\.|Unity\w+\.Runtime'
+    r'|MonoBehaviour|GameObject|Transform|Canvas|CanvasGroup'
+    r'|RectTransform|MeshRenderer|MeshFilter|Collider'
+    r'|Rigidbody|AudioSource|AudioListener|Camera'
+    r'|Light|ParticleSystem|Animator|Animation|SpriteRenderer'
+    r'|Debug|EventSystem|EventTrigger|GraphicRaycaster'
+    r'|ScrollRect|GridLayout|HorizontalLayout|VerticalLayout'
+    r'|LayoutElement|ContentSizeFitter|Image|RawImage|Button'
+    r'|Toggle|Slider|Scrollbar|InputField|Dropdown'
+    r'|TMP_|TextMeshPro|TextMesh)\b'
+)
+_PRIMITIVE_RE = re.compile(
+    r'^(Cube|Sphere|Capsule|Cylinder|Plane|Quad|Terrain)$', re.I
+)
+_GLYPH_NAME_RE = re.compile(
+    r'^(Zero|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten'
+    r'|Exclamation|Question|Period|Comma|Colon|Semicolon'
+    r'|Apostrophe|Quote|Hyphen|Underscore|Slash|Backslash'
+    r'|Space|At|Hash|Dollar|Percent|Ampersand|Asterisk'
+    r'|Plus|Equal|Less|Greater|Pipe|Tilde|Caret)$', re.I
+)
+
+
+def _is_game_text_raw(text: str) -> bool:
+    """Stricter filter for strings extracted via length-prefix from raw bytes.
+
+    Builds on _is_game_text but adds guards against common Unity asset junk
+    that only shows up in raw extraction (no typetree context).
+    """
+    t = text.strip()
+
+    # ── Base checks (reuse core logic) ──────────────────────────────────────
+    if len(t) < 3:
+        return False
+    if not any(c.isalpha() for c in t):
+        return False
+
+    if _GUID_RE.match(t):              return False
+    if _VERSION_RE.match(t):           return False
+    if _VERSION_RAW_RE.match(t):       return False
+    if _HEX_HASH_RE.match(t):          return False
+    if _URL_RE.search(t):              return False
+    if _PATH_RE.search(t):             return False
+    if _EXT_RE.search(t):              return False
+    if _LOG_TAG_RE.match(t):           return False
+
+    # ── Placeholder / gibberish ─────────────────────────────────────────────
+    low = t.lower()
+    if _PLACEHOLDER_WORD_RE.match(low):    return False
+    if _REPEATED_CHAR_RE.match(low):       return False
+    if _REPEATED_WORD_RE.search(low):      return False
+
+    # 3+ repeated words (not useful): "BREAKING NEWS BREAKING NEWS BREAKING NEWS"
+    words = low.split()
+    if len(words) >= 6:
+        unique = set(words)
+        if len(unique) < len(words) * 0.4:
+            return False
+
+    # ── Asset / engine names ────────────────────────────────────────────────
+    if _ASSET_SUFFIX_RE.search(t):         return False
+
+    # Class name patterns: "KK Eyes_smile_cl", "PhoneController, Assembly-CSharp"
+    if _CODE_WORD_RE.match(t):             return False
+    if t.lower() in _KNOWN_CODE:           return False
+
+    # Dotted code names: "CharacterBubble, Assembly-CSharp"
+    if ", assembly-csharp" in low:         return False
+    if ", unity." in low or ", unityengine" in low: return False
+
+    # ── Font names ──────────────────────────────────────────────────────────
+    if _FONT_NAME_RE.search(t):            return False
+
+    # ── Unity internal types / primitives / glyph names ─────────────────────
+    if _UNITY_INTERNAL_RE.match(t):        return False
+    if _PRIMITIVE_RE.match(t):             return False
+    if _GLYPH_NAME_RE.match(t):            return False
+
+    # TMP / UI state names that are single words
+    if low in frozenset({
+        "normal", "highlighted", "pressed", "selected", "disabled",
+        "foldout", "button", "toggle", "slider", "scrollbar",
+        "header", "message", "text", "name", "stage", "stage:",
+        "continue", "reset", "enum", "leftclick", "rightclick",
+        "bold", "italic", "regular", "light", "thin", "medium",
+        "extra", "black", "white", "empty",
+        "bloom", "vignette", "tonemapping", "depthoffield",
+        "slot", "dialogue", "panel",
+        "dropcap", "numbers",
+        "style", "sheet", "settings",
+        "alt", "ctrl", "shift", "tab", "escape", "return", "delete",
+        "beer", "wine", "gin", "milk", "bread", "eggs", "chips",
+        "oranges", "tomatoes", "laptop", "naked", "out", "party",
+        "pushed", "toilet", "work", "university", "groceries",
+        "position", "link", "quote", "title",
+        "smiley", "wink", "whaaat!",
+        "unity logo", "dropcap numbers", "tmp settings",
+        "default style sheet", "default sprite asset",
+        "panel title", "dialogue options", "drinking hint",
+        "scene name", "slot 1", "char name", "message text",
+        "bed2_03 (2)",
+        "blue to purple - vertical", "dark to light green - vertical",
+        "light to dark green - vertical", "yellow to orange - vertical",
+        "red:", "yellow:", "blue:", "green:", "white:", "black:",
+        "start massage", "continue massage", "massge",
+        "next foot", "storage room bj",
+        "new text", "option a", "option b", "option c",
+        "asdasd asd", "descdescdesc",
+        "automatic control", "manual control",
+        "i can not decline this call",
+        "hold and move in circular motion",
+        "your phone is ringing. close the quest window and press 'o' to open your phone",
+        "when drinking alone and finishing a drink, the other character (including the player) finishes theirs as well but only gains one drunk point",
+        "continue the story (indicates important decision or skip the side dialogues)",
+        "unlocked dialogue through interactions in the world and other dialogues",
+        "regular dialogue (side dialogue)",
+        "starts sexual scene",
+        "break",
+        "test2",
+    }):
+        return False
+
+    # ── Gibberish / test text ───────────────────────────────────────────────
+    # "ghj ghj", "test 1 test 1", "asdasd", repeated words
+    if re.match(r'^(?:test\s*\d*\s*){1,}$', low):          return False
+    if re.match(r'^(?:ghj|qwe|zxc|asd|fff|xxx|zzz)+(\s+\1)*$', low): return False
+    if re.match(r'^(?:asdasd|descdesc|lorem|ipsum|dummy|sample)+', low): return False
+
+    # ── Emoji descriptions from TMP (e.g. "Smiling face with smiling eyes") ─
+    if re.match(r'^(smiling|grinning|face with|winking|pouting|anguished|'
+                r'confounded|disappointed|fearful|joy|sad|thinking|'
+                r'neutral|expressionless|unamused|sweat|weary|'
+                r'clock face|skull|pile of poo|clapping|heart eyes|'
+                r'raised hand|ok hand|thumbs|folded|waving|'
+                r'muscle|sparkles|fire|star|rainbow|sun|moon|'
+                r'check mark|cross mark|warning|question|exclamation|'
+                r'multiplication|bangbang|heart|broken|two hearts|'
+                r'black|white|red|blue|green|yellow|purple|orange)\b', low):
+        return False
+
+    # ── Font character range like "20-7E,A0,2026" ──────────────────────────
+    if re.match(r'^[0-9A-Fa-f]{2,4}(?:-[0-9A-Fa-f]{2,4})?(?:,[0-9A-Fa-f]{2,4}(?:-[0-9A-Fa-f]{2,4})?)*$', t):
+        return False
+
+    # ── Credit lists ────────────────────────────────────────────────────────
+    if _CREDIT_LIST_RE.match(t):           return False
+
+    # ── Internal IDs ────────────────────────────────────────────────────────
+    if _INTERNAL_ID_RE.match(t):           return False
+
+    # ── Comma-separated short tokens (credit lists, asset lists) ────────────
+    if ',' in t:
+        parts = [p.strip() for p in t.split(',')]
+        if len(parts) >= 4 and all(len(p) <= 20 for p in parts):
+            return False
+
+    # ── Long all-same-case string with no real words ────────────────────────
+    alpha_only = ''.join(c for c in t if c.isalpha())
+    if len(alpha_only) > 10:
+        # Count transitions between upper/lower
+        transitions = sum(1 for i in range(1, len(alpha_only))
+                         if alpha_only[i].isupper() != alpha_only[i-1].isupper())
+        if transitions < 2 and not t.isupper():
+            # Mostly one case with no word boundaries → likely junk
+            pass  # keep it — could be all-caps UI like "SPACE"
+
+    # ── Standard pass-through ───────────────────────────────────────────────
+    if ' ' in t or '\n' in t:              return True   # multi-word → likely dialogue/UI
+    if t.lower() in _KNOWN_UI:             return True
+
+    # ALL CAPS button label
+    if t.isupper() and len(t) <= 20 and '_' not in t:
+        return True
+
+    # Title-case normal word
+    if t[0].isupper() and t[1:].islower() and 3 <= len(t) <= 30:
+        return True
+
+    return False
+
+
+def _extract_length_prefixed(raw: bytes) -> list[str]:
+    """Extract all length-prefixed UTF-8 strings from Unity serialized bytes."""
+    strings = []
+    i = 0
+    while i + 4 < len(raw):
+        slen = struct.unpack_from('<I', raw, i)[0]
+        if 2 <= slen <= 5000 and i + 4 + slen <= len(raw):
+            chunk = raw[i+4:i+4+slen]
+            try:
+                s = chunk.decode('utf-8')
+                if s.isprintable() and len(s) > 0:
+                    strings.append(s)
+            except (UnicodeDecodeError, ValueError):
+                pass
+        i += 1
+    return strings
+
 
 def find_aa_dir(root: str) -> str | None:
     """Find the StreamingAssets/aa directory in the project root."""
@@ -444,6 +688,7 @@ class UnityParser(BaseParser):
                 continue
 
             failed_count = 0
+            typetree_found = 0
             try:
                 env = UnityPy.load(fpath)
                 # Resolve and set generator using cached helper
@@ -515,6 +760,7 @@ class UnityParser(BaseParser):
                                 
                                 context = ", ".join(parts)
                                 results.append(self._mk(rel_path, path, text, context))
+                                typetree_found += 1
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "Text":
@@ -541,12 +787,16 @@ class UnityParser(BaseParser):
                                 
                                 context = ", ".join(parts)
                                 results.append(self._mk(rel_path, path, text, context))
+                                typetree_found += 1
                         except Exception:
                             failed_count += 1
             except Exception as e:
                 print(f"Error parsing assets file {fpath}: {e}", file=sys.stderr)
 
-            if failed_count > 0:
+            if typetree_found == 0 and failed_count > 0:
+                print(f"Typetree failed for all {failed_count} objects in {os.path.basename(fpath)}, trying length-prefix fallback.", file=sys.stderr)
+                results.extend(self._extract_raw_fallback(fpath, root))
+            elif failed_count > 0:
                 print(f"Warning: Failed to extract {failed_count} objects in compiled asset {fpath}.", file=sys.stderr)
 
         for fpath in source_files:
@@ -572,6 +822,44 @@ class UnityParser(BaseParser):
                     line_idx += 1
             except Exception as e:
                 print(f"Error parsing source file {fpath}: {e}", file=sys.stderr)
+
+        return results
+
+    def _extract_raw_fallback(self, fpath: str, root: str) -> list[TranslationString]:
+        """Fallback extraction via length-prefix scanning of raw MonoBehaviour bytes.
+
+        Used when typetree fails for ALL objects in an asset file (missing DLL,
+        unknown type tree, etc.). Scans raw bytes for Unity's int32-length-prefixed
+        UTF-8 strings and applies a stricter filter than the typetree path.
+        """
+        rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+        results = []
+        seen_texts: set[str] = set()
+
+        try:
+            import UnityPy
+            env = UnityPy.load(fpath)
+            for obj in env.objects:
+                if obj.type.name != "MonoBehaviour":
+                    continue
+                raw = obj.get_raw_data()
+                if len(raw) < 20:
+                    continue
+
+                strings = _extract_length_prefixed(raw)
+                for s in strings:
+                    t = s.strip()
+                    if not t or t in seen_texts:
+                        continue
+                    if not _is_game_text_raw(t):
+                        continue
+
+                    seen_texts.add(t)
+                    path = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
+                    context = f"File: {os.path.basename(fpath)}, PathID: {obj.path_id}, Method: length-prefix"
+                    results.append(self._mk(rel_path, path, t, context))
+        except Exception as e:
+            print(f"Error in raw fallback for {fpath}: {e}", file=sys.stderr)
 
         return results
 
