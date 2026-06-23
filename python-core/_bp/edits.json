@@ -1,0 +1,5 @@
+[
+ {"AssetPath":"FactoryGame/Mods/GameFeatures/MkPlus/Content/SessionSettings/Manufacturers/MkPlus_OCMode_ConstructorMk2.uasset","ExportIndex":0,"ContainerPath":"IntegerSelectionValues[0]","PropName":"Name","NewValue":"Линейный (По умолчанию)"},
+ {"AssetPath":"FactoryGame/Mods/GameFeatures/MkPlus/Content/SessionSettings/Manufacturers/MkPlus_OCMode_ConstructorMk2.uasset","ExportIndex":0,"ContainerPath":"IntegerSelectionValues[1]","PropName":"Name","NewValue":"Экспоненциальный"},
+ {"AssetPath":"FactoryGame/Mods/GameFeatures/MkPlus/Content/SessionSettings/Manufacturers/MkPlus_OCMode_ConstructorMk2.uasset","ExportIndex":0,"ContainerPath":"IntegerSelectionValues[2]","PropName":"Name","NewValue":"Пользовательский"}
+]

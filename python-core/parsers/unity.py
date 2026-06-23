@@ -939,14 +939,13 @@ class UnityParser(BaseParser):
 
         return results
 
-    def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str]) -> int:
-        """Inject translations via pure binary patching — no UnityPy.save().
+    def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str],
+                             env: Any = None, font_bytes: bytes | None = None,
+                             target_lang: str | None = None) -> int:
+        """Inject translations AND fonts via pure binary patching — no UnityPy.save().
 
-        Reads the file as raw bytes, scans for length-prefixed strings,
-        matches them against translations by text content, and patches them
-        in reverse order so earlier offsets stay valid. The file is written
-        back with minimal changes — only the translated strings are replaced.
-        This avoids UnityPy's re-serialization which can corrupt the file.
+        Patches both strings and fonts in the same pass, writing the file
+        once at the end. This avoids UnityPy's re-serialization.
         """
         rel_path = os.path.relpath(fpath, root).replace("\\", "/")
         written = 0
@@ -955,29 +954,57 @@ class UnityParser(BaseParser):
             with open(fpath, "rb") as f:
                 file_bytes = bytearray(f.read())
 
-            # Build a reverse map: original text -> translated text
-            # We need to match by text since we don't have path_ids in raw scan
-            text_to_translation: dict[str, str] = {}
-            for sid, translated in translations.items():
-                # Extract original text from the translation string's id
-                # The id format is hash(engine, rel_path, path, original)
-                # We can't reverse the hash, so we build the map during extract
-                # and pass it through. For now, use the translations dict directly.
-                pass
+            patches: list[tuple[int, int, bytes]] = []
 
-            # Actually, we need to know which texts to translate.
-            # Re-extract strings and match by make_id.
-            # But we also need the original text for each id.
-            # The simplest approach: scan for ALL length-prefixed strings,
-            # compute make_id for each, and if the id is in translations, patch.
+            if env is None:
+                import UnityPy
+                env = UnityPy.load(fpath)
 
-            # Phase 1: scan file for all length-prefixed strings
-            patches: list[tuple[int, int, bytes]] = []  # (start, end, new_blob)
+            # Font patching via raw bytes — replace PPtr references to non-Cyrillic fonts
+            # with LiberationSans (which supports Cyrillic). This is a SAFE size-preserving
+            # change: we only swap 8-byte path_ids in PPtrs, no file size change.
+            is_non_latin = target_lang and target_lang.lower() in ("ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr")
+            if is_non_latin:
+                # Find LiberationSans path_id (our target)
+                liberation_pid = None
+                for obj in env.objects:
+                    if obj.type.name == "Font":
+                        try:
+                            data = obj.read()
+                            if data.m_Name == "LiberationSans":
+                                liberation_pid = obj.path_id
+                                break
+                        except:
+                            pass
 
-            # We need to find MonoBehaviour objects to get their path_ids.
-            # Use UnityPy for READING only (not saving).
-            import UnityPy
-            env = UnityPy.load(fpath)
+                if liberation_pid:
+                    # Find all Font objects that DON'T support Cyrillic
+                    # and build a map: old_pid -> liberation_pid
+                    non_cyrillic_fonts = set()
+                    for obj in env.objects:
+                        if obj.type.name == "Font":
+                            try:
+                                data = obj.read()
+                                if data.m_Name != "LiberationSans":
+                                    non_cyrillic_fonts.add(obj.path_id)
+                            except:
+                                pass
+
+                    if non_cyrillic_fonts:
+                        # Scan entire file for PPtr references to non-Cyrillic fonts
+                        # PPtr = int32 FileID (0) + int64 PathID
+                        for old_pid in non_cyrillic_fonts:
+                            old_pptr = struct.pack('<Iq', 0, old_pid)
+                            new_pptr = struct.pack('<Iq', 0, liberation_pid)
+                            idx = 0
+                            while True:
+                                idx = file_bytes.find(old_pptr, idx)
+                                if idx < 0:
+                                    break
+                                patches.append((idx, idx + 12, new_pptr))
+                                idx += 12
+
+            # String patching via raw bytes
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
@@ -985,10 +1012,8 @@ class UnityParser(BaseParser):
                 if len(raw) < 20:
                     continue
 
-                # Find this raw blob's offset in the file
-                raw_offset = file_bytes.find(raw[:min(256, len(raw))])
-                if raw_offset < 0:
-                    continue
+                # Use the object's EXACT byte offset in the file — no search
+                raw_offset = obj.byte_start
 
                 # Scan raw blob for strings
                 j = 0
@@ -1006,13 +1031,18 @@ class UnityParser(BaseParser):
                                     if sid in translations:
                                         new_text = translations[sid]
                                         new_bytes = new_text.encode('utf-8')
-                                        new_len = len(new_bytes)
-                                        new_padded = (new_len + 3) & ~3
-                                        new_blob = struct.pack('<I', new_padded) + new_bytes + b'\x00' * (new_padded - new_len)
 
-                                        # Patch in the FILE bytes, not in raw
+                                        # Only replace string bytes, keep original length prefix.
+                                        # Truncate translation to original slen.
+                                        max_str_len = min(len(new_bytes), slen)
+                                        new_str = new_bytes[:max_str_len]
+
                                         file_start = raw_offset + j
                                         file_end = raw_offset + j + 4 + slen
+                                        new_blob = struct.pack('<I', slen) + new_str
+                                        if len(new_blob) < (4 + slen):
+                                            new_blob += b'\x00' * ((4 + slen) - len(new_blob))
+
                                         patches.append((file_start, file_end, new_blob))
                         except (UnicodeDecodeError, ValueError):
                             pass
@@ -1265,36 +1295,18 @@ class UnityParser(BaseParser):
                             failed_count += 1
 
                 is_non_latin = target_lang and target_lang.lower() in ("ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr")
-                if font_bytes and (is_non_latin or fonts_to_replace):
-                    for obj in env.objects:
-                        if obj.type.name == "Font":
-                            data = obj.read()
-                            should_replace = obj.path_id in fonts_to_replace or is_non_latin
-                            if should_replace:
-                                try:
-                                    tree = data.read_typetree()
-                                    if "m_FontData" in tree:
-                                        tree["m_FontData"] = font_bytes
-                                        data.save_typetree(tree)
-                                        changed = True
-                                except Exception:
-                                    try:
-                                        data.m_FontData = font_bytes
-                                        data.save()
-                                        changed = True
-                                    except Exception:
-                                        failed_count += 1
+
+                # Font PPtr replacement: swap non-Cyrillic font references to LiberationSans
+                # This is a SAFE size-preserving change (only 12 bytes per PPtr).
+                if is_non_latin:
+                    self._replace_font_pptrs(env, fpath)
 
                 if typetree_found == 0 and failed_count > 0:
-                    raw_written = self._inject_raw_fallback(fpath, root, translations)
+                    raw_written = self._inject_raw_fallback(fpath, root, translations,
+                                                            env=env, font_bytes=font_bytes,
+                                                            target_lang=target_lang)
                     if raw_written > 0:
                         written += raw_written
-                    # raw fallback writes the file directly — skip env.file.save()
-
-                elif changed:
-                    self.backup_file(root, fpath)
-                    with open(fpath, "wb") as f:
-                        f.write(env.file.save(packer="none"))
 
             except Exception as e:
                 print(f"Error injecting into assets file {fpath}: {e}", file=sys.stderr)
@@ -1346,6 +1358,66 @@ class UnityParser(BaseParser):
                 print(f"Error injecting into source file {fpath}: {e}", file=sys.stderr)
 
         return written
+
+    def _replace_font_pptrs(self, env: Any, fpath: str) -> None:
+        """Replace PPtr references to non-Cyrillic fonts with LiberationSans.
+
+        This is a SAFE size-preserving change: we only swap 8-byte path_ids
+        in PPtrs. No file size change, no structure corruption.
+        """
+        try:
+            # Find LiberationSans path_id
+            liberation_pid = None
+            for obj in env.objects:
+                if obj.type.name == "Font":
+                    try:
+                        data = obj.read()
+                        if data.m_Name == "LiberationSans":
+                            liberation_pid = obj.path_id
+                            break
+                    except:
+                        pass
+
+            if not liberation_pid:
+                return
+
+            # Find all Font path_ids that aren't LiberationSans
+            non_cyrillic_pids = set()
+            for obj in env.objects:
+                if obj.type.name == "Font":
+                    try:
+                        data = obj.read()
+                        if data.m_Name != "LiberationSans":
+                            non_cyrillic_pids.add(obj.path_id)
+                    except:
+                        pass
+
+            if not non_cyrillic_pids:
+                return
+
+            # Read the file and replace all PPtr references
+            with open(fpath, "rb") as f:
+                file_bytes = bytearray(f.read())
+
+            replaced = 0
+            for old_pid in non_cyrillic_pids:
+                old_pptr = struct.pack("<Iq", 0, old_pid)
+                new_pptr = struct.pack("<Iq", 0, liberation_pid)
+                idx = 0
+                while True:
+                    idx = file_bytes.find(old_pptr, idx)
+                    if idx < 0:
+                        break
+                    file_bytes[idx:idx + 12] = new_pptr
+                    replaced += 1
+                    idx += 12
+
+            if replaced > 0:
+                with open(fpath, "wb") as f:
+                    f.write(file_bytes)
+                print(f"Replaced {replaced} font PPtrs in {os.path.basename(fpath)}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error replacing font PPtrs: {e}", file=sys.stderr)
 
     def _inject_localization(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
         self._current_root = root

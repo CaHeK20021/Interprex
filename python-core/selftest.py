@@ -2961,18 +2961,25 @@ def check_unreal4_5_cdo() -> None:
     keys = [tuple(_build_uasset_path_key(i)) for i in widget_items + array_items]
     assert len(set(keys)) == len(keys), f"path keys collide: {keys}"
 
-    # --- Part B: _extract_cdo_meta only fires for array items -----------------
-    plain = {"InternalPath": "/x", "PropName": "Text", "Value": "v"}
-    assert _extract_cdo_meta(plain) is None, "plain item should have no CDO meta"
-    cdo_item = {
+    # --- Part B: _extract_cdo_meta fires only for nested (ContainerPath) items
+    # and carries the byte-patch locator (export_index/container_path/prop) ------
+    plain = {"InternalPath": "/x", "PropName": "Text", "Value": "v", "ContainerPath": ""}
+    assert _extract_cdo_meta(plain) is None, "top-level item should have no array meta"
+    arr_item = {
         "InternalPath": "/x", "PropName": "Name", "Value": "Linear",
+        "ExportName": "FGUserSetting_IntSelector_0#0",
+        "ContainerPath": "IntegerSelectionValues[0]",
         "CdoClass": "/A/B.B:Sel", "CdoArrayProp": "IntegerSelectionValues",
         "CdoPlaceholderToken": "@@IPX:0:IntegerSelectionValues:0:Name@@",
         "CdoArrayJson": '[{"Name":"@@IPX:0:IntegerSelectionValues:0:Name@@","Value":0}]',
         "CdoArrayOmittedFields": False,
     }
-    meta = _extract_cdo_meta(cdo_item)
+    meta = _extract_cdo_meta(arr_item)
     assert meta and meta["array_prop"] == "IntegerSelectionValues" and not meta["omitted"]
+    # byte-patch locator parsed from ExportName(#index) + ContainerPath + PropName
+    assert meta["export_index"] == 0, meta
+    assert meta["container_path"] == "IntegerSelectionValues[0]", meta
+    assert meta["prop"] == "Name", meta
 
     # --- Part B: mini-inject builds the array-replace CDO ----------------------
     # Two arrays: a SAFE selector (omitted=False) and a RISKY subsystem array
@@ -3043,6 +3050,94 @@ def check_unreal4_5_cdo() -> None:
     print("OK — unreal4_5 CDO: unique path keys (no collisions); Part-B array "
           "CDO emit gated by _ENABLE_CDO_ARRAY_REPLACE (off=no clutter, on=full "
           "array replace w/ token subst + omitted-field handling)")
+
+
+def check_unreal4_5_bytepatch() -> None:
+    """Byte-patch path: edit-collection locators + the C# --apply-edits round-trip.
+    The byte-patch rewrites struct-array FText directly in the .uasset (the working
+    replacement for the inert CDO array path) and repacks the mod as a _P container.
+    Pure-Python locator test always runs; the C# write round-trip runs only if the
+    extractor binary is present."""
+    import os, tempfile, shutil, json as _json, subprocess
+    from parsers.unreal4_5 import (
+        UnrealEngine4_5Parser, _extract_cdo_meta, _export_index_from_name,
+        _find_uasset_extractor, PAK_SEP,
+    )
+    from parsers.base import make_id, TranslationString
+
+    # 1. ExportName "#index" parsing (the byte-patch ExportIndex source)
+    assert _export_index_from_name("Foo#7") == 7
+    assert _export_index_from_name("Foo") == -1
+    assert _export_index_from_name("") == -1
+
+    # 2. Edit-collection: a nested (array) string yields a byte-patch edit with the
+    #    locator parsed from its meta; a top-level string does NOT.
+    p = UnrealEngine4_5Parser()
+    s_arr = TranslationString(id="", original="Linear (Default)", context="",
+        engine="unreal4_5",
+        file=f"uasset://MkPlus{PAK_SEP}FactoryGame/Mods/MkPlus/Content/Sel.uasset",
+        path=["/Game/Mods/MkPlus/Sel", "Name",
+              "FGUserSetting_IntSelector_0#0|IntegerSelectionValues[0]"])
+    s_arr.id = make_id("unreal4_5", s_arr.file, s_arr.path, s_arr.original)
+    s_top = TranslationString(id="", original="OC Mode", context="", engine="unreal4_5",
+        file=f"uasset://MkPlus{PAK_SEP}FactoryGame/Mods/MkPlus/Content/Sel.uasset",
+        path=["/Game/Mods/MkPlus/Sel", "DisplayName", "MkPlus_Sel#1"])
+    s_top.id = make_id("unreal4_5", s_top.file, s_top.path, s_top.original)
+    p._uasset_cache = [s_arr, s_top]
+    p._uasset_cache_key = ("dummy", None)
+    p._cdo_meta = {
+        s_arr.id: {"export_index": 0, "container_path": "IntegerSelectionValues[0]",
+                   "prop": "Name", "class": "", "array_prop": "", "token": "",
+                   "array_json": "", "omitted": False},
+        # top-level item: export_index -1 → must be ignored by byte-patch
+        s_top.id: {"export_index": -1, "container_path": "", "prop": "DisplayName",
+                   "class": "", "array_prop": "", "token": "", "array_json": "",
+                   "omitted": False},
+    }
+    translations = {s_arr.id: "Линейный", s_top.id: "Режим"}
+    # Re-implement the edit-collection inline (same logic as _inject_into_uassets_
+    # bytepatch) to assert it without touching disk/retoc.
+    collected = []
+    for s in p._uasset_cache:
+        sid = make_id(p.engine, s.file, s.path, s.original)
+        if sid not in translations:
+            continue
+        meta = p._cdo_meta.get(sid)
+        if not meta or meta.get("export_index", -1) < 0:
+            continue
+        body = s.file[9:]
+        mod_rel, _, safe_path = body.partition(PAK_SEP)
+        collected.append((mod_rel, safe_path, meta["export_index"],
+                          meta["container_path"], meta["prop"], translations[sid]))
+    assert len(collected) == 1, f"only the array string is byte-patchable: {collected}"
+    mod_rel, safe_path, ei, cp, prop, nv = collected[0]
+    assert ei == 0 and cp == "IntegerSelectionValues[0]" and prop == "Name"
+    assert nv == "Линейный" and safe_path.endswith("Sel.uasset")
+
+    # 3. C# --apply-edits round-trip (skipped if the binary is absent). Builds a
+    #    real .uasset via UAssetExtractor? We can't synth one, so we only assert the
+    #    binary accepts the flag and reports 0/0 on an empty edit set (proves the
+    #    CLI path is wired and never crashes).
+    try:
+        extr = _find_uasset_extractor()
+    except Exception:
+        print("OK — unreal4_5 byte-patch: locators + edit-collection "
+              "(C# round-trip skipped, no binary)")
+        return
+    tmp = tempfile.mkdtemp(prefix="bp_st_")
+    try:
+        ef = os.path.join(tmp, "e.json")
+        open(ef, "w", encoding="utf-8").write("[]")
+        res = subprocess.run([extr, "--apply-edits", ef, "--base-dir", tmp,
+                              "--engine", "VER_UE5_6"],
+                             capture_output=True, text=True, timeout=60)
+        out = (res.stdout or "").strip()
+        assert '"applied":0' in out and '"requested":0' in out, f"unexpected: {out!r}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("OK — unreal4_5 byte-patch: locators + edit-collection (array-only) + "
+          "C# --apply-edits CLI wired")
 
 
 def check_prompt_width() -> None:
@@ -4075,8 +4170,9 @@ def main() -> int:
     check_unreal4_pak()
     check_unreal4_5_utoc()
     check_unreal4_5_cdo()
+    check_unreal4_5_bytepatch()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-bytepatch) + scheduler all pass")
     return 0
 
 

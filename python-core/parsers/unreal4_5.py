@@ -67,6 +67,11 @@ MAX_UASSET_SIZE = int(1.2 * 1024 * 1024 * 1024)  # 1.2 GB
 # found that actually surfaces these. See the long note in `_inject_into_uassets`.
 _ENABLE_CDO_ARRAY_REPLACE = False
 
+# Byte-patch path: rewrite struct-array FText directly in the .uasset bytes and
+# repack the mod as a `_P` container (bypasses ContentLib, which can't surface
+# these). This is the working replacement for the disabled CDO array-replace.
+_ENABLE_ASSET_BYTEPATCH = True
+
 
 def _sanitize_extracted_path(tmp_output: Path, file_path: Path) -> str | None:
     """Return the relative path of file_path inside tmp_output, or None if it escapes."""
@@ -122,19 +127,38 @@ def _build_uasset_path_key(item: dict) -> list[str]:
     return base
 
 
+def _export_index_from_name(export_name: str) -> int:
+    """ExportName is `ObjectName#<exportTableIndex>` (the index disambiguates
+    repeated ObjectNames). Pull the index back out for the byte-patch locator."""
+    if export_name and "#" in export_name:
+        try:
+            return int(export_name.rsplit("#", 1)[1])
+        except ValueError:
+            return -1
+    return -1
+
+
 def _extract_cdo_meta(item: dict) -> dict | None:
-    """Pull the Part-B CDO full-array-replace fields out of an extractor item.
-    Returns None for items that aren't part of a translatable struct array."""
-    cls = item.get("CdoClass")
-    prop = item.get("CdoArrayProp")
-    token = item.get("CdoPlaceholderToken")
-    if not (cls and prop and token):
+    """Pull array-element metadata out of an extractor item — used BOTH for the
+    (disabled) ContentLib CDO array-replace AND the byte-patch path. Returns None
+    for items that aren't inside a struct/array container.
+
+    Trigger = the item has a ContainerPath (it lives inside a struct or array).
+    The byte-patch locator (export_index, container_path, prop) mirrors exactly
+    how `_build_uasset_path_key` built `path[]`, so inject can address the value.
+    """
+    cont = item.get("ContainerPath") or ""
+    if not cont:
         return None
     return {
-        "class": cls,
-        "array_prop": prop,
-        "token": token,
-        # the full array JSON is attached to ONE item per array; "" on the rest
+        # byte-patch locator (always present for a nested item)
+        "export_index": _export_index_from_name(item.get("ExportName") or ""),
+        "container_path": cont,
+        "prop": item.get("PropName") or "",
+        # legacy CDO array-replace fields (only when the extractor tagged the array)
+        "class": item.get("CdoClass") or "",
+        "array_prop": item.get("CdoArrayProp") or "",
+        "token": item.get("CdoPlaceholderToken") or "",
         "array_json": item.get("CdoArrayJson") or "",
         "omitted": bool(item.get("CdoArrayOmittedFields")),
     }
@@ -656,6 +680,17 @@ def _detect_ue_version(utoc_path: str, retoc_bin: str) -> str:
         return "UE5_4"
 
 
+def _find_uasset_extractor() -> str:
+    """Path to the bundled UAssetExtractor binary (raises if missing)."""
+    import sys
+    ext = ".exe" if sys.platform.startswith("win") else ""
+    core_dir = Path(__file__).resolve().parent.parent
+    extractor_bin = core_dir / "bin" / f"UAssetExtractor{ext}"
+    if not extractor_bin.is_file():
+        raise RuntimeError(f"UAssetExtractor not found at {extractor_bin}")
+    return str(extractor_bin)
+
+
 def iter_utoc_files(root: str):
     """Yield every `.utoc` container under root, skipping backups and patches."""
     for f in Path(root).rglob("*.utoc"):
@@ -1174,6 +1209,12 @@ class UnrealEngine4_5Parser(BaseParser):
                 
             written = paks_written + utocs_written
             written += self._inject_into_uassets(root, translations, sub_paths)
+            # Byte-patch path: rewrite struct-array FText the ContentLib CDO can't
+            # reach (selector options, subsystem build descriptions) directly in the
+            # .uasset bytes and repack the mod as a _P container. Runs AFTER the
+            # ContentLib pass and reuses its extraction cache + _cdo_meta.
+            if _ENABLE_ASSET_BYTEPATCH:
+                written += self._inject_into_uassets_bytepatch(root, translations, sub_paths)
             return written
 
         written = 0
@@ -1456,6 +1497,182 @@ class UnrealEngine4_5Parser(BaseParser):
                         logger.error(f"Failed to write ContentLib patch {file_name}: {e}")
 
         return written_count
+
+    def _inject_into_uassets_bytepatch(self, root: str, translations: dict[str, str],
+                                       sub_paths) -> int:
+        """Rewrite struct-array FText (selector options, subsystem descriptions)
+        directly in the .uasset bytes and repack each affected mod as a `_P`
+        IoStore container — the working path for strings ContentLib CDO can't reach.
+
+        Per mod: re-run `retoc to-legacy` (assemble .uasset), run UAssetExtractor
+        `--apply-edits` (write the new FText in place via UAssetAPI), copy only the
+        edited assets into a fresh dir, then `retoc to-zen` into `<stem>_P`. Reuses
+        the SAME (export_index, container_path, prop) locators the extractor emits
+        (stored in self._cdo_meta), so each edit lands on the right value.
+        """
+        import json as _json
+        from .base import update_metadata
+
+        cdo_meta = getattr(self, "_cdo_meta", {})
+        if not cdo_meta:
+            return 0
+
+        # Reuse the extraction cache populated by _inject_into_uassets (same run).
+        cache_key = (root, tuple(sub_paths) if sub_paths else None)
+        if not hasattr(self, "_uasset_cache") or self._uasset_cache_key != cache_key:
+            self._uasset_cache = []
+            self._extract_from_uassets(root, sub_paths, self._uasset_cache)
+            self._uasset_cache_key = cache_key
+            cdo_meta = getattr(self, "_cdo_meta", {})
+
+        # Collect edits, grouped by mod_rel -> safe_path(asset) -> list[edit].
+        # mod_rel + safe_path come straight from each string's file key.
+        edits_by_mod: dict[str, list[dict]] = {}
+        for s in self._uasset_cache:
+            sid = make_id(self.engine, s.file, s.path, s.original)
+            if sid not in translations or not s.file.startswith("uasset://"):
+                continue
+            meta = cdo_meta.get(sid)
+            if not meta or meta.get("export_index", -1) < 0:
+                continue  # only nested (array/struct) strings go through byte-patch
+            body = s.file[9:]
+            mod_rel, _, safe_path = body.partition(PAK_SEP)
+            if not safe_path:
+                continue
+            edits_by_mod.setdefault(mod_rel, []).append({
+                "AssetPath": safe_path,            # relative to the to-legacy out dir
+                "ExportIndex": meta["export_index"],
+                "ContainerPath": meta["container_path"],
+                "PropName": meta["prop"],
+                "NewValue": translations[sid],
+            })
+
+        if not edits_by_mod:
+            return 0
+
+        try:
+            retoc_bin = _find_retoc()
+        except RuntimeError as e:
+            logger.warning(f"Byte-patch skipped (no retoc): {e}")
+            return 0
+        try:
+            extractor_bin = _find_uasset_extractor()
+        except Exception as e:
+            logger.warning(f"Byte-patch skipped (no extractor): {e}")
+            return 0
+
+        root_path = Path(root)
+        global_utoc = root_path / "FactoryGame" / "Content" / "Paks" / "global.utoc"
+        global_ucas = root_path / "FactoryGame" / "Content" / "Paks" / "global.ucas"
+
+        # Map each mod_rel back to its source .utoc on disk.
+        utocs = list(iter_utoc_files(root))
+        utoc_by_mod = {_mod_path_from_utoc(uf, root): uf for uf in utocs}
+
+        written = 0
+        for mod_rel, edits in edits_by_mod.items():
+            uf = utoc_by_mod.get(mod_rel)
+            if uf is None:
+                logger.warning(f"Byte-patch: no source utoc for mod {mod_rel}; skipped")
+                continue
+            try:
+                written += self._bytepatch_one_mod(
+                    root, uf, edits, retoc_bin, extractor_bin,
+                    global_utoc, global_ucas, update_metadata, _json)
+            except Exception as e:
+                logger.error(f"Byte-patch failed for mod {mod_rel}: {e}")
+        return written
+
+    def _bytepatch_one_mod(self, root, uf, edits, retoc_bin, extractor_bin,
+                           global_utoc, global_ucas, update_metadata, _json) -> int:
+        """to-legacy → apply-edits → copy edited assets → to-zen `_P`. Returns the
+        number of edits applied. Mirrors the locres _inject_into_utocs repack."""
+        ue_ver = _detect_ue_version(str(uf), retoc_bin)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_input = Path(tmp_dir) / "input"
+            tmp_legacy = Path(tmp_dir) / "legacy"
+            tmp_zen = Path(tmp_dir) / "zen"
+            tmp_input.mkdir(); tmp_legacy.mkdir(); tmp_zen.mkdir()
+
+            for name, src in [("global.utoc", global_utoc), ("global.ucas", global_ucas)]:
+                if src.is_file():
+                    try:
+                        os.symlink(str(src), str(tmp_input / name))
+                    except OSError:
+                        shutil.copy2(str(src), str(tmp_input / name))
+            shutil.copy2(str(uf), str(tmp_input / uf.name))
+            ucas = uf.with_suffix(".ucas")
+            if ucas.is_file():
+                shutil.copy2(str(ucas), str(tmp_input / ucas.name))
+
+            # 1. assemble legacy .uasset
+            _run_cmd([
+                retoc_bin, "to-legacy", str(tmp_input), str(tmp_legacy),
+                "--version", ue_ver, "--no-shaders", "--no-script-objects"
+            ], check=True, capture_output=True, timeout=120)
+
+            # 2. write edits in place (AssetPath is relative to tmp_legacy)
+            edits_file = Path(tmp_dir) / "edits.json"
+            edits_file.write_text(_json.dumps(edits, ensure_ascii=False), encoding="utf-8")
+            res = _run_cmd([
+                extractor_bin, "--apply-edits", str(edits_file),
+                "--base-dir", str(tmp_legacy), "--engine", f"VER_{ue_ver}"
+            ], check=True, capture_output=True, text=True, timeout=120)
+            applied = 0
+            try:
+                applied = int(_json.loads(res.stdout.strip().splitlines()[-1]).get("applied", 0))
+            except Exception:
+                pass
+            if applied == 0:
+                logger.warning(f"Byte-patch: 0 edits applied for {uf.name}")
+                return 0
+
+            # 3. copy ONLY the edited assets (.uasset + .uexp) into the zen input,
+            #    preserving their relative paths so the package path is unchanged.
+            edited_rel = {e["AssetPath"].replace("\\", "/") for e in edits}
+            for rel in edited_rel:
+                for ext in (".uasset", ".uexp", ".ubulk"):
+                    src = tmp_legacy / (rel[:-len(".uasset")] + ext if rel.endswith(".uasset") else rel + ext)
+                    if src.is_file():
+                        dst = tmp_zen / src.relative_to(tmp_legacy)
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(src), str(dst))
+
+            # 4. repack as a `_P` patch container next to the original mod utoc.
+            # LIMITATION: the locres inject (`_inject_into_utocs`) writes the SAME
+            # `<stem>_P` name for a mod that also ships .locres. A mod with BOTH
+            # .locres AND byte-patchable struct-array FText would have its locres `_P`
+            # overwritten here (byte-patch runs after locres in inject()). Verified
+            # NONE of the real Satisfactory mods overlap (byte-patch mods carry no
+            # .locres). If that ever changes, merge both asset sets into one tmp_zen
+            # before to-zen instead of overwriting.
+            patch_base = uf.parent / f"{uf.stem}_P"
+            patch_utoc = uf.parent / f"{uf.stem}_P.utoc"
+            patch_ucas = uf.parent / f"{uf.stem}_P.ucas"
+            patch_pak = uf.parent / f"{uf.stem}_P.pak"
+            for p_file in (patch_utoc, patch_ucas, patch_pak):
+                if p_file.exists():
+                    self.backup_file(root, str(p_file))
+
+            # to-zen OUTPUT must be the `.utoc` path (it derives .ucas/.pak from it).
+            _run_cmd([
+                retoc_bin, "to-zen", "--version", ue_ver,
+                str(tmp_zen), str(patch_utoc)
+            ], check=True, capture_output=True, timeout=120)
+
+            missing = [p.name for p in (patch_utoc, patch_ucas)
+                       if not p.exists() or p.stat().st_size == 0]
+            if missing:
+                raise RuntimeError(f"to-zen produced no output: {', '.join(missing)}")
+
+            for p_file in (patch_utoc, patch_ucas, patch_pak):
+                if p_file.exists():
+                    rel_to_root = os.path.relpath(str(p_file), root).replace("\\", "/")
+                    sha = hashlib.sha256(p_file.read_bytes()).hexdigest()
+                    update_metadata(root, rel_to_root, "", sha, "created")
+
+            logger.info(f"Byte-patched {applied} string(s) into {patch_base.name}")
+            return applied
 
     def _inject_into_paks(self, root: str, translations: dict[str, str],
                           lang_code: str, sub_paths, sml_files: dict[str, bytes] | None = None) -> int:

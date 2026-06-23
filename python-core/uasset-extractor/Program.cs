@@ -482,6 +482,141 @@ namespace UAssetExtractor
             }
         }
 
+        // ---- Asset byte-patch (write FText/FString in place) -----------------
+        // For strings that ContentLib can't reach (struct-array FText: selector
+        // options, subsystem build descriptions), we rewrite the value directly in
+        // the .uasset and repack the mod, bypassing ContentLib. An edit is located
+        // by the SAME (ExportIndex, ContainerPath, PropName) triple the extractor
+        // emits — so the locator always matches what `path[]` was built from.
+        public class AssetEdit
+        {
+            public string? AssetPath { get; set; }   // legacy .uasset path on disk
+            public int ExportIndex { get; set; } = -1;
+            public string? ContainerPath { get; set; }
+            public string? PropName { get; set; }
+            public string? NewValue { get; set; }
+        }
+
+        // Walk one export's props EXACTLY like ExtractProps and, when the locator
+        // matches an edit, set the FText/FString value. Returns how many edits were
+        // applied. Mirror of ExtractProps — keep the traversal identical so the
+        // (exportIndex, containerPath, propName) coordinates line up byte-for-byte.
+        static int ApplyEditsToProps(IEnumerable<PropertyData> props, int exportIndex,
+            string containerPath, Dictionary<string, AssetEdit> byKey)
+        {
+            int applied = 0;
+            foreach (var prop in props)
+            {
+                if (prop is StructPropertyData structProp && structProp.Value != null)
+                {
+                    string sName = structProp.Name?.ToString() ?? "";
+                    string childPath = string.IsNullOrEmpty(containerPath) ? sName : $"{containerPath}.{sName}";
+                    applied += ApplyEditsToProps(structProp.Value, exportIndex, childPath, byKey);
+                    continue;
+                }
+                if (prop is ArrayPropertyData arrProp && arrProp.Value != null)
+                {
+                    string arrName = arrProp.Name?.ToString() ?? "";
+                    string arrBase = string.IsNullOrEmpty(containerPath) ? arrName : $"{containerPath}.{arrName}";
+                    int idx = 0;
+                    foreach (var elem in arrProp.Value)
+                    {
+                        string elemPath = $"{arrBase}[{idx}]";
+                        if (elem is StructPropertyData arrElem && arrElem.Value != null)
+                            applied += ApplyEditsToProps(arrElem.Value, exportIndex, elemPath, byKey);
+                        else if (elem is TextPropertyData arrText)
+                        {
+                            // direct TArray<FText>: PropName = array name, container = elem path
+                            if (TryEditText(arrText, exportIndex, elemPath, arrName, byKey)) applied++;
+                        }
+                        else if (elem is StrPropertyData arrStr)
+                        {
+                            if (TryEditStr(arrStr, exportIndex, elemPath, arrName, byKey)) applied++;
+                        }
+                        idx++;
+                    }
+                    continue;
+                }
+                // leaf FText / FString at the current container level
+                string pn = prop.Name?.ToString() ?? "";
+                if (prop is TextPropertyData tp)
+                {
+                    if (TryEditText(tp, exportIndex, containerPath, pn, byKey)) applied++;
+                }
+                else if (prop is StrPropertyData sp)
+                {
+                    if (TryEditStr(sp, exportIndex, containerPath, pn, byKey)) applied++;
+                }
+            }
+            return applied;
+        }
+
+        static string EditKey(int exportIndex, string containerPath, string propName)
+            => $"{exportIndex}{containerPath}{propName}";
+
+        static bool TryEditText(TextPropertyData tp, int exportIndex, string containerPath,
+            string propName, Dictionary<string, AssetEdit> byKey)
+        {
+            if (!byKey.TryGetValue(EditKey(exportIndex, containerPath, propName), out var edit))
+                return false;
+            // Write the new value where the engine reads it. Prefer the field that
+            // currently holds the source value (CultureInvariant first, else Value).
+            var nv = new FString(edit.NewValue ?? "");
+            if (tp.CultureInvariantString != null && !string.IsNullOrEmpty(tp.CultureInvariantString.Value))
+                tp.CultureInvariantString = nv;
+            else
+                tp.Value = nv;
+            return true;
+        }
+
+        static bool TryEditStr(StrPropertyData sp, int exportIndex, string containerPath,
+            string propName, Dictionary<string, AssetEdit> byKey)
+        {
+            if (!byKey.TryGetValue(EditKey(exportIndex, containerPath, propName), out var edit))
+                return false;
+            sp.Value = new FString(edit.NewValue ?? "");
+            return true;
+        }
+
+        // Apply a batch of edits to legacy .uasset files (in place). Edits are
+        // grouped by AssetPath; each asset is opened, patched across its exports,
+        // and written back via UAssetAPI (recomputes .uexp offsets). Returns total
+        // edits applied. Never throws on one bad asset.
+        static int ApplyEdits(List<AssetEdit> edits, EngineVersion version)
+        {
+            int total = 0;
+            foreach (var grp in edits.GroupBy(e => e.AssetPath))
+            {
+                string? path = grp.Key;
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) continue;
+                try
+                {
+                    var asset = new UAsset(path, version);
+                    var byKey = new Dictionary<string, AssetEdit>();
+                    foreach (var e in grp)
+                        byKey[EditKey(e.ExportIndex, e.ContainerPath ?? "", e.PropName ?? "")] = e;
+
+                    int applied = 0;
+                    int exportIdx = -1;
+                    foreach (var export in asset.Exports.OfType<NormalExport>())
+                    {
+                        exportIdx++;
+                        applied += ApplyEditsToProps(export.Data, exportIdx, "", byKey);
+                    }
+                    if (applied > 0)
+                    {
+                        asset.Write(path);   // rewrites .uasset (+ .uexp) with new offsets
+                        total += applied;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"ApplyEdits failed for {path}: {ex.Message}");
+                }
+            }
+            return total;
+        }
+
         // Extract all translatable items from ONE .uasset. Returns [] (and never
         // throws) on a failed/unreadable asset so a batch run skips it cleanly.
         static List<ExtractedItem> ProcessAsset(string filePath, EngineVersion version)
@@ -621,6 +756,8 @@ namespace UAssetExtractor
             string filePath = "";
             string inputDir = "";
             string outputPath = "";
+            string applyEdits = "";   // path to edits JSON
+            string baseDir = "";      // legacy asset dir the edits' AssetPath is relative to
             bool dumpTree = false;
             EngineVersion version = EngineVersion.VER_UE5_4;
 
@@ -638,6 +775,14 @@ namespace UAssetExtractor
                 {
                     outputPath = args[i + 1];
                 }
+                if (args[i] == "--apply-edits" && i + 1 < args.Length)
+                {
+                    applyEdits = args[i + 1];
+                }
+                if (args[i] == "--base-dir" && i + 1 < args.Length)
+                {
+                    baseDir = args[i + 1];
+                }
                 if (args[i] == "--engine" && i + 1 < args.Length)
                 {
                     if (Enum.TryParse<EngineVersion>(args[i + 1], out var parsedVer))
@@ -647,6 +792,28 @@ namespace UAssetExtractor
                 }
                 if (args[i] == "--dump-tree") dumpTree = true;
                 if (args[i] == "--dump-imports") { dumpTree = true; filePath = filePath; /* handled below */ }
+            }
+
+            // Byte-patch mode: read edits JSON, rewrite FText/FString in the legacy
+            // .uasset files in place. AssetPath in each edit is relative to baseDir.
+            if (!string.IsNullOrEmpty(applyEdits))
+            {
+                if (!File.Exists(applyEdits))
+                {
+                    Console.Error.WriteLine($"Edits file not found: {applyEdits}");
+                    Environment.Exit(1);
+                }
+                var raw = File.ReadAllText(applyEdits);
+                var edits = JsonConvert.DeserializeObject<List<AssetEdit>>(raw) ?? new List<AssetEdit>();
+                foreach (var e in edits)
+                {
+                    if (!string.IsNullOrEmpty(baseDir) && !string.IsNullOrEmpty(e.AssetPath)
+                        && !Path.IsPathRooted(e.AssetPath))
+                        e.AssetPath = Path.Combine(baseDir, e.AssetPath);
+                }
+                int applied = ApplyEdits(edits, version);
+                Console.WriteLine($"{{\"applied\":{applied},\"requested\":{edits.Count}}}");
+                return;
             }
 
             // Dump the raw import table to see if the unresolved ItemClass object
