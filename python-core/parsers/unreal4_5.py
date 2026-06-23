@@ -82,6 +82,56 @@ def _mod_path_from_utoc(uf: Path, root: str) -> str:
     return str(Path(rel).parent.as_posix())
 
 
+def _build_uasset_path_key(item: dict) -> list[str]:
+    """Build a UNIQUE address inside one .uasset for a translatable string.
+
+    `(InternalPath, PropName)` alone is NOT unique: one asset routinely holds
+    dozens of strings under the same prop name — a widget with many separate
+    `Text` exports, or a struct-array (MkPlus subsystem: dozens of `Desc` inside
+    struct elements of `droneStation`/`generator`/... arrays, PLUS single struct
+    props like `drone`). Without a discriminator they all collapse onto one stable
+    id and most translations are lost on extract (measured: 557/3859 rows). The
+    discriminator combines:
+      - ExportName   — the export the value lives in (e.g. ApplyBtnText); this
+        separates widget Text exports (case A).
+      - ContainerPath — the FULL nesting address inside the export, e.g.
+        "droneStation[0]" or "drone" or "x.Ingredients[1]". This is what pins a
+        struct-array / nested-struct value (case B); ExportName alone can't —
+        every subsystem element shares one export (Default__..._C).
+
+    MUST stay byte-identical to the inject reader's expectation (path[0]=internal,
+    path[1]=prop, path[2]=discriminator). Keep the two extract call sites using
+    THIS helper so the id never drifts between them.
+    """
+    seg = item.get("ExportName") or ""
+    cont = item.get("ContainerPath") or ""
+    base = [item["InternalPath"], item["PropName"]]
+    if cont:
+        # nested value (struct / array element): export + full container address.
+        return base + [f"{seg}|{cont}"]
+    if seg:
+        return base + [seg]
+    return base
+
+
+def _extract_cdo_meta(item: dict) -> dict | None:
+    """Pull the Part-B CDO full-array-replace fields out of an extractor item.
+    Returns None for items that aren't part of a translatable struct array."""
+    cls = item.get("CdoClass")
+    prop = item.get("CdoArrayProp")
+    token = item.get("CdoPlaceholderToken")
+    if not (cls and prop and token):
+        return None
+    return {
+        "class": cls,
+        "array_prop": prop,
+        "token": token,
+        # the full array JSON is attached to ONE item per array; "" on the rest
+        "array_json": item.get("CdoArrayJson") or "",
+        "omitted": bool(item.get("CdoArrayOmittedFields")),
+    }
+
+
 def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
     """Module-level worker for ProcessPoolExecutor. Extracts uassets from one mod's .utoc.
     Returns list of dicts (picklable) instead of TranslationString objects.
@@ -142,16 +192,23 @@ def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
                 if safe_path is None:
                     continue
                 file_key = f"uasset://{mod_rel}{PAK_SEP}{safe_path}"
-                path_key = [item["InternalPath"], item["PropName"]]
+                path_key = _build_uasset_path_key(item)
                 original_val = item["Value"]
-                results.append({
-                    "id": make_id("unreal4_5", file_key, path_key, original_val),
+                sid = make_id("unreal4_5", file_key, path_key, original_val)
+                rec = {
+                    "id": sid,
                     "original": original_val,
                     "context": f"Class: {item['AssetClass']} | Property: {item['PropName']}",
                     "file": file_key,
                     "path": path_key,
                     "engine": "unreal4_5",
-                })
+                }
+                # Part B: carry CDO full-array-replace metadata for inject (stripped
+                # before TranslationString construction; stored in _cdo_meta by id).
+                cdo = _extract_cdo_meta(item)
+                if cdo:
+                    rec["_cdo"] = cdo
+                results.append(rec)
         return results
     except Exception:
         return []
@@ -976,7 +1033,12 @@ class UnrealEngine4_5Parser(BaseParser):
         from . import pak as pakmod
         import tempfile
         import re
-        
+
+        # Part B: per-string CDO full-array-replace metadata, keyed by string id.
+        # Populated alongside extraction so inject (which re-runs this) can emit
+        # array-replace CDO patches without re-extracting structure.
+        self._cdo_meta = {}
+
         paks = list(iter_pak_files(root))
         utocs = list(iter_utoc_files(root))
         
@@ -1030,12 +1092,16 @@ class UnrealEngine4_5Parser(BaseParser):
                     inner = path_map.get(str(Path(ap).resolve())) if ap else None
                     if inner is None:
                         continue
-                    out.append(self._mk(
+                    ts = self._mk(
                         file=f"uasset://{mod_rel}{PAK_SEP}{inner}",
-                        path=[item["InternalPath"], item["PropName"]],
+                        path=_build_uasset_path_key(item),
                         original=item["Value"],
                         context=f"Class: {item['AssetClass']} | Property: {item['PropName']}"
-                    ))
+                    )
+                    out.append(ts)
+                    cdo = _extract_cdo_meta(item)
+                    if cdo:
+                        self._cdo_meta[ts.id] = cdo
 
         # 2. Extract from .utoc/ucas files via retoc to-legacy (assembles proper .uasset files)
         #    Each mod is processed in a separate process for true parallelism.
@@ -1065,7 +1131,11 @@ class UnrealEngine4_5Parser(BaseParser):
                 try:
                     dicts = future.result(timeout=120)
                     for d in dicts:
-                        out.append(TranslationString(**d))
+                        cdo = d.pop("_cdo", None)
+                        ts = TranslationString(**d)
+                        out.append(ts)
+                        if cdo:
+                            self._cdo_meta[ts.id] = cdo
                 except Exception as e:
                     logger.error(f"Parallel utoc extraction failed: {e}")
 
@@ -1158,6 +1228,13 @@ class UnrealEngine4_5Parser(BaseParser):
                 return "Description"
             return None
 
+        cdo_meta = getattr(self, "_cdo_meta", {})
+        # Part B: accumulate CDO full-array-replace groups, keyed by
+        # (mod_name, CdoClass, array_prop). Each group rebuilds one whole array.
+        #   group -> {"class","array_prop","array_json","omitted","mod_name",
+        #             "subs": {token: translated_text}}
+        array_cdo_groups = {}
+
         written_count = 0
         for s in uasset_strings:
             string_id = make_id(self.engine, s.file, s.path, s.original)
@@ -1173,6 +1250,24 @@ class UnrealEngine4_5Parser(BaseParser):
             internal_path = s.path[0]
             prop_name = s.path[1]
             asset_leaf = internal_path.split("/")[-1].lower()
+
+            # Part B: a string that lives inside a struct array can ONLY be applied
+            # by replacing the WHOLE array (ContentLib can't edit one element). Route
+            # it to the array-replace accumulator and skip the per-field CDO path
+            # (which would write a bogus top-level edit that ContentLib ignores).
+            meta = cdo_meta.get(string_id)
+            if meta:
+                gkey = (mod_name, meta["class"], meta["array_prop"])
+                grp = array_cdo_groups.setdefault(gkey, {
+                    "class": meta["class"], "array_prop": meta["array_prop"],
+                    "array_json": "", "omitted": meta["omitted"],
+                    "mod_name": mod_name, "internal_path": internal_path, "subs": {},
+                })
+                if meta["array_json"]:
+                    grp["array_json"] = meta["array_json"]
+                grp["subs"][meta["token"]] = translated_text
+                written_count += 1
+                continue
 
             # Recover the real plugin mount path (see notes below) and class path.
             #   1. MOUNT PATH: extractor reports `/Game/Mods/<Mod>/...` but mods are
@@ -1221,6 +1316,62 @@ class UnrealEngine4_5Parser(BaseParser):
                 entry[key] = translated_text
                 written_count += 1
 
+        # Part B: turn each array-replace group into a CDO patch. The class is the
+        # owning object's LoadObject path (a sub-object for selectors, the class
+        # default for subsystem arrays); the Edit replaces the WHOLE array property
+        # with the rebuilt JSON (placeholders swapped for translations). ContentLib
+        # mount-path rule applies to the class too: strip /Game/Mods.
+        for gkey, grp in array_cdo_groups.items():
+            array_json = grp["array_json"]
+            if not array_json:
+                # no anchor item carried the full array (shouldn't happen) -> skip
+                logger.warning(f"CDO array group {gkey} has no array JSON; skipped")
+                continue
+            # substitute placeholder tokens with the actual translations
+            filled = array_json
+            for token, tx in grp["subs"].items():
+                # JSON-encode the translation (without the surrounding quotes) so
+                # newlines/quotes in the text stay valid inside the JSON string.
+                enc = json.dumps(tx, ensure_ascii=False)[1:-1]
+                filled = filled.replace(token, enc)
+            # any leftover placeholder (untranslated element) -> restore nothing,
+            # leave its ORIGINAL text by stripping the marker is impossible here, so
+            # we just drop the patch if tokens remain (safer than emitting markers).
+            if "@@IPX:" in filled:
+                logger.warning(f"CDO array {gkey}: untranslated elements remain; skipped")
+                continue
+            try:
+                array_value = json.loads(filled)
+            except Exception as e:
+                logger.error(f"CDO array {gkey}: rebuilt JSON invalid: {e}")
+                continue
+
+            cls = grp["class"]
+            if cls.startswith("/Game/Mods/"):
+                cls = "/" + cls[len("/Game/Mods/"):]
+
+            patches_by_mod.setdefault(grp["mod_name"], {"recipes": {}, "items": {}, "cdos": {}})
+            cdo_map = patches_by_mod[grp["mod_name"]]["cdos"]
+            # one CDO file per (class), key by class so multiple array props on the
+            # same object merge into one file.
+            entry = cdo_map.setdefault(f"__arr__{cls}", {
+                "Class": cls, "Edits": [], "_seen": set(),
+            })
+            entry["Edits"].append({"Property": grp["array_prop"], "Value": array_value})
+
+            # A full-array-replace where a field had to be dropped (an unresolvable
+            # base-game object ref, e.g. Ingredients.ItemClass = UnknownExport) is
+            # LOSSY: ContentLib rebuilds each struct from scratch, so the omitted
+            # field resets to default. For a buildable subsystem that can blank a
+            # recipe's ingredients. We still emit it (the translation is the goal)
+            # but log loudly so a live test can confirm the build still works.
+            if grp.get("omitted"):
+                logger.warning(
+                    f"CDO array-replace {cls}.{grp['array_prop']} omitted unresolvable "
+                    f"field(s) (e.g. Ingredients) — rebuilt elements lose them; "
+                    f"verify the build/recipe in-game."
+                )
+
         # 2. Write patch files and register in backups as 'created'
         FOLDER = {"recipes": "RecipePatches", "items": "ItemPatches", "cdos": "CDOs"}
         for mod_name, kinds in patches_by_mod.items():
@@ -1236,7 +1387,22 @@ class UnrealEngine4_5Parser(BaseParser):
                     os.makedirs(dest_dir, exist_ok=True)
 
                 for internal_path, patch_data in target_map.items():
-                    asset_name = internal_path.split("/")[-1]
+                    # `__arr__<class>` keys (Part B array-replace) name the file from
+                    # the OWNING ASSET, not the sub-object leaf: dozens of selectors
+                    # share the sub-object name `FGUserSetting_IntSelector_0`, so
+                    # naming by leaf collapses 40 distinct classes into one file
+                    # (they overwrite each other). The owning asset = the package
+                    # path's last segment (before any `:` sub-object / `.` object).
+                    if internal_path.startswith("__arr__"):
+                        cls = internal_path[len("__arr__"):]
+                        pkg = cls.split(":")[0].split(".")[0]   # /A/B/Asset
+                        asset_pkg = pkg.rstrip("/").split("/")[-1]
+                        # include the sub-object leaf too so two arrays on different
+                        # sub-objects of one asset don't collide.
+                        sub = cls.split(":")[-1] if ":" in cls else ""
+                        asset_name = "arr_" + asset_pkg + (("_" + sub) if sub else "")
+                    else:
+                        asset_name = internal_path.split("/")[-1]
                     file_name = f"Patch_{mod_name}_{asset_name}.json"
 
                     try:

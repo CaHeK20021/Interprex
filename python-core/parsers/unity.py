@@ -175,8 +175,12 @@ _PLACEHOLDER_WORD_RE = re.compile(
     r'^(New Text|Option [A-C]|Test\d*|test|PLACEHOLDER|TODO|FIXME'
     r'|asdasd|descdesc|lorem|ipsum|dummy|sample|foo|bar|baz'
     r'|qwe|zxc|asd|fff|xxx|zzz|aaa|bbb|ccc|ddd|eee|ggg|hhh|iii|jjj|kkk'
-    r'|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|yyy)+$'
+    r'|lll|mmm|nnn|ooo|ppp|qqq|rrr|sss|ttt|uuu|vvv|www|yyy)+$', re.I
 )
+_GIBBERISH_RE       = re.compile(
+    r'(?:asd|qwe|zxc|ghj|foo|bar|baz|fff|xxx|zzz|test)\w{0,5}', re.I
+)
+_REPEATED_SUBSTR_RE = re.compile(r'(\w{3,})\1{2,}')  # "DESCDESCDESC", "asdasdasd"
 _VERSION_RAW_RE    = re.compile(
     r'^v\d+(\.\d+){1,3}(\s*\(.*\))?$'
 )
@@ -231,7 +235,7 @@ def _is_game_text_raw(text: str) -> bool:
     """
     t = text.strip()
 
-    # ── Base checks (reuse core logic) ──────────────────────────────────────
+    # ── Base checks ────────────────────────────────────────────────────────
     if len(t) < 3:
         return False
     if not any(c.isalpha() for c in t):
@@ -246,13 +250,32 @@ def _is_game_text_raw(text: str) -> bool:
     if _EXT_RE.search(t):              return False
     if _LOG_TAG_RE.match(t):           return False
 
-    # ── Placeholder / gibberish ─────────────────────────────────────────────
     low = t.lower()
+
+    # ── Hard rules: underscore = internal identifier, never dialogue ────────
+    if '_' in t:
+        return False
+
+    # ── Hard rule: "Unity" anywhere = engine internal ───────────────────────
+    if 'unity' in low:
+        return False
+
+    # ── Hard rule: assembly references ("UnityEngine...", "Version=0.0.0.0") ─
+    if ', assembly-' in low or ', unity.' in low or ', unityengine' in low:
+        return False
+    if 'version=0.0.0.0' in low or 'culture=neutral' in low:
+        return False
+
+    # ── Placeholder / gibberish ─────────────────────────────────────────────
     if _PLACEHOLDER_WORD_RE.match(low):    return False
     if _REPEATED_CHAR_RE.match(low):       return False
     if _REPEATED_WORD_RE.search(low):      return False
+    if _REPEATED_SUBSTR_RE.search(low):    return False  # "DESCDESCDESC"
 
-    # 3+ repeated words (not useful): "BREAKING NEWS BREAKING NEWS BREAKING NEWS"
+    # Gibberish prefixes: "ASD HELLO", "ghj ghj", "qwe asd"
+    if _GIBBERISH_RE.match(low):           return False
+
+    # Repeated words (3+ same word): "BREAKING NEWS BREAKING NEWS BREAKING NEWS"
     words = low.split()
     if len(words) >= 6:
         unique = set(words)
@@ -261,14 +284,8 @@ def _is_game_text_raw(text: str) -> bool:
 
     # ── Asset / engine names ────────────────────────────────────────────────
     if _ASSET_SUFFIX_RE.search(t):         return False
-
-    # Class name patterns: "KK Eyes_smile_cl", "PhoneController, Assembly-CSharp"
     if _CODE_WORD_RE.match(t):             return False
     if t.lower() in _KNOWN_CODE:           return False
-
-    # Dotted code names: "CharacterBubble, Assembly-CSharp"
-    if ", assembly-csharp" in low:         return False
-    if ", unity." in low or ", unityengine" in low: return False
 
     # ── Font names ──────────────────────────────────────────────────────────
     if _FONT_NAME_RE.search(t):            return False
@@ -278,7 +295,7 @@ def _is_game_text_raw(text: str) -> bool:
     if _PRIMITIVE_RE.match(t):             return False
     if _GLYPH_NAME_RE.match(t):            return False
 
-    # TMP / UI state names that are single words
+    # ── TMP / UI state single-word blacklist ────────────────────────────────
     if low in frozenset({
         "normal", "highlighted", "pressed", "selected", "disabled",
         "foldout", "button", "toggle", "slider", "scrollbar",
@@ -291,24 +308,28 @@ def _is_game_text_raw(text: str) -> bool:
         "dropcap", "numbers",
         "style", "sheet", "settings",
         "alt", "ctrl", "shift", "tab", "escape", "return", "delete",
+        "vertical", "horizontal", "submit", "cancel",
         "beer", "wine", "gin", "milk", "bread", "eggs", "chips",
         "oranges", "tomatoes", "laptop", "naked", "out", "party",
         "pushed", "toilet", "work", "university", "groceries",
         "position", "link", "quote", "title",
         "smiley", "wink", "whaaat!",
-        "unity logo", "dropcap numbers", "tmp settings",
-        "default style sheet", "default sprite asset",
+        "new text", "option a", "option b", "option c",
+        "tmp settings", "default style sheet", "default sprite asset",
         "panel title", "dialogue options", "drinking hint",
         "scene name", "slot 1", "char name", "message text",
-        "bed2_03 (2)",
+        "storage room bj", "start massage", "continue massage",
+        "next foot",
         "blue to purple - vertical", "dark to light green - vertical",
         "light to dark green - vertical", "yellow to orange - vertical",
         "red:", "yellow:", "blue:", "green:", "white:", "black:",
-        "start massage", "continue massage", "massge",
-        "next foot", "storage room bj",
-        "new text", "option a", "option b", "option c",
-        "asdasd asd", "descdescdesc",
         "automatic control", "manual control",
+        "break", "test2",
+    }):
+        return False
+
+    # ── Multi-line blacklist (long junk that's not dialogue) ────────────────
+    if low in frozenset({
         "i can not decline this call",
         "hold and move in circular motion",
         "your phone is ringing. close the quest window and press 'o' to open your phone",
@@ -317,18 +338,11 @@ def _is_game_text_raw(text: str) -> bool:
         "unlocked dialogue through interactions in the world and other dialogues",
         "regular dialogue (side dialogue)",
         "starts sexual scene",
-        "break",
-        "test2",
+        "ghj ghj", "test 1 test 1", "asd hello",
     }):
         return False
 
-    # ── Gibberish / test text ───────────────────────────────────────────────
-    # "ghj ghj", "test 1 test 1", "asdasd", repeated words
-    if re.match(r'^(?:test\s*\d*\s*){1,}$', low):          return False
-    if re.match(r'^(?:ghj|qwe|zxc|asd|fff|xxx|zzz)+(\s+\1)*$', low): return False
-    if re.match(r'^(?:asdasd|descdesc|lorem|ipsum|dummy|sample)+', low): return False
-
-    # ── Emoji descriptions from TMP (e.g. "Smiling face with smiling eyes") ─
+    # ── Emoji descriptions from TMP ─────────────────────────────────────────
     if re.match(r'^(smiling|grinning|face with|winking|pouting|anguished|'
                 r'confounded|disappointed|fearful|joy|sad|thinking|'
                 r'neutral|expressionless|unamused|sweat|weary|'
@@ -831,6 +845,9 @@ class UnityParser(BaseParser):
         Used when typetree fails for ALL objects in an asset file (missing DLL,
         unknown type tree, etc.). Scans raw bytes for Unity's int32-length-prefixed
         UTF-8 strings and applies a stricter filter than the typetree path.
+        Provides context from sibling strings in the same blob (neighboring
+        strings from the same MonoBehaviour are usually related — a character
+        name near its dialogue, a quest title near its description).
         """
         rel_path = os.path.relpath(fpath, root).replace("\\", "/")
         results = []
@@ -846,22 +863,134 @@ class UnityParser(BaseParser):
                 if len(raw) < 20:
                     continue
 
-                strings = _extract_length_prefixed(raw)
-                for s in strings:
+                # Phase 1: collect all valid strings from this blob
+                blob_strings: list[str] = []
+                for s in _extract_length_prefixed(raw):
                     t = s.strip()
-                    if not t or t in seen_texts:
-                        continue
-                    if not _is_game_text_raw(t):
-                        continue
+                    if t and t not in seen_texts and _is_game_text_raw(t):
+                        blob_strings.append(t)
 
+                if not blob_strings:
+                    continue
+
+                # Phase 2: detect possible speaker names in this blob
+                # Names: 1-2 words, ≤20 chars, starts uppercase, not a common UI word
+                _UI_NAMES = frozenset({
+                    "play", "quit", "load", "save", "back", "next", "yes", "no",
+                    "ok", "all", "none", "video", "audio", "game", "settings",
+                    "gallery", "music", "loading", "credits", "options", "resume",
+                    "start", "new", "continue", "delete", "accept", "cancel",
+                    "confirm", "close", "help", "return", "pause", "skip",
+                    "adult", "content", "disclaimer",
+                })
+                possible_names: list[str] = []
+                for s in blob_strings:
+                    words = s.split()
+                    if (1 <= len(words) <= 2 and
+                            len(s) <= 20 and
+                            s[0].isupper() and
+                            s.lower() not in _UI_NAMES and
+                            not any(c in s for c in '?!.:;,()[]{}') and
+                            not s.isupper() and
+                            not re.match(r'^[A-Z][a-z]+$', s)):  # single common word like "Video"
+                        possible_names.append(s)
+
+                # Phase 3: emit each string with full context
+                for idx, t in enumerate(blob_strings):
                     seen_texts.add(t)
+
+                    ctx_parts = [f"File: {os.path.basename(fpath)}"]
+
+                    # Speaker hint (only for dialogue blobs)
+                    if possible_names and len(possible_names) <= 3:
+                        ctx_parts.append(f"Speakers in this block: {', '.join(possible_names)}")
+
+                    # Sibling context: only for dialogue-like strings
+                    # (multi-word, >10 chars). UI buttons like "Play", "SOLD OUT"
+                    # don't need context — LLM knows what they are.
+                    siblings = [s for s in blob_strings if s != t]
+                    if siblings and ' ' in t and len(t) > 10:
+                        capped = []
+                        total = 0
+                        for s in siblings:
+                            if len(capped) >= 15:
+                                break
+                            addition = len(s) + 2
+                            if total + addition > 800:
+                                break
+                            capped.append(s)
+                            total += addition
+                        ctx_parts.append(f"Other strings in this block: {'; '.join(capped)}")
+
                     path = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
-                    context = f"File: {os.path.basename(fpath)}, PathID: {obj.path_id}, Method: length-prefix"
-                    results.append(self._mk(rel_path, path, t, context))
+                    results.append(self._mk(rel_path, path, t, ", ".join(ctx_parts)))
         except Exception as e:
             print(f"Error in raw fallback for {fpath}: {e}", file=sys.stderr)
 
         return results
+
+    def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str]) -> int:
+        """Inject translations via raw byte replacement when typetree fails.
+
+        scan-collect-apply-reversed: scan each MonoBehaviour for length-prefixed
+        strings, collect (offset, end, new_bytes) for matches, then apply from
+        the end backwards so earlier offsets stay valid.
+        """
+        rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+        written = 0
+
+        try:
+            import UnityPy
+            env = UnityPy.load(fpath)
+
+            for obj in env.objects:
+                if obj.type.name != "MonoBehaviour":
+                    continue
+                raw = obj.get_raw_data()
+                if len(raw) < 20:
+                    continue
+
+                patches: list[tuple[int, int, bytes]] = []
+
+                i = 0
+                while i + 4 < len(raw):
+                    slen = struct.unpack_from('<I', raw, i)[0]
+                    if 2 <= slen <= 5000 and i + 4 + slen <= len(raw):
+                        chunk = raw[i+4:i+4+slen]
+                        try:
+                            s = chunk.decode('utf-8')
+                            if s.isprintable() and len(s) > 0:
+                                t = s.strip()
+                                if t and '_' not in t and _is_game_text_raw(t):
+                                    path = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
+                                    sid = make_id(self.engine, rel_path, path, t)
+                                    if sid in translations:
+                                        new_text = translations[sid]
+                                        new_bytes = new_text.encode('utf-8')
+                                        new_len = len(new_bytes)
+                                        new_padded = (new_len + 3) & ~3  # align to 4 bytes
+                                        new_blob = struct.pack('<I', new_padded) + new_bytes + b'\x00' * (new_padded - new_len)
+                                        patches.append((i, i + 4 + slen, new_blob))
+                        except (UnicodeDecodeError, ValueError):
+                            pass
+                    i += 1
+
+                if not patches:
+                    continue
+
+                # Apply patches in reverse order so earlier offsets stay valid
+                patches.sort(key=lambda p: p[0], reverse=True)
+                new_raw = bytearray(raw)
+                for start, end, new_blob in patches:
+                    new_raw[start:end] = new_blob
+
+                obj.set_raw_data(bytes(new_raw))
+                written += len(patches)
+
+        except Exception as e:
+            print(f"Error in raw inject for {fpath}: {e}", file=sys.stderr)
+
+        return written
 
     def _extract_localization(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
         self._current_root = root
@@ -1013,6 +1142,7 @@ class UnityParser(BaseParser):
                 continue
 
             failed_count = 0
+            typetree_found = 0
             try:
                 env = UnityPy.load(fpath)
                 unity_version = None
@@ -1067,6 +1197,7 @@ class UnityParser(BaseParser):
                                             data.save_typetree(tree)
                                         changed = True
                                         written += 1
+                                        typetree_found += 1
                         except Exception:
                             failed_count += 1
 
@@ -1108,6 +1239,12 @@ class UnityParser(BaseParser):
                                     except Exception:
                                         failed_count += 1
 
+                if typetree_found == 0 and failed_count > 0:
+                    raw_written = self._inject_raw_fallback(fpath, root, translations)
+                    if raw_written > 0:
+                        changed = True
+                        written += raw_written
+
                 if changed:
                     self.backup_file(root, fpath)
                     with open(fpath, "wb") as f:
@@ -1116,7 +1253,9 @@ class UnityParser(BaseParser):
             except Exception as e:
                 print(f"Error injecting into assets file {fpath}: {e}", file=sys.stderr)
 
-            if failed_count > 0:
+            if typetree_found == 0 and failed_count > 0:
+                pass  # already handled above
+            elif failed_count > 0:
                 print(f"Warning: Failed to inject {failed_count} objects in compiled asset {fpath}.", file=sys.stderr)
 
         for fpath in source_files:

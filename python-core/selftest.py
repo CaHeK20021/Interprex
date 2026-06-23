@@ -2930,6 +2930,115 @@ def check_unreal4_5_utoc() -> None:
     shutil.rmtree(src_root, ignore_errors=True)
 
 
+def check_unreal4_5_cdo() -> None:
+    """Part A (unique path keys, no id collisions) + Part B (CDO full-array-replace).
+    Pure-function + mini-inject test; needs no game/retoc — exercises the exact
+    collision case (557 lost strings before the fix) and the array-replace patch
+    generation (selectors=safe, subsystem=omitted Ingredients)."""
+    import os, tempfile, shutil, json as _json
+    from parsers.unreal4_5 import (
+        UnrealEngine4_5Parser, _build_uasset_path_key, _extract_cdo_meta,
+    )
+    from parsers.base import make_id, TranslationString
+
+    # --- Part A: unique path keys for collision-prone items -------------------
+    # widget case: many exports, same PropName=Text -> ExportName disambiguates
+    widget_items = [
+        {"InternalPath": "/Game/Mods/M/W", "PropName": "Text", "ExportName": "Btn1#3",
+         "ContainerPath": "", "Value": "Apply"},
+        {"InternalPath": "/Game/Mods/M/W", "PropName": "Text", "ExportName": "Btn2#5",
+         "ContainerPath": "", "Value": "Cancel"},
+    ]
+    # struct-array case: one export, many elements -> ContainerPath disambiguates
+    array_items = [
+        {"InternalPath": "/Game/Mods/M/S", "PropName": "Desc", "ExportName": "Def#1",
+         "ContainerPath": "droneStation[0]", "Value": "A"},
+        {"InternalPath": "/Game/Mods/M/S", "PropName": "Desc", "ExportName": "Def#1",
+         "ContainerPath": "droneStation[1]", "Value": "B"},
+        {"InternalPath": "/Game/Mods/M/S", "PropName": "Desc", "ExportName": "Def#1",
+         "ContainerPath": "drone", "Value": "C"},
+    ]
+    keys = [tuple(_build_uasset_path_key(i)) for i in widget_items + array_items]
+    assert len(set(keys)) == len(keys), f"path keys collide: {keys}"
+
+    # --- Part B: _extract_cdo_meta only fires for array items -----------------
+    plain = {"InternalPath": "/x", "PropName": "Text", "Value": "v"}
+    assert _extract_cdo_meta(plain) is None, "plain item should have no CDO meta"
+    cdo_item = {
+        "InternalPath": "/x", "PropName": "Name", "Value": "Linear",
+        "CdoClass": "/A/B.B:Sel", "CdoArrayProp": "IntegerSelectionValues",
+        "CdoPlaceholderToken": "@@IPX:0:IntegerSelectionValues:0:Name@@",
+        "CdoArrayJson": '[{"Name":"@@IPX:0:IntegerSelectionValues:0:Name@@","Value":0}]',
+        "CdoArrayOmittedFields": False,
+    }
+    meta = _extract_cdo_meta(cdo_item)
+    assert meta and meta["array_prop"] == "IntegerSelectionValues" and not meta["omitted"]
+
+    # --- Part B: mini-inject builds the array-replace CDO ----------------------
+    # Two arrays: a SAFE selector (omitted=False) and a RISKY subsystem array
+    # (omitted=True, Ingredients dropped). Verify both patches, token substitution,
+    # the omitted flag carried through, and per-asset file naming (no collision).
+    p = UnrealEngine4_5Parser()
+    root = tempfile.mkdtemp(prefix="u45cdo_")
+    try:
+        sel_json = '[{"Name":"@@IPX:0:Opt:0:Name@@","Value":0},{"Name":"@@IPX:0:Opt:1:Name@@","Value":1}]'
+        sub_json = '[{"Buildable":"/M/Build_X.Build_X_C","Desc":"@@IPX:1:arr:0:Desc@@","Recipe":"/M/Recipe_X.Recipe_X_C"}]'
+        s1 = TranslationString(id="", original="Linear", context="", engine="unreal4_5",
+            file="uasset://M//Game/Mods/M/Sel", path=["/Game/Mods/M/Sel", "Name", "a"])
+        s1.id = make_id("unreal4_5", s1.file, s1.path, s1.original)
+        s2 = TranslationString(id="", original="Expo", context="", engine="unreal4_5",
+            file="uasset://M//Game/Mods/M/Sel", path=["/Game/Mods/M/Sel", "Name", "b"])
+        s2.id = make_id("unreal4_5", s2.file, s2.path, s2.original)
+        s3 = TranslationString(id="", original="Desc EN", context="", engine="unreal4_5",
+            file="uasset://M//Game/Mods/M/Sub", path=["/Game/Mods/M/Sub", "Desc", "c"])
+        s3.id = make_id("unreal4_5", s3.file, s3.path, s3.original)
+        p._uasset_cache = [s1, s2, s3]
+        p._uasset_cache_key = (root, None)
+        p._cdo_meta = {
+            s1.id: {"class": "/Game/Mods/M/Sel.Sel:Opt", "array_prop": "Opt",
+                    "token": "@@IPX:0:Opt:0:Name@@", "array_json": sel_json, "omitted": False},
+            s2.id: {"class": "/Game/Mods/M/Sel.Sel:Opt", "array_prop": "Opt",
+                    "token": "@@IPX:0:Opt:1:Name@@", "array_json": "", "omitted": False},
+            s3.id: {"class": "/Game/Mods/M/Sub.Default__Sub_C", "array_prop": "arr",
+                    "token": "@@IPX:1:arr:0:Desc@@", "array_json": sub_json, "omitted": True},
+        }
+        translations = {s1.id: "Линейный", s2.id: "Экспонента", s3.id: "Описание RU"}
+        n = p._inject_into_uassets(root, translations, None)
+        assert n == 3, f"expected 3 written, got {n}"
+
+        cdo_dir = os.path.join(root, "FactoryGame", "Configs", "ContentLib", "CDOs")
+        files = os.listdir(cdo_dir)
+        # two DISTINCT array files (selector + subsystem), named per owning asset
+        arr_files = [f for f in files if "_arr_" in f]
+        assert len(arr_files) == 2, f"expected 2 array CDO files, got {arr_files}"
+        # no leftover placeholders anywhere
+        for f in files:
+            txt = open(os.path.join(cdo_dir, f), encoding="utf-8").read()
+            assert "@@IPX:" not in txt, f"leftover placeholder in {f}"
+
+        # selector: mount path stripped, full array, both options translated
+        sel = next(f for f in arr_files if "Sel" in f)
+        sd = _json.load(open(os.path.join(cdo_dir, sel), encoding="utf-8"))
+        assert sd["Class"] == "/M/Sel.Sel:Opt", sd["Class"]
+        opt = next(e for e in sd["Edits"] if e["Property"] == "Opt")["Value"]
+        assert [o["Name"] for o in opt] == ["Линейный", "Экспонента"], opt
+        assert [o["Value"] for o in opt] == [0, 1], "non-text fields must survive"
+
+        # subsystem: Desc translated, Buildable/Recipe kept, Ingredients absent
+        sub = next(f for f in arr_files if "Sub" in f)
+        ud = _json.load(open(os.path.join(cdo_dir, sub), encoding="utf-8"))
+        arr = next(e for e in ud["Edits"] if e["Property"] == "arr")["Value"]
+        assert arr[0]["Desc"] == "Описание RU", arr[0]
+        assert arr[0]["Buildable"] == "/M/Build_X.Build_X_C"
+        assert "Ingredients" not in arr[0], "omitted field must stay omitted"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("OK — unreal4_5 CDO: unique path keys (no collisions), array-replace "
+          "patch (selector safe, subsystem Ingredients-omitted), token subst, "
+          "per-asset file naming")
+
+
 def check_prompt_width() -> None:
     """The fixed-width caption constraint must reach the model as a FIRST-CLASS
     field (max_chars / fixed_width on the item), NOT buried in `context` — which
@@ -3959,8 +4068,9 @@ def main() -> int:
     check_unreal4()
     check_unreal4_pak()
     check_unreal4_5_utoc()
+    check_unreal4_5_cdo()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo) + scheduler all pass")
     return 0
 
 

@@ -1046,7 +1046,7 @@ def extract(req: ExtractReq) -> dict:
                 if (cache_data.get("source_hash") == current_hash and 
                         cache_data.get("cache_version") == EXTRACT_CACHE_VERSION and 
                         cache_data.get("code_hash") == code_hash and
-                        "strings" in cache_data):
+                        cache_data.get("strings")):
                     logger.info(f"Extract cache hit for {req.root}! Loaded {len(cache_data['strings'])} strings in milliseconds.")
                     return {"strings": cache_data["strings"]}
         except Exception as e:
@@ -1055,8 +1055,8 @@ def extract(req: ExtractReq) -> dict:
     # 3. Кэш промахнулся — выполняем реальное тяжелое извлечение
     strings = [s.to_dict() for s in parser.extract(req.root, req.sub_paths)]
     
-    # 4. Записываем результат в кэш (только если извлекали всё, без sub_paths)
-    if current_hash and not req.sub_paths:
+    # 4. Записываем результат в кэш (только если извлекали всё, без sub_paths, и есть строки)
+    if current_hash and not req.sub_paths and strings:
         try:
             cache_dir = os.path.dirname(cache_path)
             os.makedirs(cache_dir, exist_ok=True)
