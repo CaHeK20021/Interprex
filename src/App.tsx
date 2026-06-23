@@ -360,6 +360,14 @@ export default function App() {
   // True once the proxy autocheck got a decisive verdict. False at launch and
   // after an offline start, so a translate run knows to re-check first.
   const proxyResolvedRef = useRef(false);
+  const runSettingsRef = useRef<{
+    provider: string;
+    model: string;
+    threads: number;
+    baseUrl: string;
+    apiKeys: string[];
+  } | null>(null);
+  const shouldRestartRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   // Search query for string filtering
   const [searchQuery, setSearchQuery] = useState("");
@@ -373,6 +381,8 @@ export default function App() {
   const [justTranslatedIds, setJustTranslatedIds] = useState<Set<string>>(new Set());
   // Filter strings by source type: all, regular strings (say, screen, define), python (uscore), or none
   const [stringTypeFilter, setStringTypeFilter] = useState<"all" | "regular" | "python" | "none">("all");
+  // Filter strings by translation status: all, translated, or untranslated
+  const [translationStatusFilter, setTranslationStatusFilter] = useState<"all" | "translated" | "untranslated">("all");
   // In mods mode: set of mod paths to hide from the table list
   const [filterHiddenModPaths, setFilterHiddenModPaths] = useState<Set<string>>(new Set());
   // Zero-based index of the visible table page (PAGE_SIZE rows each).
@@ -449,6 +459,7 @@ export default function App() {
     setOnlyLatinInTranslation(false);
     setFilterHiddenModPaths(new Set());
     setJustTranslatedIds(new Set()); // Clear pinned/highlighted translations
+    setTranslationStatusFilter("all");
     setPage(0);
   };
 
@@ -458,6 +469,7 @@ export default function App() {
     if (stringTypeFilter !== "all") count++;
     if (onlyLatinInTranslation) count++;
     if (translationMode === "mods" && filterHiddenModPaths.size > 0) count++;
+    if (translationStatusFilter !== "all") count++;
     return count;
   };
 
@@ -507,6 +519,12 @@ export default function App() {
   const [activeModel, setActiveModel] = useState("");
   const [modelsLoading, setModelsLoading] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const isFullyPaused = useMemo(() => {
+    if (!isPaused) return false;
+    const phases = Object.values(workerPhases);
+    if (phases.length === 0) return false;
+    return phases.every((p) => p === "paused");
+  }, [isPaused, workerPhases]);
   const [abortController, _setAbortController] = useState<AbortController | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const setAbortController = (controller: AbortController | null) => {
@@ -619,7 +637,9 @@ export default function App() {
       }
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
   }, []);
 
   // Wait for any in-flight disk write before the window closes.
@@ -745,7 +765,7 @@ export default function App() {
 
   /** Open a cell for inline editing. No-op while a bulk operation is running. */
   function startEdit(id: string, current: string) {
-    if (busy) return;
+    if (busy && !isPaused) return;
     setEditingId(id);
     setEditingVal(current);
   }
@@ -759,6 +779,22 @@ export default function App() {
     setEditingId(null);
     if (!project) return;
     const entry = project.strings[id];
+
+    // Add to justTranslatedIds if they typed a non-empty translation, so it stays visible under filters
+    if (editingVal.trim() !== "") {
+      setJustTranslatedIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+    } else {
+      setJustTranslatedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+
     const updated: ProjectFile = {
       ...project,
       strings: {
@@ -905,7 +941,7 @@ export default function App() {
   }
 
   async function handleToggleMod(path: string) {
-    if (busy) return;
+    if (busy && !isPaused) return;
     const isSelected = selectedModPaths.includes(path);
     const nextPaths = isSelected
       ? selectedModPaths.filter((p) => p !== path)
@@ -915,7 +951,7 @@ export default function App() {
   }
 
   async function handleSelectAllMods() {
-    if (busy) return;
+    if (busy && !isPaused) return;
     const allPaths = detectedMods
       .filter((m) => m.total_count !== undefined && m.total_count > 0)
       .map((m) => m.path);
@@ -924,7 +960,7 @@ export default function App() {
   }
 
   async function handleDeselectAllMods() {
-    if (busy) return;
+    if (busy && !isPaused) return;
     setSelectedModPaths([]);
     await scanSelectedMods([]);
   }
@@ -971,8 +1007,24 @@ export default function App() {
   async function togglePause() {
     try {
       if (isPaused) {
-        await resumeTranslation();
-        setIsPaused(false);
+        const settingsChanged = runSettingsRef.current && (
+          runSettingsRef.current.provider !== provider ||
+          runSettingsRef.current.model !== model ||
+          runSettingsRef.current.threads !== threads ||
+          runSettingsRef.current.baseUrl !== baseUrl ||
+          JSON.stringify(runSettingsRef.current.apiKeys) !== JSON.stringify(apiKeys)
+        );
+        if (settingsChanged) {
+          shouldRestartRef.current = true;
+          if (abortController) {
+            abortController.abort();
+            setAbortController(null);
+          }
+          setIsPaused(false);
+        } else {
+          await resumeTranslation();
+          setIsPaused(false);
+        }
       } else {
         await pauseTranslation();
         setIsPaused(true);
@@ -985,6 +1037,14 @@ export default function App() {
 
   async function translateAll(targetIds?: string[]): Promise<{ ok: boolean; project?: ProjectFile }> {
     if (!project || !engine) return { ok: false };
+    runSettingsRef.current = {
+      provider,
+      model,
+      threads,
+      baseUrl,
+      apiKeys: [...apiKeys],
+    };
+    shouldRestartRef.current = false;
     let ok = true;
     let currentProject = project;
     try {
@@ -1137,6 +1197,12 @@ export default function App() {
       } else {
         fail(e);
       }
+    }
+    if (shouldRestartRef.current) {
+      shouldRestartRef.current = false;
+      setTimeout(() => {
+        translateAll(targetIds);
+      }, 50);
     }
     return { ok, project: ok ? currentProject : undefined };
   }
@@ -1711,7 +1777,7 @@ export default function App() {
 
 
   const translateDisabled =
-    busy ||
+    busy && !isPaused ||
     !strings.length ||
     !activeRoot ||
     (providerInfo.needsKey && !primaryKey) ||
@@ -1747,6 +1813,21 @@ export default function App() {
       result = result.filter((s) => s.path.includes("uscore") || justTranslatedIds.has(s.id));
     } else if (stringTypeFilter === "none") {
       result = result.filter((s) => justTranslatedIds.has(s.id));
+    }
+
+    // Filter by translation status
+    if (translationStatusFilter === "translated") {
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        const entry = project?.strings[s.id];
+        return entry && entry.translated && entry.translated.trim() !== "";
+      });
+    } else if (translationStatusFilter === "untranslated") {
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        const entry = project?.strings[s.id];
+        return !entry || !entry.translated || entry.translated.trim() === "";
+      });
     }
 
     // Filter only those that contain foreign words in their translation (ignoring Ren'Py tags)
@@ -1809,7 +1890,7 @@ export default function App() {
     }
 
     return result;
-  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds]);
+  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds, translationStatusFilter]);
 
   // Pagination math. pageCount is at least 1 so "page 1 of 1" reads right on a
   // small project. Clamp the current page in case strings shrank under it (e.g.
@@ -1834,7 +1915,7 @@ export default function App() {
               handleTranslate(Array.from(selectedIds));
               setSelectedIds(new Set()); // Reset selection after translation
             }}
-            disabled={busy}
+            disabled={busy && !isPaused}
             title="Перевести выбранные строки заново с помощью выбранной модели"
           >
             🔄 Переперевести
@@ -1858,14 +1939,14 @@ export default function App() {
         <div className={`mode-switcher engine-${engine || "none"}`}>
           <button
             className={`mode-btn ${translationMode === "game" ? "active" : ""}`}
-            disabled={busy}
+            disabled={busy && !isPaused}
             onClick={() => changeTranslationMode("game")}
           >
             {t("modeGame")}
           </button>
           <button
             className={`mode-btn ${translationMode === "mods" ? "active" : ""}`}
-            disabled={busy}
+            disabled={busy && !isPaused}
             onClick={() => changeTranslationMode("mods")}
           >
             {t("modeMods")}
@@ -2009,11 +2090,11 @@ export default function App() {
 
       <div className="controls">
         {translationMode === "game" ? (
-          <button onClick={() => setFolderPickerKind("game")} disabled={busy}>
+          <button onClick={() => setFolderPickerKind("game")} disabled={busy && !isPaused}>
             {t("openFolder")}
           </button>
         ) : (
-          <button onClick={() => setFolderPickerKind("mods")} disabled={busy}>
+          <button onClick={() => setFolderPickerKind("mods")} disabled={busy && !isPaused}>
             {t("openModsFolder")}
           </button>
         )}
@@ -2026,7 +2107,7 @@ export default function App() {
               setTarget(next);
               saveSetting("targetLang", next);
             }}
-            disabled={busy}
+            disabled={busy && !isPaused}
           >
             {TARGET_LANGS.map((l) => (
               <option key={l} value={l}>
@@ -2043,7 +2124,7 @@ export default function App() {
                 type="button"
                 className={fontStyle === "smooth" ? "active" : ""}
                 onClick={() => setFontStyle("smooth")}
-                disabled={busy}
+                disabled={busy && !isPaused}
                 title={t("fontStyleSmoothHint") as string}
               >
                 {t("fontStyleSmooth")}
@@ -2052,7 +2133,7 @@ export default function App() {
                 type="button"
                 className={`fs-pixel ${fontStyle === "pixel" ? "active" : ""}`}
                 onClick={() => setFontStyle("pixel")}
-                disabled={busy}
+                disabled={busy && !isPaused}
                 title={t("fontStylePixelHint") as string}
               >
                 {t("fontStylePixel")}
@@ -2089,7 +2170,7 @@ export default function App() {
             <button
               className="btn-danger"
               onClick={handleRestoreBackup}
-              disabled={busy}
+              disabled={busy && !isPaused}
               title={t("restoreOriginalHint") as string}
             >
               {t("restoreOriginal") as string}
@@ -2097,7 +2178,7 @@ export default function App() {
             <button
               className="btn-secondary"
               onClick={handleDiscardBackup}
-              disabled={busy}
+              disabled={busy && !isPaused}
               title={t("deleteBackupHint") as string}
             >
               {t("deleteBackup") as string}
@@ -2278,7 +2359,7 @@ export default function App() {
               const restoredFreeOnly = isOp ? (loadSetting("openrouterFreeOnly", "false") === "true") : false;
               setFreeOnly(restoredFreeOnly);
             }}
-            disabled={busy}
+            disabled={busy && !isFullyPaused}
           >
             {PROVIDERS.map((p) => (
               <option key={p.id} value={p.id}>
@@ -2297,7 +2378,7 @@ export default function App() {
                 setModel(e.target.value);
                 saveProviderSetting("providerModel", provider, e.target.value);
               }}
-              disabled={busy}
+              disabled={busy && !isFullyPaused}
             >
               {/* Empty option only while the current model isn't one we found,
                   so the box never silently shows the wrong row. */}
@@ -2339,7 +2420,7 @@ export default function App() {
                 setModel(e.target.value);
                 saveProviderSetting("providerModel", provider, e.target.value);
               }}
-              disabled={busy}
+              disabled={busy && !isFullyPaused}
             />
           )}
         </label>
@@ -2357,7 +2438,7 @@ export default function App() {
                   setThreads(n);
                   saveProviderSetting("providerThreads", provider, String(n));
                 }}
-                disabled={busy}
+                disabled={busy && !isFullyPaused}
               >
                 {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
                   <option key={n} value={n}>{n}</option>
@@ -2380,7 +2461,7 @@ export default function App() {
                   setRpmLimit(v);
                   saveProviderSetting("providerRpm", provider, String(v));
                 }}
-                disabled={busy}
+                disabled={busy && !isFullyPaused}
               />
             </label>
           </>
@@ -2408,7 +2489,7 @@ export default function App() {
                 setFreeOnly(checked);
                 saveSetting("openrouterFreeOnly", checked ? "true" : "false");
               }}
-              disabled={busy}
+              disabled={busy && !isFullyPaused}
             />
           </label>
         )}
@@ -2427,7 +2508,7 @@ export default function App() {
               setMaxBatchSize(n);
               saveSetting("maxBatchSize", String(n));
             }}
-            disabled={busy}
+            disabled={busy && !isFullyPaused}
           />
         </label>
 
@@ -2451,7 +2532,7 @@ export default function App() {
                 setBaseUrl(e.target.value);
                 saveProviderSetting("providerBaseUrl", provider, e.target.value);
               }}
-              disabled={busy}
+              disabled={busy && !isFullyPaused}
             />
           </label>
         )}
@@ -2467,7 +2548,7 @@ export default function App() {
                 type="button"
                 className="api-key-add btn-secondary"
                 onClick={() => updateKeys([...apiKeys, ""])}
-                disabled={busy}
+                disabled={busy && !isFullyPaused}
                 title={t("addKey") as string}
               >
                 + {t("addKey")}
@@ -2492,14 +2573,14 @@ export default function App() {
                       return n;
                     })
                   }
-                  disabled={busy}
+                   disabled={busy && !isFullyPaused}
                 />
                 {apiKeys.length > 1 && (
                   <button
                     type="button"
                     className="api-key-del"
                     onClick={() => updateKeys(apiKeys.filter((_, j) => j !== i))}
-                    disabled={busy}
+                     disabled={busy && !isFullyPaused}
                     title={t("removeKey") as string}
                   >
                     ×
@@ -2759,6 +2840,24 @@ export default function App() {
                 
                 <div className="filter-dropdown-divider" />
                 
+                <div className="filter-dropdown-section-title">Статус перевода:</div>
+                <div className="filter-dropdown-select-wrap">
+                  <select
+                    className="filter-dropdown-select"
+                    value={translationStatusFilter}
+                    onChange={(e) => {
+                      setPage(0);
+                      setTranslationStatusFilter(e.target.value as any);
+                    }}
+                  >
+                    <option value="all">Все строки</option>
+                    <option value="untranslated">Только непереведенные</option>
+                    <option value="translated">Только переведенные</option>
+                  </select>
+                </div>
+
+                <div className="filter-dropdown-divider" />
+                
                 <div className="filter-dropdown-section-title">Ошибки / Подсветка:</div>
                 <label className="filter-dropdown-item">
                   <input
@@ -2774,7 +2873,7 @@ export default function App() {
 
 
 
-          {(searchQuery || onlyLatinInTranslation || stringTypeFilter !== "all" || selectedIds.size > 0) && (
+          {(searchQuery || onlyLatinInTranslation || stringTypeFilter !== "all" || translationStatusFilter !== "all" || selectedIds.size > 0) && (
             <span className="search-count">
               Найдено: {filteredStrings.length} из {strings.length}
             </span>

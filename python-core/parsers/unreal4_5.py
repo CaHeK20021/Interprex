@@ -59,6 +59,14 @@ from .base import BaseParser, TranslationString
 # Security limits
 MAX_UASSET_SIZE = int(1.2 * 1024 * 1024 * 1024)  # 1.2 GB
 
+# Part B (CDO full-array-replace) emit toggle. OFF: verified on a real Satisfactory
+# run that the patches apply at the ContentLib layer but the game still renders
+# English for these struct-array FText (selector options, MkPlus subsystem build
+# descriptions), so they're inert clutter. The build/serialize path is kept (it's
+# correct) but no patches are written. Flip to True only if an engine-side path is
+# found that actually surfaces these. See the long note in `_inject_into_uassets`.
+_ENABLE_CDO_ARRAY_REPLACE = False
+
 
 def _sanitize_extracted_path(tmp_output: Path, file_path: Path) -> str | None:
     """Return the relative path of file_path inside tmp_output, or None if it escapes."""
@@ -1251,12 +1259,21 @@ class UnrealEngine4_5Parser(BaseParser):
             prop_name = s.path[1]
             asset_leaf = internal_path.split("/")[-1].lower()
 
-            # Part B: a string that lives inside a struct array can ONLY be applied
-            # by replacing the WHOLE array (ContentLib can't edit one element). Route
-            # it to the array-replace accumulator and skip the per-field CDO path
-            # (which would write a bogus top-level edit that ContentLib ignores).
+            # Part B (DISABLED — see _ENABLE_CDO_ARRAY_REPLACE): a string inside a
+            # struct array can only be applied by replacing the WHOLE array via a
+            # CDO. We BUILT this (selectors, subsystem descriptions) and the engine
+            # log confirmed the patches apply (`Processed CDOs Successful: N/N`,
+            # NewValue shows the translation) — BUT the game still renders English,
+            # in a fresh save too. ContentLib's CDO edit does not reach the FText the
+            # game actually displays for these DataAsset/subsystem arrays. So the
+            # patches are inert clutter (1354 files on a real run). We keep the
+            # extraction+serialization code (it's correct and a future engine-side
+            # path may use it) but DON'T emit the patches. The string still shows as
+            # extracted in the table; it just can't be applied via ContentLib.
             meta = cdo_meta.get(string_id)
             if meta:
+                if not _ENABLE_CDO_ARRAY_REPLACE:
+                    continue   # array-element string: not applicable via ContentLib
                 gkey = (mod_name, meta["class"], meta["array_prop"])
                 grp = array_cdo_groups.setdefault(gkey, {
                     "class": meta["class"], "array_prop": meta["array_prop"],

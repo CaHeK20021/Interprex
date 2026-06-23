@@ -17,6 +17,14 @@ from typing import Any
 from collections.abc import Generator
 from .base import BaseParser, TranslationString, make_id
 
+# DEBUG: Test UnityPy import at startup and log traceback on failure
+try:
+    import UnityPy
+except Exception as e:
+    import traceback
+    print(f"DEBUG: UnityPy global import test failed: {e}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+
 # Skip namespaces to avoid library string noise in assets
 SKIP_NAMESPACES = {
     "UnityStandardAssets",
@@ -692,8 +700,10 @@ class UnityParser(BaseParser):
         if compiled_files:
             try:
                 import UnityPy
-            except ImportError:
-                print("UnityPy is not installed. Skipping compiled assets.", file=sys.stderr)
+            except ImportError as e:
+                import traceback
+                print(f"UnityPy import failed: {e}", file=sys.stderr)
+                traceback.print_exc(file=sys.stderr)
                 compiled_files = []
 
         for fpath in compiled_files:
@@ -930,19 +940,44 @@ class UnityParser(BaseParser):
         return results
 
     def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str]) -> int:
-        """Inject translations via raw byte replacement when typetree fails.
+        """Inject translations via pure binary patching — no UnityPy.save().
 
-        scan-collect-apply-reversed: scan each MonoBehaviour for length-prefixed
-        strings, collect (offset, end, new_bytes) for matches, then apply from
-        the end backwards so earlier offsets stay valid.
+        Reads the file as raw bytes, scans for length-prefixed strings,
+        matches them against translations by text content, and patches them
+        in reverse order so earlier offsets stay valid. The file is written
+        back with minimal changes — only the translated strings are replaced.
+        This avoids UnityPy's re-serialization which can corrupt the file.
         """
         rel_path = os.path.relpath(fpath, root).replace("\\", "/")
         written = 0
 
         try:
+            with open(fpath, "rb") as f:
+                file_bytes = bytearray(f.read())
+
+            # Build a reverse map: original text -> translated text
+            # We need to match by text since we don't have path_ids in raw scan
+            text_to_translation: dict[str, str] = {}
+            for sid, translated in translations.items():
+                # Extract original text from the translation string's id
+                # The id format is hash(engine, rel_path, path, original)
+                # We can't reverse the hash, so we build the map during extract
+                # and pass it through. For now, use the translations dict directly.
+                pass
+
+            # Actually, we need to know which texts to translate.
+            # Re-extract strings and match by make_id.
+            # But we also need the original text for each id.
+            # The simplest approach: scan for ALL length-prefixed strings,
+            # compute make_id for each, and if the id is in translations, patch.
+
+            # Phase 1: scan file for all length-prefixed strings
+            patches: list[tuple[int, int, bytes]] = []  # (start, end, new_blob)
+
+            # We need to find MonoBehaviour objects to get their path_ids.
+            # Use UnityPy for READING only (not saving).
             import UnityPy
             env = UnityPy.load(fpath)
-
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
@@ -950,13 +985,17 @@ class UnityParser(BaseParser):
                 if len(raw) < 20:
                     continue
 
-                patches: list[tuple[int, int, bytes]] = []
+                # Find this raw blob's offset in the file
+                raw_offset = file_bytes.find(raw[:min(256, len(raw))])
+                if raw_offset < 0:
+                    continue
 
-                i = 0
-                while i + 4 < len(raw):
-                    slen = struct.unpack_from('<I', raw, i)[0]
-                    if 2 <= slen <= 5000 and i + 4 + slen <= len(raw):
-                        chunk = raw[i+4:i+4+slen]
+                # Scan raw blob for strings
+                j = 0
+                while j + 4 < len(raw):
+                    slen = struct.unpack_from('<I', raw, j)[0]
+                    if 2 <= slen <= 5000 and j + 4 + slen <= len(raw):
+                        chunk = raw[j+4:j+4+slen]
                         try:
                             s = chunk.decode('utf-8')
                             if s.isprintable() and len(s) > 0:
@@ -968,24 +1007,31 @@ class UnityParser(BaseParser):
                                         new_text = translations[sid]
                                         new_bytes = new_text.encode('utf-8')
                                         new_len = len(new_bytes)
-                                        new_padded = (new_len + 3) & ~3  # align to 4 bytes
+                                        new_padded = (new_len + 3) & ~3
                                         new_blob = struct.pack('<I', new_padded) + new_bytes + b'\x00' * (new_padded - new_len)
-                                        patches.append((i, i + 4 + slen, new_blob))
+
+                                        # Patch in the FILE bytes, not in raw
+                                        file_start = raw_offset + j
+                                        file_end = raw_offset + j + 4 + slen
+                                        patches.append((file_start, file_end, new_blob))
                         except (UnicodeDecodeError, ValueError):
                             pass
-                    i += 1
+                    j += 1
 
-                if not patches:
-                    continue
+            if not patches:
+                return 0
 
-                # Apply patches in reverse order so earlier offsets stay valid
-                patches.sort(key=lambda p: p[0], reverse=True)
-                new_raw = bytearray(raw)
-                for start, end, new_blob in patches:
-                    new_raw[start:end] = new_blob
+            # Phase 2: apply patches in reverse order
+            patches.sort(key=lambda p: p[0], reverse=True)
+            for start, end, new_blob in patches:
+                file_bytes[start:end] = new_blob
 
-                obj.set_raw_data(bytes(new_raw))
-                written += len(patches)
+            # Phase 3: write patched file
+            self.backup_file(root, fpath)
+            with open(fpath, "wb") as f:
+                f.write(file_bytes)
+
+            written = len(patches)
 
         except Exception as e:
             print(f"Error in raw inject for {fpath}: {e}", file=sys.stderr)
@@ -1242,10 +1288,10 @@ class UnityParser(BaseParser):
                 if typetree_found == 0 and failed_count > 0:
                     raw_written = self._inject_raw_fallback(fpath, root, translations)
                     if raw_written > 0:
-                        changed = True
                         written += raw_written
+                    # raw fallback writes the file directly — skip env.file.save()
 
-                if changed:
+                elif changed:
                     self.backup_file(root, fpath)
                     with open(fpath, "wb") as f:
                         f.write(env.file.save(packer="none"))

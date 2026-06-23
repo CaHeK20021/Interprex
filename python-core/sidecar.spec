@@ -12,6 +12,9 @@ from pathlib import Path
 HERE = Path(SPECPATH)
 ASSETS = HERE / "assets"
 
+import UnityPy
+UNITYPY_RESOURCES = os.path.join(os.path.dirname(UnityPy.__file__), "resources")
+
 a = Analysis(
     [str(HERE / "main.py")],
     pathex=[str(HERE)],
@@ -21,6 +24,7 @@ a = Analysis(
     ] if (ASSETS / "fonts").exists() else []) + [
         (str(HERE / "bin"), "bin"),
         (str(HERE / "tools/unrpyc"), "tools/unrpyc"),
+        (UNITYPY_RESOURCES, "UnityPy/resources"),
     ] + (
         # Oodle DLL for reading compressed UE4/5 .pak files (unreal4 engine).
         # Lives at the project root in dev; bundle it at the _MEIPASS root so
@@ -52,6 +56,16 @@ a = Analysis(
         # onefile bundle.
         "scheduler",
         "pickletools",
+        "UnityPy",
+        "UnityPy.helpers.TypeTreeGenerator",
+        "UnityPy.resources",
+        "brotli",
+        "lz4",
+        "fsspec",
+        "texture2ddecoder",
+        "etcpak",
+        "astc_encoder",
+        "fmod_toolkit",
     ],
     hookspath=[],
     hooksconfig={},

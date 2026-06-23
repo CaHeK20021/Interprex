@@ -694,6 +694,104 @@ strings inside **Satisfactory mod `.uasset` files** via ContentLib JSON patches.
 The locres pipeline (`unreal4.py`) handles base-game localization; this pipeline
 handles mod content that lives in IoStore containers.
 
+### Stable-id uniqueness inside one `.uasset` — load-bearing (2026-06)
+`path = [InternalPath, PropName]` is NOT unique: one asset routinely holds dozens
+of strings under the SAME prop name. Three real collision shapes (measured on 36
+real mods: **557 of 3859 rows collapsed onto a shared id and were LOST on
+extract** — they showed as "translated" in the table but vanished/duplicated):
+1. **Widget with many Text exports** (SmartFoundations `Smart_SettingsForm`): 83
+   strings, 2 distinct `(InternalPath, PropName)` — every text field is a separate
+   EXPORT, prop is almost always `Text`.
+2. **Struct array** (MkPlus `BP_MkPlusSubsystem`): dozens of `Desc` inside struct
+   elements of `droneStation`/`generator`/… arrays + single struct props (`drone`).
+3. **Repeated ObjectName across exports** (SmartFoundations `Smart_Config`): six
+   exports all literally named `BP_ConfigPropertyBool_C_0`.
+
+Fix = make `path[]` a 3rd discriminator segment, built by `_build_uasset_path_key`
+(Python) from extractor fields. Both extract call sites (`_process_utoc_worker`
+:utoc path, `_extract_from_uassets` :pak path) MUST use this helper — keep byte-
+identical or the id drifts between extract and inject. The extractor (`Program.cs`)
+supplies:
+- **`ExportName`** = `ObjectName + "#" + exportTableIndex`. The table index is
+  REQUIRED — ObjectName alone repeats across exports (case 3). Index is stable for
+  an unchanged asset (we re-extract the same bytes), so the id reproduces.
+- **`ContainerPath`** = full nesting address inside the export, e.g.
+  `droneStation[0]`, `drone`, `x.Ingredients[1]`. Threaded DOWN through struct/
+  array recursion in `ExtractProps` (params `arrayName`/`arrayIndex`/`containerPath`,
+  `exportIndex`). This is what separates struct-array elements (case 2).
+- `path[2] = f"{ExportName}|{ContainerPath}"` when nested, else `ExportName`, else
+  bare 2-element path. After the fix: **557 lost → 0** (verified by re-running
+  extract over all mods and counting `(file,path) → distinct originals`).
+- ⚠️ This CHANGES the id of every previously-extracted mod string (path feeds the
+  hash). Expected & accepted — old ids were the broken "glued" ones. Translation
+  memory just re-translates. Regression-guarded by `check_unreal4_5_cdo`.
+
+### Skip base-game string-table refs (`HistoryType==StringTableEntry`)
+An FText whose `HistoryType` is `StringTableEntry` is a REFERENCE into a string
+table (usually the BASE GAME's, value like `Production/Constructor/Description`).
+The engine resolves it to the player's language at RUNTIME, so its "value" is a
+code key, NOT translatable text. Extracting it pollutes the list AND a patch would
+hardcode English, breaking base-game localization. `Program.cs::IsStringTableRef`
+skips these everywhere FText is read (top-level, TArray<FText>, CDO serialization).
+On MkPlus subsystem this dropped the 22 `factory`/`variablePower` StringTableEntry
+`Desc` (kept only real `Base` literals the mod wrote).
+
+### ⚠️ ContentLib CDO array-replace — BUILT, then DISABLED (does NOT reach the game)
+**The ~7% of mod strings that live inside STRUCT ARRAYS cannot be translated by
+any ContentLib path. This was proven on a real Satisfactory run — do NOT retry
+the CDO route.** Affected: `FGUserSetting_IntSelector.IntegerSelectionValues`
+(selector options "Linear/Exponential", "Overclocking Mode", "3x/5x multipliers")
+and MkPlus subsystem build descriptions (Исследователь/дрон-порт/вагон Mk2/Mk3).
+
+What was built (kept behind `_ENABLE_CDO_ARRAY_REPLACE = False`, code is correct):
+ContentLib can't edit ONE array element — it `EmptyValues()` + rebuilds the whole
+array from JSON (`CLCDOBPFLib.cpp::EditCDO`). So `Program.cs::SerializeArrayForCdo`
+re-emits the WHOLE top-level array as ContentLib JSON with each translatable FText
+replaced by a placeholder token (`@@IPX:export:arrayprop:idx:field@@`), object refs
+resolved to LoadObject paths (`ResolveObjectPath` walks the import outer chain),
+numerics/bools/nested structs verbatim. Python (`_inject_into_uassets`) substitutes
+tokens with translations and writes a CDO patch (`Class` = the owning object's
+LoadObject path — a sub-object like `…:FGUserSetting_IntSelector_0`, resolvable
+because ContentLib `Class` uses `LoadObject`, not `LoadClass`). `_cdo_meta` (parser
+side dict, id→meta) carries the metadata from extract to inject.
+
+**Why it's disabled — the engine log is the ground truth:**
+- The patches APPLY cleanly: `[CL] Processed CDOs Successful: 1354/1354`, and the
+  log even shows `Overwrite …: Name … NewValue = Линейный (По умолчанию)` and the
+  full RU drone-port description. ContentLib DOES handle FText (`FText::FromString`;
+  the `FStrProperty` log label is a cosmetic bug in CLCDOBPFLib).
+- **Yet the game renders English — in a brand-new save too.** The CDO write reaches
+  the Class Default Object / sub-object, but the game displays these FText from a
+  DIFFERENT live object (DataAsset instances / the subsystem's own per-build state),
+  which the CDO edit never touches. Net: 1354 inert patch files, zero visible change.
+- Decision: emit NOTHING for array-element strings (no clutter). They still extract
+  (Part A keeps them unique in the table) — they're just not applicable via
+  ContentLib. The only viable future path is **rewriting the FText in the `.uasset`
+  bytes and repacking the mod `.utoc/.ucas`** (UAssetAPI write + retoc `to-zen`),
+  bypassing ContentLib entirely — same stance as base-game locres repack.
+
+**Hard ceiling, unrelated to us:** some mod strings exist ONLY in a compiled C++
+DLL (e.g. EnhancedConveyors belt descriptions "Transports up to N resources per
+minute" — `Binaries/Win64/*.dll`, nothing in any `.uasset`/`.locres`).
+Untranslatable by any asset/ContentLib approach.
+
+### `Ingredients` is unrecoverable in assembled legacy assets
+`retoc to-legacy` replaces base-game item refs (`Ingredients[].ItemClass`) with
+`/Engine/UnknownPackage.UnknownExport` — the item NAME is gone (verified in the
+import table: outer chain points at the stub package, object is literally named
+`UnknownExport`). `Buildable`/`Recipe` (mod-owned) DO resolve. So a full-array CDO
+replace would blank `Ingredients` → broken recipe. `SerializeArrayForCdo` therefore
+OMITS any field holding an unresolved object (`omitted=True` surfaced). Moot while
+Part B is off, but documents why subsystem array-replace is doubly unsafe.
+
+### retoc/extractor version flags (gotcha)
+`retoc to-legacy --version` wants the BARE form `UE5_3`/`UE5_6`; `UAssetExtractor
+--engine` wants the `VER_` prefix `VER_UE5_3`. `_detect_ue_version` maps
+`ReplaceIoChunkHashWithIoHash`→`UE5_6`, `PartitionedToc`→`UE5_5`, else `UE5_4`.
+Using the WRONG version doesn't just misname — it MISREADS struct data (saw
+`Ingredients` amounts 20/15/100 at UE5_3 vs correct 8/8/20 at UE5_6 for the same
+asset). Always feed the detected version to BOTH tools.
+
 ### Why ContentLib
 Satisfactory mods ship as `.utoc`/`.ucas` IoStore containers. Their `.uasset`
 files contain `TextPropertyData` (FText) with `mDisplayName`, `mDescription`,

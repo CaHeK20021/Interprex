@@ -841,8 +841,9 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
+        if provider != "lmstudio":
+            body["response_format"] = {"type": "json_object"}
     else:
         # Gemini. If a proxy base_url is set, route through it the SAME way the
         # main path does (providers/gemini.py::_get_proxy_url): keep the native

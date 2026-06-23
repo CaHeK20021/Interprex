@@ -3003,40 +3003,46 @@ def check_unreal4_5_cdo() -> None:
                     "token": "@@IPX:1:arr:0:Desc@@", "array_json": sub_json, "omitted": True},
         }
         translations = {s1.id: "Линейный", s2.id: "Экспонента", s3.id: "Описание RU"}
-        n = p._inject_into_uassets(root, translations, None)
-        assert n == 3, f"expected 3 written, got {n}"
+        from parsers.unreal4_5 import _ENABLE_CDO_ARRAY_REPLACE
+        p._inject_into_uassets(root, translations, None)
 
         cdo_dir = os.path.join(root, "FactoryGame", "Configs", "ContentLib", "CDOs")
-        files = os.listdir(cdo_dir)
-        # two DISTINCT array files (selector + subsystem), named per owning asset
+        files = os.listdir(cdo_dir) if os.path.isdir(cdo_dir) else []
         arr_files = [f for f in files if "_arr_" in f]
-        assert len(arr_files) == 2, f"expected 2 array CDO files, got {arr_files}"
-        # no leftover placeholders anywhere
+        # no leftover placeholder tokens anywhere, in either mode
         for f in files:
             txt = open(os.path.join(cdo_dir, f), encoding="utf-8").read()
             assert "@@IPX:" not in txt, f"leftover placeholder in {f}"
 
-        # selector: mount path stripped, full array, both options translated
-        sel = next(f for f in arr_files if "Sel" in f)
-        sd = _json.load(open(os.path.join(cdo_dir, sel), encoding="utf-8"))
-        assert sd["Class"] == "/M/Sel.Sel:Opt", sd["Class"]
-        opt = next(e for e in sd["Edits"] if e["Property"] == "Opt")["Value"]
-        assert [o["Name"] for o in opt] == ["Линейный", "Экспонента"], opt
-        assert [o["Value"] for o in opt] == [0, 1], "non-text fields must survive"
-
-        # subsystem: Desc translated, Buildable/Recipe kept, Ingredients absent
-        sub = next(f for f in arr_files if "Sub" in f)
-        ud = _json.load(open(os.path.join(cdo_dir, sub), encoding="utf-8"))
-        arr = next(e for e in ud["Edits"] if e["Property"] == "arr")["Value"]
-        assert arr[0]["Desc"] == "Описание RU", arr[0]
-        assert arr[0]["Buildable"] == "/M/Build_X.Build_X_C"
-        assert "Ingredients" not in arr[0], "omitted field must stay omitted"
+        if _ENABLE_CDO_ARRAY_REPLACE:
+            # (only if Part B is re-enabled) full-array CDOs emitted, two distinct
+            # files, tokens substituted, omitted field stays omitted.
+            assert len(arr_files) == 2, f"expected 2 array CDO files, got {arr_files}"
+            sel = next(f for f in arr_files if "Sel" in f)
+            sd = _json.load(open(os.path.join(cdo_dir, sel), encoding="utf-8"))
+            assert sd["Class"] == "/M/Sel.Sel:Opt", sd["Class"]
+            opt = next(e for e in sd["Edits"] if e["Property"] == "Opt")["Value"]
+            assert [o["Name"] for o in opt] == ["Линейный", "Экспонента"], opt
+            assert [o["Value"] for o in opt] == [0, 1], "non-text fields must survive"
+            sub = next(f for f in arr_files if "Sub" in f)
+            ud = _json.load(open(os.path.join(cdo_dir, sub), encoding="utf-8"))
+            arr = next(e for e in ud["Edits"] if e["Property"] == "arr")["Value"]
+            assert arr[0]["Desc"] == "Описание RU", arr[0]
+            assert arr[0]["Buildable"] == "/M/Build_X.Build_X_C"
+            assert "Ingredients" not in arr[0], "omitted field must stay omitted"
+        else:
+            # DISABLED (shipped default): array-element strings are inert via
+            # ContentLib (verified in-game — patches apply but the game renders
+            # English), so NO array CDO files are written: no clutter. The strings
+            # still EXTRACT fine (Part A unique keys above); they just can't be
+            # applied through ContentLib.
+            assert len(arr_files) == 0, f"Part B disabled but array files written: {arr_files}"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    print("OK — unreal4_5 CDO: unique path keys (no collisions), array-replace "
-          "patch (selector safe, subsystem Ingredients-omitted), token subst, "
-          "per-asset file naming")
+    print("OK — unreal4_5 CDO: unique path keys (no collisions); Part-B array "
+          "CDO emit gated by _ENABLE_CDO_ARRAY_REPLACE (off=no clutter, on=full "
+          "array replace w/ token subst + omitted-field handling)")
 
 
 def check_prompt_width() -> None:

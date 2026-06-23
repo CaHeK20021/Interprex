@@ -28,6 +28,9 @@ class _OpenAICompat(BaseProvider):
     # context window / KV-cache VRAM); subclasses on servers that reject unknown
     # fields (vLLM/TGI) set this False — their window is fixed at server start.
     sends_num_ctx: bool = True
+    # Whether to send "response_format": {"type": "json_object"}. Set False for
+    # servers that reject it (e.g. LM Studio v0.3+).
+    sends_json_object: bool = True
 
     def _base(self, cfg: ProviderConfig) -> str:
         return (cfg.base_url or self.default_base_url).rstrip("/")
@@ -65,8 +68,9 @@ class _OpenAICompat(BaseProvider):
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
+        if self.sends_json_object:
+            body["response_format"] = {"type": "json_object"}
         if cfg.num_ctx and self.sends_num_ctx:
             # Ollama reads num_ctx to size its context window (and thus KV-cache
             # VRAM); a smaller window means less video memory used. LM Studio
@@ -79,7 +83,11 @@ class _OpenAICompat(BaseProvider):
         if resp.is_error:
             try:
                 err_data = resp.json()
-                msg = err_data["error"]["message"]
+                err = err_data.get("error")
+                if isinstance(err, dict):
+                    msg = err.get("message") or str(err)
+                else:
+                    msg = str(err) if err else resp.text
                 raise RuntimeError(f"API error ({resp.status_code}): {msg}")
             except Exception as e_parse:
                 if isinstance(e_parse, RuntimeError):
@@ -149,6 +157,8 @@ class OllamaProvider(_OpenAICompat):
 class LMStudioProvider(_OpenAICompat):
     name = "lmstudio"
     default_base_url = "http://localhost:1234/v1"
+    sends_num_ctx = False
+    sends_json_object = False
 
     def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
         """LM Studio's /v1/models lists the models it has loaded, so the first

@@ -12,7 +12,7 @@ use windows::Win32::System::JobObjects::{
 };
 
 // The Python sidecar binary is embedded at compile time.
-// Build order: run build-sidecar.bat first, then tauri build.
+// Build order: run build-sidecar.bat first, then tauri build. (force rebuild v7 - lmstudio fix)
 const SIDECAR_BYTES: &[u8] = include_bytes!("../../python-core/dist/sidecar.exe");
 
 struct SidecarState(Mutex<Option<Child>>);
