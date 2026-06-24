@@ -15,6 +15,7 @@ from .qsp import QspParser
 from .unreal import UnrealParser
 from .unreal4_5 import UnrealEngine4_5Parser
 from .twine import TwineParser
+from .sdf7d2d import Sdf7d2dParser
 
 # Order matters only for detect(): first match wins. RPG Maker and Ren'Py key
 # off different marker files/dirs, so the order between them is not significant.
@@ -28,6 +29,7 @@ REGISTRY: list[type[BaseParser]] = [
     QspParser,
     UnrealEngine4_5Parser,
     UnrealParser,
+    Sdf7d2dParser,
     UnityParser,
     TwineParser,
 ]

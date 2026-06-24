@@ -890,7 +890,7 @@ export default function App() {
 
     try {
       setPhase("detecting");
-      const res = await detectMods(picked);
+      const res = await detectMods(picked, target);
       setModsDir(res.mods_dir);
       setGameRoot(res.game_root);
       const sortedMods = [...res.mods].sort((a, b) => {
@@ -1784,7 +1784,7 @@ export default function App() {
     (translationMode === "mods" && (selectedModPaths.length === 0 || hasMixedEngines));
 
   // phase_* keys map to plain strings; cast narrows the t() union for JSX.
-  const phaseLabel = busy ? (t(`phase_${phase}` as StringKey) as string) : "";
+  const phaseLabel = busy ? (isFullyPaused ? (t("phase_paused" as StringKey) as string) : (t(`phase_${phase}` as StringKey) as string)) : "";
 
   // Filter strings by search query (original, translation, path), type and mode
   const filteredStrings = useMemo(() => {
@@ -2392,6 +2392,18 @@ export default function App() {
                 </option>
               ))}
             </select>
+          ) : provider === "custom" ? (
+            // Custom provider: always show a typeable field — the user knows
+            // their model name even if /models isn't reachable.
+            <input
+              value={model}
+              placeholder={t("modelPlaceholderLocal")}
+              onChange={(e) => {
+                setModel(e.target.value);
+                saveProviderSetting("providerModel", provider, e.target.value);
+              }}
+              disabled={busy && !isFullyPaused}
+            />
           ) : providerInfo.needsKey ? (
             // Key-needing provider (Gemini) with no models: the field stays
             // LOCKED until a key actually lists models (then the dropdown above
@@ -2517,7 +2529,7 @@ export default function App() {
         {/* Server URL: shown for local servers (default-backed) and Kaggle
             (ngrok URL, required, no default). Hidden for pure-cloud (Gemini). */}
         {(!providerInfo.needsKey || providerInfo.needsUrl) && (
-          <label className="field grow">
+          <label className="field">
             <span>{t("baseUrl")}</span>
             <input
               value={baseUrl}
@@ -2526,7 +2538,9 @@ export default function App() {
                   ? "http://localhost:11434/v1"
                   : provider === "kaggle"
                     ? "https://xxxx.ngrok-free.app/v1"
-                    : "http://localhost:1234/v1"
+                    : provider === "custom"
+                      ? "http://your-server:8000/v1"
+                      : "http://localhost:1234/v1"
               }
               onChange={(e) => {
                 setBaseUrl(e.target.value);
@@ -2541,9 +2555,17 @@ export default function App() {
             "+" adds another, "×" removes. Each key spins up its own worker group
             (threads × keys), so adding keys multiplies throughput. */}
         {providerInfo.needsKey && (
-          <div className="api-keys-block">
-            <div className="api-keys-head">
+          apiKeys.length <= 1 ? (
+            <label className="field api-key-field">
               <span>{t("apiKey")}</span>
+              <input
+                type={shownKeys.has(0) ? "text" : "password"}
+                value={apiKeys[0] ?? ""}
+                onChange={(e) => updateKeys([e.target.value])}
+                onFocus={() => setShownKeys((s) => new Set(s).add(0))}
+                onBlur={() => setShownKeys((s) => { const n = new Set(s); n.delete(0); return n; })}
+                disabled={busy && !isFullyPaused}
+              />
               <button
                 type="button"
                 className="api-key-add btn-secondary"
@@ -2553,29 +2575,42 @@ export default function App() {
               >
                 + {t("addKey")}
               </button>
-            </div>
-            {apiKeys.map((k, i) => (
-              <div className="api-key-row" key={i}>
-                <input
-                  type={shownKeys.has(i) ? "text" : "password"}
-                  value={k}
-                  placeholder={apiKeys.length > 1 ? `${t("apiKey")} ${i + 1}` : ""}
-                  onChange={(e) => {
-                    const next = apiKeys.slice();
-                    next[i] = e.target.value;
-                    updateKeys(next);
-                  }}
-                  onFocus={() => setShownKeys((s) => new Set(s).add(i))}
-                  onBlur={() =>
-                    setShownKeys((s) => {
-                      const n = new Set(s);
-                      n.delete(i);
-                      return n;
-                    })
-                  }
-                   disabled={busy && !isFullyPaused}
-                />
-                {apiKeys.length > 1 && (
+            </label>
+          ) : (
+            <div className="api-keys-block">
+              <div className="api-keys-head">
+                <span>{t("apiKey")}</span>
+                <button
+                  type="button"
+                  className="api-key-add btn-secondary"
+                  onClick={() => updateKeys([...apiKeys, ""])}
+                  disabled={busy && !isFullyPaused}
+                  title={t("addKey") as string}
+                >
+                  + {t("addKey")}
+                </button>
+              </div>
+              {apiKeys.map((k, i) => (
+                <div className="api-key-row" key={i}>
+                  <input
+                    type={shownKeys.has(i) ? "text" : "password"}
+                    value={k}
+                    placeholder={`${t("apiKey")} ${i + 1}`}
+                    onChange={(e) => {
+                      const next = apiKeys.slice();
+                      next[i] = e.target.value;
+                      updateKeys(next);
+                    }}
+                    onFocus={() => setShownKeys((s) => new Set(s).add(i))}
+                    onBlur={() =>
+                      setShownKeys((s) => {
+                        const n = new Set(s);
+                        n.delete(i);
+                        return n;
+                      })
+                    }
+                     disabled={busy && !isFullyPaused}
+                  />
                   <button
                     type="button"
                     className="api-key-del"
@@ -2585,10 +2620,10 @@ export default function App() {
                   >
                     ×
                   </button>
-                )}
-              </div>
-            ))}
-          </div>
+                </div>
+              ))}
+            </div>
+          )
         )}
       </div>
 
@@ -2646,7 +2681,10 @@ export default function App() {
 
               let statusText = t("statusNoStrings");
               let statusClass = "status-empty";
-              if (isCurrentlyExtracting) {
+              if (mod.already_translated) {
+                statusText = t("statusAlreadyTranslated");
+                statusClass = "status-done";
+              } else if (isCurrentlyExtracting) {
                 statusText = t("statusExtracting");
                 statusClass = "status-progress";
               } else if (hasStrings) {

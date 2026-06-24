@@ -196,6 +196,22 @@ class KaggleProvider(_OpenAICompat):
         return models[0] if models else ""
 
 
+class CustomProvider(_OpenAICompat):
+    """User-provided OpenAI-compatible endpoint. No defaults — the user must
+    supply the base URL (and optionally an API key and model name). Covers any
+    server exposing /v1/chat/completions: vLLM, text-generation-webui, TabbyML,
+    LocalAI, koboldcpp, etc."""
+    name = "custom"
+    default_base_url = ""
+    sends_num_ctx = False
+    sends_json_object = False
+
+    def active_model(self, cfg: ProviderConfig, models: list[str] | None = None) -> str:
+        if models is None:
+            models = self.list_models(cfg)
+        return models[0] if models else ""
+
+
 class OpenRouterProvider(_OpenAICompat):
     name = "openrouter"
     default_base_url = "https://openrouter.ai/api/v1"

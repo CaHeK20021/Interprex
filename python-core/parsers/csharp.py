@@ -271,7 +271,13 @@ class CSharpParser(BaseParser):
 
     @staticmethod
     def detect(root: str) -> bool:
-        """True if any .cs files are present in the directory structure."""
+        """True if any .cs files are present in the directory structure,
+        but NOT if Languages/ exists (RimWorld mod → i18n engine)."""
+        if os.path.isdir(os.path.join(root, "Languages")):
+            return False
+        for sub in os.listdir(root):
+            if os.path.isdir(os.path.join(root, sub)) and os.path.isdir(os.path.join(root, sub, "Languages")):
+                return False
         ignore_dirs = {
             "bin", "obj", ".vs", "node_modules", "venv", ".git", ".interprex_backups"
         }

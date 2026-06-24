@@ -617,6 +617,16 @@ class UnityParser(BaseParser):
     @staticmethod
     def detect(root: str) -> bool:
         """True if there are any non-system .dll files, level* / *.assets / *.prefab, or Addressables localization bundles."""
+        # Skip mods with i18n/default.json (Stardew Valley) or Languages/ (RimWorld)
+        if os.path.isfile(os.path.join(root, "i18n", "default.json")):
+            return False
+        if os.path.isdir(os.path.join(root, "Languages")):
+            return False
+        for sub in os.listdir(root):
+            sub_path = os.path.join(root, sub)
+            if os.path.isdir(sub_path):
+                if os.path.isdir(os.path.join(sub_path, "Languages")):
+                    return False
         # Unreal signature protection: if it's an Unreal mod/plugin, do not detect as Unity.
         from pathlib import Path
         try:

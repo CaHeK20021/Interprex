@@ -158,13 +158,15 @@ export interface ModInfo {
   engine: Engine | null;
   translated_count?: number;
   total_count?: number;
+  already_translated?: boolean;
 }
 
 /** Detect and list mods in a game or mods directory. */
 export function detectMods(
   root: string,
+  targetLang?: string,
 ): Promise<{ mods_dir: string; game_root: string; mods: ModInfo[] }> {
-  return callPython("detect_mods", { root });
+  return callPython("detect_mods", { root, target_lang: targetLang ?? null });
 }
 
 /** Raw shape the /translate endpoint expects (snake_case to match Python). */

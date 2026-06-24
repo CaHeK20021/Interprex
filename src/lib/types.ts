@@ -28,6 +28,7 @@ export type Engine =
   | "fusion"
   | "mmf2"
   | "qsp"
+  | "sdf7d2d"
   | "twine";
 
 /**

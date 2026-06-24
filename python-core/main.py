@@ -132,6 +132,7 @@ class ExtractReq(BaseModel):
     root: str
     engine: str
     sub_paths: list[str] = []
+    target_lang: str | None = None
 
 
 class InjectReq(BaseModel):
@@ -151,6 +152,7 @@ class InjectReq(BaseModel):
 
 class DetectModsReq(BaseModel):
     root: str
+    target_lang: str | None = None
 
 
 class BackupStatusReq(BaseModel):
@@ -833,9 +835,10 @@ def detect_mods(req: DetectModsReq) -> dict:
     
     mods_list = []
     
-    def count_mod_strings(mod_engine: str | None, mod_rel_path: str) -> tuple[int, int]:
+    def count_mod_strings(mod_engine: str | None, mod_rel_path: str, target_lang: str | None = None) -> tuple[int, int, bool]:
+        """Returns (translated_count, total_count, already_translated)."""
         if not mod_engine:
-            return 0, 0
+            return 0, 0, False
         try:
             mod_full = os.path.join(root, *mod_rel_path.split("/")) if os.path.isdir(root) else mod_rel_path
             p = Path(mod_full)
@@ -843,21 +846,59 @@ def detect_mods(req: DetectModsReq) -> dict:
             uplugins = list(p.glob("*.uplugin"))
             logger.info(f"uplugins found: {uplugins}")
             for uplugin in uplugins:
-                return 0, 1
+                return 0, 1, False
             paks = p / "Content" / "Paks"
             if paks.is_dir():
                 for _ in paks.rglob("*.utoc"):
-                    return 0, 1
+                    return 0, 1, False
                 for _ in paks.rglob("*.pak"):
-                    return 0, 1
+                    return 0, 1, False
             for _ in p.rglob("*.uasset"):
-                return 0, 1
+                return 0, 1, False
             for _ in p.rglob("*.locres"):
-                return 0, 1
-            return 0, 0
+                return 0, 1, False
+            # i18n / RimWorld XML: count translatable Keyed entries
+            if mod_engine == "i18n":
+                from parsers.i18n import _find_rimworld_english_dirs, _rimworld_has_lang, flatten_json
+                # If target language already exists, mod is already translated
+                if target_lang and _rimworld_has_lang(str(p), target_lang):
+                    return 0, 0, True
+                eng_dirs = _find_rimworld_english_dirs(str(p))
+                count = 0
+                for eng_dir in eng_dirs:
+                    for xml_path in Path(eng_dir).rglob("*.xml"):
+                        try:
+                            import xml.etree.ElementTree as ET
+                            tree = ET.parse(str(xml_path))
+                            for child in tree.getroot():
+                                if isinstance(child.tag, str) and child.text and child.text.strip():
+                                    count += 1
+                        except Exception:
+                            pass
+                if count:
+                    return 0, count, False
+                # Stardew Valley i18n
+                stardew_json = p / "i18n" / "default.json"
+                if stardew_json.is_file():
+                    # If target lang file already exists, mod is already translated
+                    if target_lang:
+                        from parsers.i18n import get_stardew_code
+                        lang_code = get_stardew_code(target_lang)
+                        if (p / "i18n" / f"{lang_code}.json").is_file():
+                            return 0, 0, True
+                    import json
+                    from parsers.i18n import _strip_json_comments
+                    with open(stardew_json, "r", encoding="utf-8-sig") as f:
+                        raw = f.read()
+                    data = json.loads(_strip_json_comments(raw))
+                    if isinstance(data, dict):
+                        count = sum(1 for _ in flatten_json(data))
+                        return 0, count, False
+                return 0, 0, False
+            return 0, 0, False
         except Exception as e:
             logger.error(f"count_mod_strings error: {e}")
-            return 0, 0
+            return 0, 0, False
 
     if os.path.isdir(mods_dir):
         try:
@@ -876,13 +917,14 @@ def detect_mods(req: DetectModsReq) -> dict:
                             if os.path.isdir(sub_full_path) and not sub_name.startswith(".") and sub_name.lower() not in ignore_dirs:
                                 engine = detect_engine(sub_full_path)
                                 rel_path = os.path.relpath(sub_full_path, root).replace("\\", "/")
-                                x, n = count_mod_strings(engine, rel_path)
+                                x, n, already = count_mod_strings(engine, rel_path, req.target_lang)
                                 mods_list.append({
                                     "name": sub_name,
                                     "path": rel_path,
                                     "engine": engine,
                                     "translated_count": x,
-                                    "total_count": n
+                                    "total_count": n,
+                                    "already_translated": already,
                                 })
                     except Exception as e:
                         logger.error(f"Error scanning GameFeatures directory {full_path}: {e}")
@@ -890,13 +932,14 @@ def detect_mods(req: DetectModsReq) -> dict:
                     
                 engine = detect_engine(full_path)
                 rel_path = os.path.relpath(full_path, root).replace("\\", "/")
-                x, n = count_mod_strings(engine, rel_path)
+                x, n, already = count_mod_strings(engine, rel_path, req.target_lang)
                 mods_list.append({
                     "name": name,
                     "path": rel_path,
                     "engine": engine,
                     "translated_count": x,
-                    "total_count": n
+                    "total_count": n,
+                    "already_translated": already,
                 })
         except Exception as e:
             logger.error(f"Error scanning mods directory {mods_dir}: {e}")

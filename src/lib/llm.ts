@@ -14,7 +14,7 @@ import {
 } from "./ipc";
 
 /** Which backends the user can pick. Mirrors the Python provider registry. */
-export type ProviderId = "ollama" | "lmstudio" | "kaggle" | "gemini" | "openrouter";
+export type ProviderId = "ollama" | "lmstudio" | "kaggle" | "gemini" | "openrouter" | "custom";
 
 // needsKey: an API key is required (cloud). needsUrl: a server URL is required
 // (no usable default — local servers have a default, Kaggle's ngrok URL does
@@ -30,6 +30,7 @@ export const PROVIDERS: {
   { id: "kaggle", label: "Kaggle (ngrok)", needsKey: false, needsUrl: true },
   { id: "gemini", label: "Google Gemini", needsKey: true, needsUrl: false },
   { id: "openrouter", label: "OpenRouter", needsKey: true, needsUrl: false },
+  { id: "custom", label: "Custom (OpenAI-compatible)", needsKey: true, needsUrl: true },
 ];
 
 /** Provider connection settings, supplied per call from the UI. */

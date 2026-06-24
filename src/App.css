@@ -120,6 +120,7 @@ body {
 .provider-row { padding: 6px 0; }
 .field.grow { flex: 1; }
 .field.grow input { width: 100%; min-width: 0; }
+.api-key-field input { flex: 1; min-width: 0; }
 
 /* Compact segmented toggle for the font style. Each segment previews its own
    font so the choice is self-explanatory: "Smooth" in Noto, "Pixel" in
@@ -1304,6 +1305,7 @@ input[type="checkbox"]:disabled {
   gap: 4px;
   flex: 1;
   min-width: 220px;
+  align-self: flex-start;
 }
 .api-keys-head {
   display: flex;
@@ -1325,7 +1327,7 @@ input[type="checkbox"]:disabled {
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 6px 9px;
+  padding: 5px 8px;
   font-size: 13px;
   letter-spacing: 0.04em;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
