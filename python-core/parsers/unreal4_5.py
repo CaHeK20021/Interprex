@@ -1679,6 +1679,31 @@ class UnrealEngine4_5Parser(BaseParser):
                 "--version", ue_ver, "--no-shaders", "--no-script-objects"
             ], check=True, capture_output=True, timeout=120)
 
+            # 1b. Filter out assets whose imports contain UnknownExport stubs
+            # (retoc replaces base-game refs with UnknownExport). UAssetAPI can
+            # rewrite these but the game can't resolve the broken outer-link chain.
+            _bad_assets: set[str] = set()
+            for e in edits:
+                asset_rel = e.get("AssetPath", "")
+                if not asset_rel:
+                    continue
+                asset_path = tmp_legacy / asset_rel
+                if not asset_path.is_file():
+                    continue
+                try:
+                    raw = asset_path.read_bytes()
+                    if b"UnknownExport" in raw:
+                        _bad_assets.add(asset_rel)
+                except Exception:
+                    pass
+            if _bad_assets:
+                logger.info(
+                    f"Byte-patch: skipping {len(_bad_assets)} asset(s) with "
+                    f"UnknownExport imports in {uf.name}")
+                edits = [e for e in edits if e.get("AssetPath", "") not in _bad_assets]
+                if not edits:
+                    return 0
+
             # 2. write edits in place (AssetPath is relative to tmp_legacy)
             edits_file = Path(tmp_dir) / "edits.json"
             edits_file.write_text(_json.dumps(edits, ensure_ascii=False), encoding="utf-8")

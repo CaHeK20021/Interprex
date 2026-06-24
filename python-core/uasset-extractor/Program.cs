@@ -598,6 +598,17 @@ namespace UAssetExtractor
                     foreach (var bt in _bytecodeExportTypes)
                         if (bt.IsAssignableFrom(t)) return false;
                 }
+                // retoc to-legacy replaces base-game imports (parent class, outer objects)
+                // with UnknownExport stubs (ObjectName="UnknownExport", ClassPackage varies).
+                // When UAssetAPI rewrites the asset, the sub-object outer-link chain breaks
+                // in-game because the engine can't resolve the stub import. Detect by
+                // checking if any import has ObjectName "UnknownExport" — these assets are
+                // unsafe to rewrite.
+                foreach (var imp in probe.Imports)
+                {
+                    if (imp.ObjectName?.ToString() == "UnknownExport")
+                        return false;
+                }
                 return true;
             }
             catch { return false; }
