@@ -764,11 +764,49 @@ side dict, id→meta) carries the metadata from extract to inject.
   the Class Default Object / sub-object, but the game displays these FText from a
   DIFFERENT live object (DataAsset instances / the subsystem's own per-build state),
   which the CDO edit never touches. Net: 1354 inert patch files, zero visible change.
-- Decision: emit NOTHING for array-element strings (no clutter). They still extract
-  (Part A keeps them unique in the table) — they're just not applicable via
-  ContentLib. The only viable future path is **rewriting the FText in the `.uasset`
-  bytes and repacking the mod `.utoc/.ucas`** (UAssetAPI write + retoc `to-zen`),
-  bypassing ContentLib entirely — same stance as base-game locres repack.
+- Decision: emit NOTHING for array-element strings via ContentLib (no clutter). They
+  still extract (Part A keeps them unique in the table) — they're just not applicable
+  via ContentLib. They ARE reachable via the **byte-patch path** below.
+
+### ⚠️ Asset byte-patch — works ONLY for DataAssets, NEVER Blueprints (fidelity gate)
+The array-element FText that ContentLib can't reach (selector options
+`FGUserSetting_IntSelector.IntegerSelectionValues` — "Overclocking Mode",
+"Linear/Exponential", "3x/5x"; and Blueprint subsystem build descriptions) can be
+translated by **rewriting the FText in the `.uasset` bytes + repacking the mod into a
+`_P.utoc/.ucas` patch container** (`retoc to-zen`), bypassing ContentLib. Enabled by
+`_ENABLE_ASSET_BYTEPATCH = True` (`parsers/unreal4_5.py`); runs in `inject()` AFTER
+ContentLib. C# `UAssetExtractor.exe --apply-edits <editsJson> --base-dir <legacyDir>`
+writes via UAssetAPI 1.1.0 `asset.Write(path)`.
+
+**THE LOAD-BEARING CONSTRAINT (a real shipped crash, 2026-06):** UAssetAPI does NOT
+model compiled **Kismet bytecode**. Re-serializing a Blueprint-class asset
+(`BP_MkPlusSubsystem` — class/function/struct exports) drops/garbles ~half its
+`.uexp` the moment ANY property is written (even a no-op edit to the SAME value:
+44127→43851 bytes, ~22k differ). The loaded class then becomes NULL →
+`Assertion failed: SubsystemClass … Attempt to register NULL ModSubsystem` → SML
+crash on map load. **DataAssets** (only `NormalExport`s, e.g.
+`FGUserSetting_IntSelector`) re-serialize **byte-exact** and patch cleanly (verified:
+selector translated, file identical except the string).
+
+**The gate (`Program.cs::IsLoadWriteRoundTripSafe`):** SKIP any asset whose export
+list contains a `ClassExport`/`FunctionExport`/`StructExport` (compiled script) or a
+`RawExport` (UAssetAPI couldn't parse it). Gate on EXPORT TYPE, the ground-truth
+structural marker — NOT a byte compare (a plain load→Write of a Blueprint can
+serialize clean while the property EDIT still corrupts it; the byte-compare gate gave
+false "safe"). Skipped assets stay English; they NEVER enter the `_P` container, so
+the game can't crash. `--apply-edits` returns `{"applied":N,"written":[abs paths]}`;
+Python (`_bytepatch_one_mod`) packs ONLY `written` into `_P`, never the
+requested-but-skipped set.
+
+**Net coverage:** selector options (DataAsset) translate; Blueprint subsystem
+descriptions stay English but cause no crash. This is the "translate everything we
+safely can" line — DataAssets yes, Blueprints no (their FText is only reachable by a
+full Blueprint recompile, out of scope). `.usmap` mappings (game ships
+`CommunityResources/FactoryGame.usmap`, Oodle-compressed) do NOT help — UAssetAPI
+1.1.0 crashes reading it (`Usmap.Read` index-out-of-range) and it wouldn't fix the
+bytecode-modelling gap anyway. Verified offline: combined edit of BP + selector →
+`SKIP BP_MkPlusSubsystem` (file untouched, 44127), selector written, `_P` built
+holding only the selector. Guard: `check_unreal4_5_bytepatch` in `selftest.py`.
 
 **Hard ceiling, unrelated to us:** some mod strings exist ONLY in a compiled C++
 DLL (e.g. EnhancedConveyors belt descriptions "Transports up to N resources per

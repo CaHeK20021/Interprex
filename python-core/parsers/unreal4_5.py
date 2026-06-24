@@ -1511,7 +1511,7 @@ class UnrealEngine4_5Parser(BaseParser):
         (stored in self._cdo_meta), so each edit lands on the right value.
         """
         import json as _json
-        from .base import update_metadata
+        from .base import update_metadata, make_id
 
         cdo_meta = getattr(self, "_cdo_meta", {})
         if not cdo_meta:
@@ -1619,24 +1619,59 @@ class UnrealEngine4_5Parser(BaseParser):
                 "--base-dir", str(tmp_legacy), "--engine", f"VER_{ue_ver}"
             ], check=True, capture_output=True, text=True, timeout=120)
             applied = 0
+            written_abs: list[str] = []
             try:
-                applied = int(_json.loads(res.stdout.strip().splitlines()[-1]).get("applied", 0))
+                result_obj = _json.loads(res.stdout.strip().splitlines()[-1])
+                applied = int(result_obj.get("applied", 0))
+                # The C# side gates each asset on round-trip fidelity (export type) and
+                # returns ONLY the assets it actually wrote — Blueprints whose Kismet
+                # bytecode UAssetAPI can't faithfully re-serialize are SKIPPED (writing
+                # them would NULL the class → SML crash). We pack ONLY `written` into the
+                # _P container, never the requested-but-skipped set.
+                written_abs = [str(p).replace("\\", "/") for p in result_obj.get("written", [])]
             except Exception:
                 pass
-            if applied == 0:
-                logger.warning(f"Byte-patch: 0 edits applied for {uf.name}")
+            if applied == 0 or not written_abs:
+                logger.warning(f"Byte-patch: 0 round-trip-safe edits applied for {uf.name}")
+                # No safe assets to ship. If a PRIOR (buggy) run left a `_P` here that
+                # bundled a corrupt Blueprint, it would keep crashing the game — remove
+                # any stale `_P` we own so the mod loads vanilla instead.
+                for ext in (".utoc", ".ucas", ".pak"):
+                    stale = uf.parent / f"{uf.stem}_P{ext}"
+                    if stale.exists():
+                        try:
+                            stale.unlink()  # our own created artifact, not a game original
+                            logger.info(f"Removed stale byte-patch container {stale.name}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove stale {stale.name}: {e}")
                 return 0
 
-            # 3. copy ONLY the edited assets (.uasset + .uexp) into the zen input,
-            #    preserving their relative paths so the package path is unchanged.
-            edited_rel = {e["AssetPath"].replace("\\", "/") for e in edits}
-            for rel in edited_rel:
+            # 3. copy ONLY the assets the extractor actually wrote (safe, round-trip
+            #    verified) into the zen input, preserving their relative paths so the
+            #    package path is unchanged. Skipped (unsafe) assets never enter _P.
+            tmp_legacy_abs = str(tmp_legacy).replace("\\", "/").rstrip("/")
+            written_rel = set()
+            for ab in written_abs:
+                ab_norm = ab.replace("\\", "/")
+                if ab_norm.startswith(tmp_legacy_abs + "/"):
+                    written_rel.add(ab_norm[len(tmp_legacy_abs) + 1:])
+                else:
+                    # fall back to basename match if path normalization drifts
+                    written_rel.add(Path(ab_norm).name)
+            copied = 0
+            for rel in written_rel:
+                base = rel[:-len(".uasset")] if rel.endswith(".uasset") else rel
                 for ext in (".uasset", ".uexp", ".ubulk"):
-                    src = tmp_legacy / (rel[:-len(".uasset")] + ext if rel.endswith(".uasset") else rel + ext)
+                    src = tmp_legacy / (base + ext)
                     if src.is_file():
                         dst = tmp_zen / src.relative_to(tmp_legacy)
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(str(src), str(dst))
+                        if ext == ".uasset":
+                            copied += 1
+            if copied == 0:
+                logger.warning(f"Byte-patch: no written assets copied for {uf.name}")
+                return 0
 
             # 4. repack as a `_P` patch container next to the original mod utoc.
             # LIMITATION: the locres inject (`_inject_into_utocs`) writes the SAME

@@ -554,6 +554,44 @@ namespace UAssetExtractor
         static string EditKey(int exportIndex, string containerPath, string propName)
             => $"{exportIndex}{containerPath}{propName}";
 
+        // Fidelity gate: is this asset safe to re-serialize with UAssetAPI?
+        // A Blueprint-class asset carries compiled Kismet bytecode (Class/Function/
+        // Struct exports). UAssetAPI does NOT model that bytecode, so re-emitting the
+        // asset on Write drops/garbles ~half the .uexp — the loaded class becomes NULL
+        // and SML crashes ("Attempt to register NULL ModSubsystem"). DataAssets (e.g.
+        // FGUserSetting_IntSelector selector options) have ONLY NormalExports and round-
+        // trip byte-exact, so they are safe to byte-patch. We gate on EXPORT TYPE — the
+        // ground-truth structural marker — not on a fragile byte compare. The earlier
+        // byte-compare approach was unreliable: a plain load→Write of a Blueprint can
+        // serialize clean while the actual property EDIT still corrupts it.
+        static readonly Type[] _bytecodeExportTypes = new[]
+        {
+            typeof(UAssetAPI.ExportTypes.ClassExport),
+            typeof(UAssetAPI.ExportTypes.FunctionExport),
+            typeof(UAssetAPI.ExportTypes.StructExport),
+        };
+
+        static bool IsLoadWriteRoundTripSafe(string path, EngineVersion version,
+            UAssetAPI.Unversioned.Usmap? mappings)
+        {
+            try
+            {
+                var probe = mappings != null ? new UAsset(path, version, mappings) : new UAsset(path, version);
+                foreach (var export in probe.Exports)
+                {
+                    // Any compiled-script export means UAssetAPI can't faithfully rewrite
+                    // this asset. RawExport = UAssetAPI itself couldn't parse the export
+                    // (kept as raw bytes) → also unsafe to round-trip.
+                    if (export is UAssetAPI.ExportTypes.RawExport) return false;
+                    var t = export.GetType();
+                    foreach (var bt in _bytecodeExportTypes)
+                        if (bt.IsAssignableFrom(t)) return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
         static bool TryEditText(TextPropertyData tp, int exportIndex, string containerPath,
             string propName, Dictionary<string, AssetEdit> byKey)
         {
@@ -582,20 +620,46 @@ namespace UAssetExtractor
         // grouped by AssetPath; each asset is opened, patched across its exports,
         // and written back via UAssetAPI (recomputes .uexp offsets). Returns total
         // edits applied. Never throws on one bad asset.
-        static int ApplyEdits(List<AssetEdit> edits, EngineVersion version)
+        // Returns (appliedCount, writtenAssetPaths). Only assets that round-trip with
+        // byte-perfect fidelity (VerifyBinaryEquality before any edit) are written; an
+        // asset UAssetAPI can't faithfully re-serialize (Blueprints — their bytecode is
+        // not modelled, a no-op Write mangles ~half the .uexp and the loaded class goes
+        // NULL → SML crash) is SKIPPED entirely. DataAssets (e.g. FGUserSetting_IntSelector
+        // selector options) round-trip exactly, so they ARE patched. This is the
+        // "translate everything we safely can" gate: unsafe assets stay English, never crash.
+        static (int applied, List<string> written) ApplyEdits(
+            List<AssetEdit> edits, EngineVersion version, UAssetAPI.Unversioned.Usmap? mappings = null)
         {
             int total = 0;
+            var written = new List<string>();
             foreach (var grp in edits.GroupBy(e => e.AssetPath))
             {
                 string? path = grp.Key;
                 if (string.IsNullOrEmpty(path) || !File.Exists(path)) continue;
                 try
                 {
-                    var asset = new UAsset(path, version);
                     var byKey = new Dictionary<string, AssetEdit>();
                     foreach (var e in grp)
                         byKey[EditKey(e.ExportIndex, e.ContainerPath ?? "", e.PropName ?? "")] = e;
 
+                    // GATE: serialize a fresh load to a temp file and require it to match
+                    // pristine disk BYTE-FOR-BYTE. UAssetAPI re-emits each export from its
+                    // property tree on Write; for a Blueprint that tree is incomplete (the
+                    // bytecode isn't modelled), so even a plain load→Write loses ~half the
+                    // .uexp — which NULLs the loaded class and crashes SML. DataAssets
+                    // re-serialize byte-identical. Unsafe assets are skipped entirely
+                    // (stay English, never crash). Pristine bytes are read inside, before
+                    // any write touches `path`.
+                    bool safe = IsLoadWriteRoundTripSafe(path, version, mappings);
+                    if (!safe)
+                    {
+                        Console.Error.WriteLine($"SKIP (not round-trip safe): {Path.GetFileName(path)}");
+                        continue;
+                    }
+
+                    var asset = mappings != null
+                        ? new UAsset(path, version, mappings)
+                        : new UAsset(path, version);
                     int applied = 0;
                     int exportIdx = -1;
                     foreach (var export in asset.Exports.OfType<NormalExport>())
@@ -607,6 +671,7 @@ namespace UAssetExtractor
                     {
                         asset.Write(path);   // rewrites .uasset (+ .uexp) with new offsets
                         total += applied;
+                        written.Add(path);
                     }
                 }
                 catch (Exception ex)
@@ -614,7 +679,7 @@ namespace UAssetExtractor
                     Console.Error.WriteLine($"ApplyEdits failed for {path}: {ex.Message}");
                 }
             }
-            return total;
+            return (total, written);
         }
 
         // Extract all translatable items from ONE .uasset. Returns [] (and never
@@ -758,6 +823,7 @@ namespace UAssetExtractor
             string outputPath = "";
             string applyEdits = "";   // path to edits JSON
             string baseDir = "";      // legacy asset dir the edits' AssetPath is relative to
+            string mappingsPath = ""; // .usmap mappings for honest unversioned-property round-trip
             bool dumpTree = false;
             EngineVersion version = EngineVersion.VER_UE5_4;
 
@@ -782,6 +848,10 @@ namespace UAssetExtractor
                 if (args[i] == "--base-dir" && i + 1 < args.Length)
                 {
                     baseDir = args[i + 1];
+                }
+                if (args[i] == "--mappings" && i + 1 < args.Length)
+                {
+                    mappingsPath = args[i + 1];
                 }
                 if (args[i] == "--engine" && i + 1 < args.Length)
                 {
@@ -811,8 +881,17 @@ namespace UAssetExtractor
                         && !Path.IsPathRooted(e.AssetPath))
                         e.AssetPath = Path.Combine(baseDir, e.AssetPath);
                 }
-                int applied = ApplyEdits(edits, version);
-                Console.WriteLine($"{{\"applied\":{applied},\"requested\":{edits.Count}}}");
+                UAssetAPI.Unversioned.Usmap? mappings = null;
+                if (!string.IsNullOrEmpty(mappingsPath) && File.Exists(mappingsPath))
+                {
+                    try { mappings = new UAssetAPI.Unversioned.Usmap(mappingsPath); }
+                    catch (Exception ex) { Console.Error.WriteLine($"Usmap load failed (continuing without): {ex.Message}"); }
+                }
+                var (applied, written) = ApplyEdits(edits, version, mappings);
+                // Emit the absolute paths actually written so the caller packs ONLY
+                // those into the _P container (skipped/unsafe assets are excluded).
+                var resultObj = new { applied, requested = edits.Count, written };
+                Console.WriteLine(JsonConvert.SerializeObject(resultObj));
                 return;
             }
 

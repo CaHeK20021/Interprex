@@ -31,6 +31,37 @@ export type Engine =
   | "sdf7d2d"
   | "twine";
 
+/** Human-readable engine names for the UI. The `Engine` id is byte-stable (it
+ *  feeds the stable id hash) and must NEVER change; this label is display-only.
+ *  `unreal4_5` is one parser serving TWO things: generic UE4/5 `.locres`/`.pak`
+ *  AND the Satisfactory ContentLib mod pipeline. So its label is context-aware
+ *  (see engineLabel()): "Satisfactory (mods)" in mods mode, "Unreal Engine 4/5"
+ *  otherwise — the ID stays the same, only the wording changes. */
+export const ENGINE_LABELS: Record<Engine, string> = {
+  rpgmaker: "RPG Maker",
+  renpy: "Ren'Py",
+  godot: "Godot",
+  gamemaker: "GameMaker",
+  unity: "Unity",
+  unreal: "Unreal Engine 3",
+  unreal4_5: "Unreal Engine 4/5",
+  csharp: "C#/.NET",
+  i18n: "i18n JSON",
+  fusion: "Fusion/Chowdren",
+  mmf2: "MMF2",
+  qsp: "QSP",
+  sdf7d2d: "7 Days to Die",
+  twine: "Twine",
+};
+
+/** Display name for an engine, given whether we're translating mods. The only
+ *  context-sensitive case is `unreal4_5`: in mods mode it's the Satisfactory
+ *  ContentLib pipeline, otherwise a generic UE4/5 game. */
+export function engineLabel(engine: Engine, modsMode: boolean): string {
+  if (engine === "unreal4_5" && modsMode) return "Satisfactory (mods)";
+  return ENGINE_LABELS[engine] ?? engine;
+}
+
 /**
  * One translatable unit of text, as produced by a parser's extract().
  *
