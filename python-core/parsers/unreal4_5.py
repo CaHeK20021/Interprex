@@ -127,6 +127,51 @@ def _build_uasset_path_key(item: dict) -> list[str]:
     return base
 
 
+# --- ContentLib patch routing ------------------------------------------------
+# WHICH ContentLib patch folder an asset goes to is decided by its PARENT UE class
+# (the same type ContentLib gates on: "Was not FGRecipe after loading"), NOT by its
+# filename. Routing by name over-matched categories/input-actions that merely sit in
+# a /Recipes/ folder or contain "Recipe" (CAT_PP, RecipeCatUpgrade, IA_Smart_Recipe*)
+# -> they failed as RecipePatches. The parent class (Program.cs SuperClass) is the
+# ground truth; HasIngredientsAndProduct is the fallback when retoc erased the parent.
+_RECIPE_SUPERS = {"FGRecipe"}
+_CATEGORY_SUPERS = {
+    "FGItemCategory", "FGCategory", "FGRecipeCategory",
+    "FGBuildCategory", "FGBuildableCategory",
+}
+_ITEM_SUPERS = {"FGItemDescriptor"}
+# parents retoc to-legacy erased (direct base-game inheritance) -> use prop fallback
+_ERASED_SUPERS = {"", "UnknownExport", "<null>", "None"}
+
+
+def _route_patch_kind(super_class: str, has_ing_prod: bool, asset_leaf: str) -> str:
+    """Decide the ContentLib patch kind ("recipes"|"items"|"cdos") from the asset's
+    PARENT UE class (ground truth), with a property-set fallback for assets whose
+    parent retoc erased to UnknownExport. asset_leaf (lowercased asset name) is used
+    ONLY as a last-resort name heuristic so an old/missing-metadata build degrades to
+    the previous behaviour instead of mis-routing."""
+    sc = (super_class or "").strip()
+    if sc in _RECIPE_SUPERS:
+        return "recipes"
+    if sc in _CATEGORY_SUPERS:
+        # ContentLib has no category patch; CDO patches mDisplayName by raw name with
+        # no type gate -> the right home for a category caption.
+        return "cdos"
+    if sc in _ITEM_SUPERS:
+        return "items"
+    if sc in _ERASED_SUPERS:
+        if has_ing_prod:
+            return "recipes"            # Recipe_MK*, Rec_packing* (erased but real recipes)
+        if asset_leaf.startswith("desc_"):
+            return "items"
+        if asset_leaf.startswith("recipe_"):
+            return "recipes"
+        return "cdos"                   # CAT_PP, IA_Smart_*, and any unknown -> safe CDO
+    # Any other concrete parent (FGSchematic, a mod intermediate, a non-FG class) ->
+    # CDO is the safe catch-all (patches any class with no type gate).
+    return "cdos"
+
+
 def _export_index_from_name(export_name: str) -> int:
     """ExportName is `ObjectName#<exportTableIndex>` (the index disambiguates
     repeated ObjectNames). Pull the index back out for the byte-patch locator."""
@@ -240,6 +285,11 @@ def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
                 cdo = _extract_cdo_meta(item)
                 if cdo:
                     rec["_cdo"] = cdo
+                # ContentLib routing facts (stripped in the parent, stored in _route_meta).
+                rec["_route"] = {
+                    "super": item.get("SuperClass") or "",
+                    "has_ing_prod": bool(item.get("HasIngredientsAndProduct")),
+                }
                 results.append(rec)
         return results
     except Exception:
@@ -1081,6 +1131,9 @@ class UnrealEngine4_5Parser(BaseParser):
         # Populated alongside extraction so inject (which re-runs this) can emit
         # array-replace CDO patches without re-extracting structure.
         self._cdo_meta = {}
+        # Per-string ContentLib routing facts (super class + recipe-prop signal),
+        # keyed by string id. inject reads this to pick recipes/items/cdos.
+        self._route_meta = {}
 
         paks = list(iter_pak_files(root))
         utocs = list(iter_utoc_files(root))
@@ -1145,6 +1198,10 @@ class UnrealEngine4_5Parser(BaseParser):
                     cdo = _extract_cdo_meta(item)
                     if cdo:
                         self._cdo_meta[ts.id] = cdo
+                    self._route_meta[ts.id] = {
+                        "super": item.get("SuperClass") or "",
+                        "has_ing_prod": bool(item.get("HasIngredientsAndProduct")),
+                    }
 
         # 2. Extract from .utoc/ucas files via retoc to-legacy (assembles proper .uasset files)
         #    Each mod is processed in a separate process for true parallelism.
@@ -1175,10 +1232,13 @@ class UnrealEngine4_5Parser(BaseParser):
                     dicts = future.result(timeout=120)
                     for d in dicts:
                         cdo = d.pop("_cdo", None)
+                        route = d.pop("_route", None)
                         ts = TranslationString(**d)
                         out.append(ts)
                         if cdo:
                             self._cdo_meta[ts.id] = cdo
+                        if route:
+                            self._route_meta[ts.id] = route
                 except Exception as e:
                     logger.error(f"Parallel utoc extraction failed: {e}")
 
@@ -1247,10 +1307,12 @@ class UnrealEngine4_5Parser(BaseParser):
             self._uasset_cache_key = cache_key
         uasset_strings = self._uasset_cache
         
-        # Group translations by (mod, asset, ContentLib kind). We emit THREE kinds:
-        #   - RecipePatches : Recipe_* assets (FGRecipe)               -> docs ItemPatch-style file
-        #   - ItemPatches   : Desc_*   assets (FGItemDescriptor)       -> docs ItemPatch-style file
-        #   - CDOs          : EVERYTHING ELSE incl. Build_* buildables -> CDO file
+        # Group translations by (mod, asset, ContentLib kind). Kind is decided by the
+        # asset's PARENT UE class (see _route_patch_kind), not its filename:
+        #   - RecipePatches : parent FGRecipe (or erased + has mIngredients+mProduct)
+        #   - ItemPatches   : parent FGItemDescriptor (Desc_*)
+        #   - CDOs          : categories, schematics, buildables, input-actions, and
+        #                     anything else -> CDO patches any class with no type gate
         # WHY CDO for Build_*: ContentLib's ItemPatch loader rejects any class that
         # is `Was not FGItemDescriptor` — Build_* buildables are NOT descriptors, so
         # 485/550 item patches failed. The CDO feature patches ANY class by raw UE
@@ -1342,12 +1404,18 @@ class UnrealEngine4_5Parser(BaseParser):
 
             patches_by_mod.setdefault(mod_name, {"recipes": {}, "items": {}, "cdos": {}})
 
-            if asset_leaf.startswith("recipe_") or "recipe" in internal_path.lower():
-                kind = "recipes"
-            elif asset_leaf.startswith("desc_"):
-                kind = "items"
-            else:
-                kind = "cdos"   # Build_* and anything else not a descriptor/recipe
+            # Route by the asset's PARENT UE class (ground truth ContentLib gates on),
+            # not by filename — the old `"recipe" in internal_path` sent categories and
+            # input-actions in a /Recipes/ folder to RecipePatches where they were
+            # rejected ("Was not FGRecipe"). Falls back to the name heuristic if the
+            # extractor predates SuperClass (graceful degradation, no mis-route on a
+            # rebuilt exe).
+            route = (getattr(self, "_route_meta", {}) or {}).get(string_id, {})
+            kind = _route_patch_kind(
+                route.get("super", ""),
+                bool(route.get("has_ing_prod")),
+                asset_leaf,
+            )
 
             target_map = patches_by_mod[mod_name][kind]
 

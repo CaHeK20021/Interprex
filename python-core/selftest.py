@@ -3052,6 +3052,116 @@ def check_unreal4_5_cdo() -> None:
           "array replace w/ token subst + omitted-field handling)")
 
 
+def check_unreal4_5_routing() -> None:
+    """ContentLib patch routing: _route_patch_kind picks recipes/items/cdos by the
+    asset's PARENT UE class (ground truth ContentLib gates on), with a property-set
+    fallback for retoc-erased parents and a name fallback for no-metadata builds.
+    Drives the canonical (super, has_ing_prod, leaf) -> kind table measured on the
+    real mods (the bug: CAT_PP/RecipeCatUpgrade/IA_Smart_* were routed to recipes
+    and rejected 'Was not FGRecipe')."""
+    from parsers.unreal4_5 import _route_patch_kind
+
+    cases = [
+        # (super, has_ing_prod, asset_leaf, expected_kind)
+        # real recipes (parent survives) -> recipes
+        ("FGRecipe",        True,  "advanced-circuit",      "recipes"),
+        ("FGRecipe",        True,  "battery",               "recipes"),
+        ("FGRecipe",        True,  "recipe-minermk5",       "recipes"),
+        # recipes whose parent retoc erased, but props prove it -> recipes
+        ("",                True,  "recipe_mk2",            "recipes"),
+        ("UnknownExport",   True,  "rec_packinguraniumore", "recipes"),
+        # categories -> cdos (the 4 that failed as recipes)
+        ("",                False, "cat_pp",                "cdos"),   # erased category
+        ("FGItemCategory",  False, "recipecatupgrade",      "cdos"),
+        ("FGCategory",      False, "itemcategory_upgrade",  "cdos"),
+        # input-actions with "recipe" in the name -> cdos
+        ("InputAction",     False, "ia_smart_recipemode",   "cdos"),
+        ("",                False, "ia_smart_recipe_adjust","cdos"),
+        # schematics / buildables -> cdos
+        ("FGSchematic",     False, "mk5",                   "cdos"),
+        ("FGBuildableFactory", False, "build_abflaretower", "cdos"),
+        # item descriptors -> items
+        ("FGItemDescriptor",False, "desc_oreiron",          "items"),
+        # graceful degradation: no super metadata, fall back to the name heuristic
+        ("",                False, "desc_thing",            "items"),
+        ("",                False, "recipe_thing",          "recipes"),
+        ("",                False, "build_thing",           "cdos"),
+    ]
+    for sup, hip, leaf, exp in cases:
+        got = _route_patch_kind(sup, hip, leaf)
+        assert got == exp, f"_route_patch_kind({sup!r}, {hip}, {leaf!r}) -> {got!r}, expected {exp!r}"
+
+    print(f"OK — unreal4_5 routing: {len(cases)} cases (FGRecipe->recipes, "
+          "categories/IA/schematics->cdos, FGItemDescriptor->items, erased-parent "
+          "prop fallback, name-fallback degradation)")
+
+
+def check_unreal4_5_inherited() -> None:
+    """Inherited-property fix: a Blueprint child that overrides only one caption (e.g.
+    Build_GlassTank_4Pipes has its own mDisplayName but inherits mDescription) used to
+    ship a half-translated building — RU name, EN description. The C# extractor now
+    emits the inherited prop as a SECOND item on the CHILD's internal_path with a
+    DIFFERENT prop name. This guards the Python inject contract that both land as two
+    Edits in ONE CDO file (the `_seen` set dedups by prop NAME, so distinct props are
+    NOT collapsed). Also asserts the two items get distinct path keys (no id clash)."""
+    import os, tempfile, shutil, json as _json
+    from parsers.unreal4_5 import UnrealEngine4_5Parser, _build_uasset_path_key
+    from parsers.base import make_id, TranslationString
+
+    # Two items on the SAME child asset, DIFFERENT props (own + inherited).
+    own = {"InternalPath": "/Game/Mods/GlassFluidTank/Build_GlassTank_4Pipes",
+           "PropName": "mDisplayName", "ExportName": "Default__Build_GlassTank_4Pipes_C#1",
+           "ContainerPath": "", "Value": "Industrial Glass Fluid Buffer 4 pipes"}
+    inh = {"InternalPath": "/Game/Mods/GlassFluidTank/Build_GlassTank_4Pipes",
+           "PropName": "mDescription", "ExportName": "Default__Build_GlassTank_4Pipes_C#1",
+           "ContainerPath": "", "Value": "Holds up to 2400 m3 of fluid."}
+    k_own = tuple(_build_uasset_path_key(own))
+    k_inh = tuple(_build_uasset_path_key(inh))
+    assert k_own != k_inh, f"own/inherited path keys must differ: {k_own} == {k_inh}"
+
+    p = UnrealEngine4_5Parser()
+    root = tempfile.mkdtemp(prefix="u45inh_")
+    try:
+        file_key = "uasset://GlassFluidTank//Game/Mods/GlassFluidTank/Build_GlassTank_4Pipes"
+        s_own = TranslationString(id="", original=own["Value"], context="", engine="unreal4_5",
+            file=file_key, path=_build_uasset_path_key(own))
+        s_own.id = make_id("unreal4_5", s_own.file, s_own.path, s_own.original)
+        s_inh = TranslationString(id="", original=inh["Value"], context="", engine="unreal4_5",
+            file=file_key, path=_build_uasset_path_key(inh))
+        s_inh.id = make_id("unreal4_5", s_inh.file, s_inh.path, s_inh.original)
+        assert s_own.id != s_inh.id, "own/inherited must get distinct stable ids"
+
+        p._uasset_cache = [s_own, s_inh]
+        p._uasset_cache_key = (root, None)
+        p._cdo_meta = {}
+        # Build_* with erased parent + no recipe props -> routes to cdos (name fallback).
+        p._route_meta = {
+            s_own.id: {"super": "", "has_ing_prod": False},
+            s_inh.id: {"super": "", "has_ing_prod": False},
+        }
+        translations = {
+            s_own.id: "Промышленный стеклянный буфер жидкости на 4 трубы",
+            s_inh.id: "Вмещает до 2400 м³ жидкости.",
+        }
+        p._inject_into_uassets(root, translations, None)
+
+        cdo_dir = os.path.join(root, "FactoryGame", "Configs", "ContentLib", "CDOs")
+        files = os.listdir(cdo_dir) if os.path.isdir(cdo_dir) else []
+        target = [f for f in files if "Build_GlassTank_4Pipes" in f]
+        assert len(target) == 1, f"expected 1 CDO file for the asset, got {files}"
+        d = _json.load(open(os.path.join(cdo_dir, target[0]), encoding="utf-8"))
+        edits = {e["Property"]: e["Value"] for e in d.get("Edits", [])}
+        assert "mDisplayName" in edits and "mDescription" in edits, \
+            f"both own + inherited props must be Edits, got {list(edits)}"
+        assert edits["mDisplayName"].startswith("Промышленный"), edits["mDisplayName"]
+        assert edits["mDescription"].startswith("Вмещает"), edits["mDescription"]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("OK — unreal4_5 inherited prop: own + inherited captions land as TWO Edits "
+          "in one CDO file (distinct path keys/ids, no _seen dedup collapse)")
+
+
 def check_unreal4_5_bytepatch() -> None:
     """Byte-patch path: edit-collection locators + the C# --apply-edits round-trip.
     The byte-patch rewrites struct-array FText directly in the .uasset (the working
@@ -4170,9 +4280,11 @@ def main() -> int:
     check_unreal4_pak()
     check_unreal4_5_utoc()
     check_unreal4_5_cdo()
+    check_unreal4_5_routing()
+    check_unreal4_5_inherited()
     check_unreal4_5_bytepatch()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-bytepatch) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
     return 0
 
 

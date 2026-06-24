@@ -987,16 +987,40 @@ but different inner log lines — read the INNER line, not the count:**
    STILL fail. The frozen sidecar's text-mode `open` did NOT translate `\n`→`\r\n`
    (worked in dev venv → classic build trap). Fix: build body then
    `.replace("\r\n","\n").replace("\n","\r\n")`, write `open(...,newline="")`.
-4. **Patch TYPE per asset class (the "all mods" rule).** ContentLib `ItemPatch`
-   accepts ONLY `FGItemDescriptor` (= `Desc_*`); a `Build_*` BUILDABLE → rejected
-   `"Was not FGItemDescriptor after loading"` (485/550 of ours). Each buildable has
-   BOTH `Build_*` (buildable; sometimes a junk `mDisplayName` like "Build_AIPacker")
-   and a sibling `Desc_*` (descriptor; the real name); WHICH drives the in-game name
-   varies per mod (`Desc_ABFlareTower` is EMPTY → name from `Build_`; FluidPacker's
-   real name is in `Desc_`). So route by asset-leaf prefix:
-   - `Recipe_*` → `RecipePatches/` (FGRecipe), ItemPatch-style file
-   - `Desc_*`   → `ItemPatches/`   (FGItemDescriptor), ItemPatch-style file
-   - `Build_*` + anything else → `CDOs/` (the catch-all)
+4. **Patch TYPE per asset — route by the PARENT UE CLASS, not the filename**
+   (`_route_patch_kind` in `unreal4_5.py`). ContentLib type-gates each folder
+   (`ItemPatch` accepts ONLY `FGItemDescriptor`; `RecipePatch` ONLY `FGRecipe`),
+   rejecting a wrong-type asset with `"Was not FGRecipe/FGItemDescriptor after
+   loading"`. The OLD name-based router (`"recipe" in internal_path.lower()`) was
+   wrong in BOTH directions: it over-matched categories + input-actions that merely
+   sit in a `/Recipes/` folder or contain "Recipe" (`CAT_PP`, `RecipeCatUpgrade`,
+   `IA_Smart_RecipeMode/_Adjust` → 4 RecipePatch rejects, `Recipe Patches 165/169`
+   in the game log), and real recipes often LACK a `Recipe_` prefix
+   (`advanced-circuit`, `battery`, `Rec_packing*`, `Recipe-MinerMk5`). Fix: the C#
+   extractor (`Program.cs`) emits the asset's PARENT class via `ClassExport.
+   SuperStruct` (`SuperClass`) plus a `HasIngredientsAndProduct` recipe signal; the
+   Python `_route_patch_kind(super, has_ing_prod, leaf)` decides:
+   - super `FGRecipe` → `RecipePatches/`
+   - super `FGItemCategory`/`FGCategory`/… → `CDOs/` (categories: no ContentLib
+     category patch; CDO patches `mDisplayName` by raw name with no type gate)
+   - super `FGItemDescriptor` → `ItemPatches/`
+   - super erased by retoc (`UnknownExport`/`""`, base-game direct inheritance) →
+     fall back to props: has `mIngredients`+`mProduct` → recipes (catches
+     `Recipe_MK*`, `Rec_packing*`), else `desc_`/`recipe_` name heuristic, else CDO
+   - any other concrete parent (`FGSchematic`, mod intermediate, non-FG) → CDO
+   Facts ride from extract→inject on a `self._route_meta` sidecar dict (keyed by
+   string id, like `_cdo_meta`); id is unaffected (id = hash(engine+file+path+
+   original)). Old exe/cache without `SuperClass` → empty route_meta → graceful
+   degradation to the name heuristic. Verified on real mods: 67 ProductionPlus
+   `FGRecipe` stay in recipes, the 4 mis-routed assets move to CDO; guarded by
+   `check_unreal4_5_routing` (16 cases) in `selftest.py`.
+
+   Each buildable still has BOTH `Build_*` (buildable; sometimes a junk
+   `mDisplayName` like "Build_AIPacker") and a sibling `Desc_*` (descriptor; the
+   real name); WHICH drives the in-game name varies per mod (`Desc_ABFlareTower` is
+   EMPTY → name from `Build_`; FluidPacker's real name is in `Desc_`). `Build_*`
+   (super not FGItemDescriptor/FGRecipe) → `CDOs/`, `Desc_*` (FGItemDescriptor) →
+   `ItemPatches/`.
 
    **CDO file format is DIFFERENT** (`Configs/ContentLib/CDOs/`, a supported
    folder): NO first-line comment — the target is the JSON `Class` field — and
@@ -1017,6 +1041,50 @@ Patch files go to BOTH `Configs/ContentLib/<Folder>/` AND
 `FactoryGame/Configs/ContentLib/<Folder>/` (SML version compat). Registered in
 `.interprex_backups/metadata.json` as `type: created` for clean removal on
 backup restore.
+
+### Inherited Blueprint CDO properties (the half-translated-building bug)
+A Blueprint CHILD class stores in its CDO ONLY the properties it OVERRIDES; an
+inherited property is baked into the PARENT's CDO and is ABSENT from the child
+`.uasset`. So the child's inherited caption never extracts → never translates →
+stays English. Real bug (GlassFluidTank): `Build_GlassTank_4Pipes` overrides
+`mDisplayName` ("…4 pipes") but inherits `mDescription` → RU name, EN description;
+its sibling `Build_GlassTank_Child` is the opposite (own `mDescription` "400 m³",
+inherited `mDisplayName`). Patching the PARENT does NOT cascade — ContentLib loads
+the child as a separate object whose inherited value was already compiled in (game
+log: `Patch_..._4Pipes.json` does `Overwrite mDisplayName` ONLY).
+
+Fix is **read-only in C# extraction** (`Program.cs`, batch `--input-dir` only): a
+two-pass `inputDir` walk. Pass 1 extracts each asset's own strings, builds a
+`packagePath→file` index (raw `FolderName`), and records each CDO export
+(`CdoExportRecord`: child internal path, super package path, own prop names,
+routing facts). Pass 2, per child, walks the parent chain via
+`GetSuperPackagePath` (`ClassExport.SuperStruct` import → its `Package` outer
+ObjectName = parent's raw package path), loads each parent `.uasset` (cached
+`ResolvedCdo` per package, `ResolveInheritedProp`/`CollectInheritablePropNames`),
+and for every translatable prop the parent defines that the child does NOT override,
+emits an ADDITIONAL `ExtractedItem` stamped with the CHILD's coordinates
+(InternalPath, ExportName, SuperClass, HasIngredientsAndProduct) and the parent's
+value. Same translatable filters as own props (`TryReadTranslatableTopLevel` mirrors
+the Text/Str branches of `ExtractProps`). Chain stops at a non-mod parent
+(`/Engine/UnknownPackage` → base-game, nothing to inherit); cycle-guarded; never
+throws (a missing/unreadable parent → prop stays English, batch continues).
+
+Consequences:
+- The inherited item is a TOP-LEVEL prop on the child's CDO export, so
+  `_build_uasset_path_key` → `[childInternalPath, propName, childExportName]` — a
+  NEW, unique stable id (correct: it's a genuinely new translatable string). Own
+  items are untouched (only additions), so no id churn / no re-translate.
+- Multi-level inheritance works: `Child_Child` inherits its description from
+  `Child` (nearest parent wins), not from the base.
+- Python is UNCHANGED — inherited items flow through both extract sites and get
+  `_route_meta` from the child's super. At inject, the child's own prop and the
+  inherited prop share `internal_path` but differ in `prop_name`, so the CDO branch
+  (`entry["_seen"]` dedups by prop NAME) appends BOTH as two `Edits` in ONE child
+  CDO file → variant gets `Overwrite mDisplayName + mDescription` (both RU).
+- Single-file `--input` mode does NOT resolve inheritance (no tree); the real
+  pipeline uses `--input-dir`. Verified on GlassFluidTank: 5 → 8 GlassTank strings
+  (each building now has both name+description). Guarded by
+  `check_unreal4_5_inherited` in `selftest.py` (the two-Edits-one-CDO contract).
 
 ### `detect_mods` and game root resolution
 When the user selects `FactoryGame/Mods` in mods mode, the sidecar needs the
