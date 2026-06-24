@@ -1,0 +1,12 @@
+[package]
+name = "jmap_dumper"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "jmap_dumper"
+path = "src/main.rs"
+
+[dependencies]
+jmap = { path = "C:/Users/Alexandr/AppData/Local/Temp/jmap/jmap" }
+serde_json = "1"
