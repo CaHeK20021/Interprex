@@ -69,8 +69,25 @@ _ENABLE_CDO_ARRAY_REPLACE = False
 
 # Byte-patch path: rewrite struct-array FText directly in the .uasset bytes and
 # repack the mod as a `_P` container (bypasses ContentLib, which can't surface
-# these). This is the working replacement for the disabled CDO array-replace.
-_ENABLE_ASSET_BYTEPATCH = True
+# these).
+#
+# ⚠️ DISABLED 2026-06-25 — retoc `to-zen` does NOT faithfully repack mod assets that
+# carry base-game `UnknownExport` import stubs (which `retoc to-legacy` creates for
+# every erased base-game ref). A plain to-legacy→to-zen→to-legacy round-trip of an
+# UNEDITED `MkPlus_OCMode_*` selector already changes the import table: the stub
+# outer-indices collapse (`[8] outer=-14, [9] outer=-15` → both `-13`). Those stubs
+# are the base-game object refs the engine needs to construct an `FGUserSetting_*`,
+# so after repack the engine logs `Plugin MkPlus attempted to register NULL session
+# setting` + `Could not find user setting 'MkPlus.OCMode.<X>'` and the WHOLE setting
+# (and the buildings keyed to it — Constructor/Assembler/Manufacturer Mk2/Mk3)
+# DISAPPEARS in-game. This is a retoc repack limitation, NOT our edit: it reproduces
+# with zero edits. Verified by a real player launch (buildings vanished) + an offline
+# `cmp` of base-assembled vs repacked selector (4 bytes differ, all import outer-idx).
+# Until retoc can round-trip UnknownExport-stub assets byte-exact (or we resolve those
+# stubs to real imports via reflection data), this path ships broken mods. Keep OFF.
+# The selector OPTIONS therefore stay English; the mod stays intact. The extraction +
+# apply-edits + gate code is correct and kept for a future working repack path.
+_ENABLE_ASSET_BYTEPATCH = False
 
 
 def _sanitize_extracted_path(tmp_output: Path, file_path: Path) -> str | None:
@@ -812,6 +829,16 @@ _TEXT_PROP_MARKERS = (
     b"mDisplayName", b"mDescription", b"mTooltip", b"mFlavor",
     b"mLongDescription", b"mPreUnlockDisplayName", b"mPreUnlockDescription",
     b"mPostUnlockDescription", b"mAbbreviatedDisplayName", b"mMenuName",
+    # FGUserSetting* config widgets (MkPlus selectors, sliders, etc.) store their
+    # user-visible captions under prop names WITHOUT the `m` prefix — `DisplayName`,
+    # `ToolTip`, and the selector options under `IntegerSelectionValues[].Name`.
+    # Without these markers the content pre-gate (`_uasset_has_text`) skipped every
+    # `MkPlus_OCMode_*`/`PPMode`/`Power` selector, so they never reached the C#
+    # extractor and were ABSENT from the translation table entirely (real bug
+    # 2026-06-25: "Overclocking Mode: Linear" et al. missing). The C# extractor still
+    # applies its own TechnicalProps/IsTranslatable filter, so adding broad markers
+    # here only widens the pre-gate, it does not admit junk.
+    b"IntegerSelectionValues", b"DisplayName", b"ToolTip",
 )
 
 
@@ -1254,31 +1281,23 @@ class UnrealEngine4_5Parser(BaseParser):
             return 0
         lang_code = UE4_LANG_MAP.get(target_lang) or target_lang[:2].lower()
 
-        files = list(iter_locres_files(root))
+        written = 0
+
+        # 1. LOOSE .locres on disk (rare for mods; common for a base game that ships
+        #    loose localization). Translate each in place into its <lang> sibling.
+        #    ⚠️ This used to be an EXCLUSIVE branch — `if not files: <everything else>
+        #    else: <only loose locres>`. That was a real shipped bug (2026-06-25): the
+        #    moment ANY loose .locres exists (even one), the ENTIRE ContentLib pass
+        #    (_inject_into_uassets — names/descriptions/recipes, the bulk of mod text)
+        #    AND the packed-locres pass were SKIPPED for every mod. The three passes are
+        #    independent — a mod's text can live in ContentLib props, in packed .locres,
+        #    AND in loose .locres at once — so ALL THREE must always run.
+        loose_files = list(iter_locres_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            files = [f for f in files if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)]
-
-        if not files:
-            sml_files: dict[str, bytes] = {}
-            paks_written = self._inject_into_paks(root, translations, lang_code, sub_paths, sml_files)
-            utocs_written = self._inject_into_utocs(root, translations, lang_code, sub_paths, sml_files)
-            
-            if sml_files:
-                self._write_sml_plugin(root, sml_files)
-                
-            written = paks_written + utocs_written
-            written += self._inject_into_uassets(root, translations, sub_paths)
-            # Byte-patch path: rewrite struct-array FText the ContentLib CDO can't
-            # reach (selector options, subsystem build descriptions) directly in the
-            # .uasset bytes and repack the mod as a _P container. Runs AFTER the
-            # ContentLib pass and reuses its extraction cache + _cdo_meta.
-            if _ENABLE_ASSET_BYTEPATCH:
-                written += self._inject_into_uassets_bytepatch(root, translations, sub_paths)
-            return written
-
-        written = 0
-        for f in files:
+            loose_files = [f for f in loose_files
+                           if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)]
+        for f in loose_files:
             rel = f.relative_to(root).as_posix()
             try:
                 m = parse_locres(f.read_bytes())
@@ -1290,6 +1309,27 @@ class UnrealEngine4_5Parser(BaseParser):
                 target.write_bytes(serialize_locres(m))
             except Exception as e:
                 logger.error(f"Failed to inject into {rel}: {e}")
+
+        # 2. PACKED .locres (inside .pak / .utoc) — translate + write the language
+        #    sibling back into a mod container (or collect base-game files for the SML
+        #    plugin). Independent of the loose pass above.
+        sml_files: dict[str, bytes] = {}
+        written += self._inject_into_paks(root, translations, lang_code, sub_paths, sml_files)
+        written += self._inject_into_utocs(root, translations, lang_code, sub_paths, sml_files)
+        if sml_files:
+            self._write_sml_plugin(root, sml_files)
+
+        # 3. ContentLib JSON patches (names / descriptions / recipes / categories) —
+        #    the bulk of mod UI text. ALWAYS runs, regardless of any .locres above.
+        written += self._inject_into_uassets(root, translations, sub_paths)
+
+        # 4. Byte-patch path: struct-array FText ContentLib can't reach (selector
+        #    options, subsystem build descriptions). Reuses the ContentLib extraction
+        #    cache + _cdo_meta. Disabled by default (retoc repack breaks the mod —
+        #    see _ENABLE_ASSET_BYTEPATCH).
+        if _ENABLE_ASSET_BYTEPATCH:
+            written += self._inject_into_uassets_bytepatch(root, translations, sub_paths)
+
         return written
 
     def _inject_into_uassets(self, root: str, translations: dict[str, str], sub_paths) -> int:
@@ -1679,30 +1719,22 @@ class UnrealEngine4_5Parser(BaseParser):
                 "--version", ue_ver, "--no-shaders", "--no-script-objects"
             ], check=True, capture_output=True, timeout=120)
 
-            # 1b. Filter out assets whose imports contain UnknownExport stubs
-            # (retoc replaces base-game refs with UnknownExport). UAssetAPI can
-            # rewrite these but the game can't resolve the broken outer-link chain.
-            _bad_assets: set[str] = set()
-            for e in edits:
-                asset_rel = e.get("AssetPath", "")
-                if not asset_rel:
-                    continue
-                asset_path = tmp_legacy / asset_rel
-                if not asset_path.is_file():
-                    continue
-                try:
-                    raw = asset_path.read_bytes()
-                    if b"UnknownExport" in raw:
-                        _bad_assets.add(asset_rel)
-                except Exception:
-                    pass
-            if _bad_assets:
-                logger.info(
-                    f"Byte-patch: skipping {len(_bad_assets)} asset(s) with "
-                    f"UnknownExport imports in {uf.name}")
-                edits = [e for e in edits if e.get("AssetPath", "") not in _bad_assets]
-                if not edits:
-                    return 0
+            # 1b. (REMOVED 2026-06-25) The old belt-and-suspenders filter dropped any
+            # asset whose bytes contained "UnknownExport". That was a proxy for "retoc
+            # erased a base-game import → the game can't resolve the broken outer-link
+            # chain". It is now BOTH wrong and harmful:
+            #   * Since Satisfactory updated to UE5.6 the game ships script objects in
+            #     global.utoc (54949 of them), so retoc resolves FGUserSetting_IntSelector
+            #     and the like. The class — the thing that used to crash when erased — is
+            #     now a real import. The few residual "UnknownExport" stubs are base-game
+            #     Object refs in /Engine/UnknownPackage (e.g. an empty SubOptionTo); they
+            #     are NOT on the translation path and do not block load.
+            #   * Selector DataAssets (FGUserSetting_IntSelector.IntegerSelectionValues —
+            #     the previously-untranslatable 80 strings) carry exactly those residual
+            #     stubs, so this filter discarded precisely the strings we want.
+            # The honest gate is the C# round-trip check (load → Write → byte-compare),
+            # which the extractor applies per asset and reports via `written`. We trust
+            # that instead of a substring scan.
 
             # 2. write edits in place (AssetPath is relative to tmp_legacy)
             edits_file = Path(tmp_dir) / "edits.json"
@@ -1739,31 +1771,38 @@ class UnrealEngine4_5Parser(BaseParser):
                             logger.warning(f"Could not remove stale {stale.name}: {e}")
                 return 0
 
-            # 3. copy ONLY the assets the extractor actually wrote (safe, round-trip
-            #    verified) into the zen input, preserving their relative paths so the
-            #    package path is unchanged. Skipped (unsafe) assets never enter _P.
-            tmp_legacy_abs = str(tmp_legacy).replace("\\", "/").rstrip("/")
-            written_rel = set()
-            for ab in written_abs:
-                ab_norm = ab.replace("\\", "/")
-                if ab_norm.startswith(tmp_legacy_abs + "/"):
-                    written_rel.add(ab_norm[len(tmp_legacy_abs) + 1:])
-                else:
-                    # fall back to basename match if path normalization drifts
-                    written_rel.add(Path(ab_norm).name)
+            # 3. Pack the WHOLE assembled mod into the zen input, not just the edited
+            #    assets. THIS IS LOAD-BEARING (real shipped bug 2026-06-25, log:
+            #    "Plugin MkPlus attempted to register NULL session setting" ×many).
+            #    A patched selector (`MkPlus_OCMode_*`) imports its companion classes
+            #    `SSC_MkPlus_<X>_C` / `SSC_MkPlus_Manufacturers_C`, which live in OTHER
+            #    `.uasset` files of the SAME mod. A `_P` that contained ONLY the edited
+            #    asset re-resolved those sibling imports to `UnknownExport` at to-zen
+            #    time (verified: the SAME corruption happens on a to-zen→to-legacy
+            #    round-trip with NO edit at all — it is a packaging artifact, not an
+            #    edit artifact). The engine then can't construct the setting → NULL →
+            #    the selector silently vanishes (player sees stock English options).
+            #    Packing the FULL assembled mod keeps every sibling class in the same
+            #    container, so imports resolve to `BlueprintGeneratedClass` again
+            #    (verified: 537/537 assets, SSC_*_C resolves).
+            #
+            #    Unsafe (Blueprint) assets are NOT edited — the C# gate SKIPs them — so
+            #    their bytes in tmp_legacy are the pristine `to-legacy` output, which
+            #    to-zen round-trips cleanly (the crash only came from EDITING a
+            #    Blueprint, which we no longer do). Copy everything verbatim.
             copied = 0
-            for rel in written_rel:
-                base = rel[:-len(".uasset")] if rel.endswith(".uasset") else rel
-                for ext in (".uasset", ".uexp", ".ubulk"):
-                    src = tmp_legacy / (base + ext)
-                    if src.is_file():
-                        dst = tmp_zen / src.relative_to(tmp_legacy)
-                        dst.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(str(src), str(dst))
-                        if ext == ".uasset":
-                            copied += 1
+            for src in tmp_legacy.rglob("*"):
+                if not src.is_file():
+                    continue
+                if src.suffix.lower() not in (".uasset", ".uexp", ".ubulk", ".uptnl"):
+                    continue
+                dst = tmp_zen / src.relative_to(tmp_legacy)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+                if src.suffix.lower() == ".uasset":
+                    copied += 1
             if copied == 0:
-                logger.warning(f"Byte-patch: no written assets copied for {uf.name}")
+                logger.warning(f"Byte-patch: no assets to pack for {uf.name}")
                 return 0
 
             # 4. repack as a `_P` patch container next to the original mod utoc.

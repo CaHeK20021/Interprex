@@ -582,6 +582,32 @@ namespace UAssetExtractor
             typeof(UAssetAPI.ExportTypes.StructExport),
         };
 
+        // Fidelity gate: is this asset safe to re-serialize with UAssetAPI after a real
+        // property EDIT? Two structural markers, both load-bearing:
+        //
+        // 1. BYTECODE EXPORTS (the crash). A Blueprint-class asset carries compiled
+        //    Kismet bytecode in its Class/Function/Struct exports. UAssetAPI does NOT
+        //    model that bytecode. A NO-OP load→Write can come out byte-identical (raw
+        //    export bytes are preserved when nothing in the tree changed) — but the
+        //    moment ANY property is edited, UAssetAPI re-serializes the whole .uexp from
+        //    its parsed tree and DROPS ~half of it (measured on BP_MkPlusSubsystem:
+        //    .uexp 44127→43671, 22780 bytes differ). The loaded class then becomes NULL
+        //    → SML `Attempt to register NULL ModSubsystem` crash on map load (a real
+        //    shipped crash, reproduced 2026-06-25). So a no-op byte round-trip is NOT a
+        //    valid safety test — the export TYPE is. RawExport = UAssetAPI couldn't parse
+        //    the export at all → also unsafe.
+        //
+        // 2. (NO LONGER GATED) UnknownExport imports. The old gate also rejected any
+        //    asset whose import table held an UnknownExport stub, on the theory that
+        //    retoc erased a base-game script import the game then can't resolve. Since
+        //    Satisfactory updated to UE5.6 it ships script objects in global.utoc, so
+        //    retoc resolves FGUserSetting_IntSelector etc.; the residual UnknownExport
+        //    stubs on a selector are plain base-game Object field refs (e.g. an empty
+        //    SubOptionTo), NOT a load blocker — and gating on them discarded exactly the
+        //    selector DataAssets we want. DataAssets are NormalExport-only and edit-then-
+        //    write byte-clean (selector verified: only the edited FText changes), so they
+        //    pass this gate and ship. We trust the export-type structural marker, NOT the
+        //    import table and NOT a no-op byte compare.
         static bool IsLoadWriteRoundTripSafe(string path, EngineVersion version,
             UAssetAPI.Unversioned.Usmap? mappings)
         {
@@ -590,24 +616,10 @@ namespace UAssetExtractor
                 var probe = mappings != null ? new UAsset(path, version, mappings) : new UAsset(path, version);
                 foreach (var export in probe.Exports)
                 {
-                    // Any compiled-script export means UAssetAPI can't faithfully rewrite
-                    // this asset. RawExport = UAssetAPI itself couldn't parse the export
-                    // (kept as raw bytes) → also unsafe to round-trip.
                     if (export is UAssetAPI.ExportTypes.RawExport) return false;
                     var t = export.GetType();
                     foreach (var bt in _bytecodeExportTypes)
                         if (bt.IsAssignableFrom(t)) return false;
-                }
-                // retoc to-legacy replaces base-game imports (parent class, outer objects)
-                // with UnknownExport stubs (ObjectName="UnknownExport", ClassPackage varies).
-                // When UAssetAPI rewrites the asset, the sub-object outer-link chain breaks
-                // in-game because the engine can't resolve the stub import. Detect by
-                // checking if any import has ObjectName "UnknownExport" — these assets are
-                // unsafe to rewrite.
-                foreach (var imp in probe.Imports)
-                {
-                    if (imp.ObjectName?.ToString() == "UnknownExport")
-                        return false;
                 }
                 return true;
             }
@@ -1109,6 +1121,7 @@ namespace UAssetExtractor
             string baseDir = "";      // legacy asset dir the edits' AssetPath is relative to
             string mappingsPath = ""; // .usmap mappings for honest unversioned-property round-trip
             bool dumpTree = false;
+            bool verifyRoundtrip = false;
             EngineVersion version = EngineVersion.VER_UE5_4;
 
             for (int i = 0; i < args.Length; i++)
@@ -1145,7 +1158,39 @@ namespace UAssetExtractor
                     }
                 }
                 if (args[i] == "--dump-tree") dumpTree = true;
-                if (args[i] == "--dump-imports") { dumpTree = true; filePath = filePath; /* handled below */ }
+                if (args[i] == "--dump-imports") { dumpTree = true; /* filePath set via --input, handled below */ }
+                if (args[i] == "--verify-roundtrip") verifyRoundtrip = true;
+            }
+
+            // Diagnostic: report the byte-patch fidelity gate decision per asset —
+            // SAFE (DataAsset, only NormalExports → edit-then-write is byte-clean) vs
+            // SKIP (carries Class/Function/Struct/Raw exports → a real EDIT corrupts the
+            // .uexp → SML crash). This mirrors the EXACT gate ApplyEdits uses, so it is
+            // an honest preview of what will/won't be byte-patched. (A no-op load→Write
+            // byte compare is NOT used — it falsely passes Blueprints, whose raw export
+            // bytes survive an unchanged write but are destroyed by an actual edit.)
+            if (verifyRoundtrip)
+            {
+                UAssetAPI.Unversioned.Usmap? mappings = null;
+                if (!string.IsNullOrEmpty(mappingsPath) && File.Exists(mappingsPath))
+                {
+                    try { mappings = new UAssetAPI.Unversioned.Usmap(mappingsPath); }
+                    catch (Exception ex) { Console.Error.WriteLine($"Usmap load failed (continuing without): {ex.Message}"); }
+                }
+                var files = new List<string>();
+                if (!string.IsNullOrEmpty(inputDir) && Directory.Exists(inputDir))
+                    files.AddRange(Directory.EnumerateFiles(inputDir, "*.uasset", SearchOption.AllDirectories));
+                else if (!string.IsNullOrEmpty(filePath))
+                    files.Add(filePath);
+                int safec = 0, skipc = 0;
+                foreach (var fp in files)
+                {
+                    string name = Path.GetFileName(fp);
+                    if (IsLoadWriteRoundTripSafe(fp, version, mappings)) { safec++; Console.WriteLine($"SAFE  {name}"); }
+                    else { skipc++; Console.WriteLine($"SKIP  {name}"); }
+                }
+                Console.WriteLine($"\n=== gate: SAFE={safec} SKIP={skipc} total={files.Count} ===");
+                return;
             }
 
             // Byte-patch mode: read edits JSON, rewrite FText/FString in the legacy

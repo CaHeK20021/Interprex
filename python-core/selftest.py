@@ -3243,11 +3243,21 @@ def check_unreal4_5_bytepatch() -> None:
                              capture_output=True, text=True, timeout=60)
         out = (res.stdout or "").strip()
         assert '"applied":0' in out and '"requested":0' in out, f"unexpected: {out!r}"
+
+        # 4. --verify-roundtrip CLI is wired (reports the fidelity gate decision the
+        #    apply path uses: export-type SAFE/SKIP). On an empty dir it must summarize
+        #    0 files without crashing. The real gate is exercised on actual mod assets
+        #    at inject time; here we only assert the flag is recognised and degrades.
+        res2 = subprocess.run([extr, "--verify-roundtrip", "--input-dir", tmp,
+                               "--engine", "VER_UE5_6"],
+                              capture_output=True, text=True, timeout=60)
+        out2 = (res2.stdout or "").strip()
+        assert "gate:" in out2 and "total=0" in out2, f"unexpected: {out2!r}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("OK — unreal4_5 byte-patch: locators + edit-collection (array-only) + "
-          "C# --apply-edits CLI wired")
+          "C# --apply-edits + --verify-roundtrip gate CLI wired")
 
 
 def check_prompt_width() -> None:
