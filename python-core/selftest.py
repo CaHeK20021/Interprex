@@ -2735,18 +2735,20 @@ def check_unreal4_pak() -> None:
     # ids stable across runs
     assert {s.id for s in strings} == {s.id for s in p.extract(root)}, "pak ids not stable"
 
-    # inject -> mod-pak
+    # inject -> LOOSE .locres on disk (NOT a _ru_P.pak — the engine never mounts a
+    # sibling localization pak; it reads the loose path. See _inject_into_paks.)
     tr = {s.id: s.original.upper() for s in strings}
     written = p.inject(root, tr, target_lang="Russian")
     assert written == 4, f"pak written={written}"
 
-    mod = os.path.join(paks, "MyGame_ru_P.pak")
-    assert os.path.isfile(mod), "mod-pak not created"
-    back = read_pak(mod)
-    assert len(back) == 1, [b.path for b in back]
-    # retargeted culture en -> ru
-    assert "/ru/" in back[0].path, back[0].path
-    m = parse_locres(back[0].data)
+    # _loose_locres_path anchors on the `Content/` segment of the inner path and joins
+    # the tail to mod_dir (=root here), so inner `Game/Content/Localization/Game/en/...`
+    # -> `<root>/Content/Localization/Game/ru/Game.locres`.
+    loose = os.path.join(root, "Content", "Localization", "Game", "ru", "Game.locres")
+    assert os.path.isfile(loose), f"loose locres not created (looked for {loose})"
+    # the old broken mod-pak must NOT be produced
+    assert not os.path.isfile(os.path.join(paks, "MyGame_ru_P.pak")), "stale _ru_P.pak should not be written"
+    m = parse_locres(open(loose, "rb").read())
     vals = {m.string_table[k.string_index].value.text for ns in m.namespaces for k in ns.keys}
     assert "START GAME" in vals and "ПРИВЕТ МИР" in vals, vals
     # original pak untouched
@@ -2885,10 +2887,12 @@ def check_unreal4_5_utoc() -> None:
         written = p.inject(game_root, tr, target_lang="Russian")
         assert written == 4, f"utoc inject written={written}"
         
-        # Verify that Zen patch files were created
-        assert os.path.exists(os.path.join(content_paks, "GameContainer_P.utoc"))
-        assert os.path.exists(os.path.join(content_paks, "GameContainer_P.ucas"))
-        assert os.path.exists(os.path.join(content_paks, "GameContainer_P.pak"))
+        # Verify a LOOSE .locres was written (NOT a Zen _P container — retoc to-zen
+        # can't pack .locres, and the engine reads the loose path anyway).
+        loose_utoc = os.path.join(game_root, "Content", "Localization", "Game", "ru", "Game.locres")
+        assert os.path.exists(loose_utoc), f"loose locres not written: {loose_utoc}"
+        assert not os.path.exists(os.path.join(content_paks, "GameContainer_P.utoc")), \
+            "dead Zen container should not be produced for locres"
         
         # --- TEST 4: Inject for Satisfactory Base Game (SML Plugin folder) ---
         # Clear/initialize Satisfactory root and extract
@@ -2917,10 +2921,18 @@ def check_unreal4_5_utoc() -> None:
         sat_mod_written = p.inject(sat_mod_root, sat_mod_tr, target_lang="Russian")
         assert sat_mod_written == 4, f"Satisfactory mod inject written={sat_mod_written}"
         
-        # Verify standard patch container is created next to original mod file
-        assert os.path.exists(os.path.join(sat_mod_paks, "TestMod_P.utoc"))
-        assert os.path.exists(os.path.join(sat_mod_paks, "TestMod_P.ucas"))
-        assert os.path.exists(os.path.join(sat_mod_paks, "TestMod_P.pak"))
+        # Verify a LOOSE translated .locres is written under the mod dir (the engine
+        # reads it directly), and NO dead _P container is produced.
+        # sat_mod_paks = <sat_mod_root>/FactoryGame/Mods/TestMod/Content/Paks/Windows;
+        # mod_dir walk strips Windows/Paks/Content -> TestMod; inner is
+        # Game/Content/Localization/Game/en/... retargeted to /ru/.
+        import glob as _glob
+        loose_mod = _glob.glob(os.path.join(
+            sat_mod_root, "FactoryGame", "Mods", "TestMod", "**", "ru", "Game.locres"),
+            recursive=True)
+        assert loose_mod, "loose mod locres not written"
+        assert not os.path.exists(os.path.join(sat_mod_paks, "TestMod_P.utoc")), \
+            "dead Zen container should not be produced for mod locres"
 
     # Cleanup temp dirs
     import shutil

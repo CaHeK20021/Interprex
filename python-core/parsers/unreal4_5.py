@@ -622,6 +622,31 @@ SOURCE_CULTURES = ("en-us", "en", "en-gb")
 PAK_SEP = "!"
 
 
+def _loose_locres_path(mod_dir: "Path", inner_path: str) -> "Path":
+    """Resolve the on-disk loose path the ENGINE reads for a translated mod .locres.
+
+    The engine opens `<ModDir>/Content/Localization/<Mod>/<lang>/<Mod>.locres`. But a
+    pak's INNER path is relative to that pak's MOUNT point, which varies per mod:
+      - InfiniteNudge inner = `Content/Localization/InfiniteNudge/en/...`   (mounted at mod root)
+      - AB_FluidExtras inner = `Mods/GameFeatures/AB_FluidExtras/Content/Localization/...`
+        (mounted at `FactoryGame/`)
+    Blindly joining the inner path to `mod_dir` doubled the AB path
+    (`AB_FluidExtras/Mods/GameFeatures/AB_FluidExtras/...`) so the engine never found it.
+    Fix: anchor on the `Content/` segment — the loose path is always `<mod_dir>` + the
+    inner tail from `Content/` onward (the mod's own content tree). Mods keep their
+    localization under their OWN Content/, regardless of the pak mount point."""
+    parts = inner_path.replace("\\", "/").lstrip("/").split("/")
+    lower = [p.lower() for p in parts]
+    if "content" in lower:
+        tail = parts[lower.index("content"):]
+    else:
+        tail = parts  # no Content segment — fall back to verbatim (rare)
+    p = mod_dir
+    for seg in tail:
+        p = p / seg
+    return p
+
+
 def _inner_culture(inner_path: str) -> str | None:
     """Culture folder of an inner `.locres` path: .../Localization/<Target>/<cul>/x.locres."""
     parts = [p.lower() for p in inner_path.split("/")]
@@ -1843,9 +1868,12 @@ class UnrealEngine4_5Parser(BaseParser):
 
     def _inject_into_paks(self, root: str, translations: dict[str, str],
                           lang_code: str, sub_paths, sml_files: dict[str, bytes] | None = None) -> int:
-        """Write translated .locres into a NEW uncompressed mod-pak per source pak
-        (`<name>_<lang>_P.pak`), leaving the original untouched. Inner files are
-        retargeted to the chosen culture so the game loads them as that language."""
+        """Translate each mod's packed .locres and write it back as a LOOSE
+        `<ModDir>/Content/Localization/<Mod>/<lang>/<Mod>.locres` file — the path the
+        engine actually reads (a sibling `_<lang>_P.pak` is never mounted for locres
+        override). Base-game packed locres still go to the SML plugin via sml_files."""
+        import os, hashlib
+        from .base import update_metadata
         from . import pak as pakmod
         paks = list(iter_pak_files(root))
         if sub_paths:
@@ -1883,11 +1911,29 @@ class UnrealEngine4_5Parser(BaseParser):
                 if sml_files is not None:
                     sml_files.update(out_files)
             else:
-                mod_pak = pf.with_name(f"{pf.stem}_{lang_code}_P.pak")
-                if mod_pak.exists():
-                    self.backup_file(root, str(mod_pak))
-                pakmod.write_pak(str(mod_pak), out_files)
-                logger.info("Wrote mod-pak %s (%d files)", mod_pak.name, len(out_files))
+                # ⚠️ Write the translated .locres as a LOOSE file on disk, NOT a
+                # `_<lang>_P.pak` (2026-06-25). The engine does NOT mount a sibling
+                # `<Mod>_ru_P.pak` for localization override — verified in the game log:
+                # it never appears in "Mounted Pak file" lines, and the engine instead
+                # tries to OPEN the loose path `<ModDir>/Content/Localization/<Mod>/<lang>/
+                # <Mod>.locres` directly ("LocRes '...' could not be opened for reading").
+                # So we place the file exactly there. (The old `_ru_P.pak` path silently
+                # did nothing in-game.) `out_files` keys are already the retargeted inner
+                # paths `Content/Localization/<Mod>/<lang>/<Mod>.locres`; the mod root is
+                # the ancestor of pf that holds `Content/Paks/Windows`.
+                mod_dir = pf.parent
+                while mod_dir != mod_dir.parent and mod_dir.name.lower() in ("windows", "paks", "content"):
+                    mod_dir = mod_dir.parent
+                for inner_path, data in out_files.items():
+                    loose = _loose_locres_path(mod_dir, inner_path)
+                    if loose.exists():
+                        self.backup_file(root, str(loose))
+                    loose.parent.mkdir(parents=True, exist_ok=True)
+                    loose.write_bytes(data)
+                    rel_to_root = os.path.relpath(str(loose), root).replace("\\", "/")
+                    sha = hashlib.sha256(data).hexdigest()
+                    update_metadata(root, rel_to_root, "", sha, "created")
+                    logger.info("Wrote loose locres %s", rel_to_root)
         return written
 
     def _inject_into_utocs(self, root: str, translations: dict[str, str],
@@ -1956,43 +2002,29 @@ class UnrealEngine4_5Parser(BaseParser):
                 if sml_files is not None:
                     sml_files.update(out_files)
             else:
-                ue_ver = _detect_ue_version(str(uf), retoc_bin)
-                
-                with tempfile.TemporaryDirectory() as tmp_zen_dir:
-                    for inner_path, data in out_files.items():
-                        target_file = Path(tmp_zen_dir) / inner_path.lstrip("/")
-                        target_file.parent.mkdir(parents=True, exist_ok=True)
-                        target_file.write_bytes(data)
-                        
-                    patch_base = uf.parent / f"{uf.stem}_P"
-                    patch_utoc = uf.parent / f"{uf.stem}_P.utoc"
-                    patch_ucas = uf.parent / f"{uf.stem}_P.ucas"
-                    patch_pak = uf.parent / f"{uf.stem}_P.pak"
-                    
-                    for p_file in (patch_utoc, patch_ucas, patch_pak):
-                        if p_file.exists():
-                            self.backup_file(root, str(p_file))
-                            
-                    try:
-                        _run_cmd([
-                            retoc_bin, "to-zen",
-                            "--version", ue_ver,
-                            str(tmp_zen_dir),
-                            str(patch_base)
-                        ], check=True, capture_output=True)
-                        
-                        missing = []
-                        for p_file in (patch_utoc, patch_ucas, patch_pak):
-                            if not p_file.exists() or p_file.stat().st_size == 0:
-                                missing.append(p_file.name)
-                        if missing:
-                            raise RuntimeError(
-                                f"retoc to-zen did not generate valid output files: {', '.join(missing)}"
-                            )
-                        logger.info(f"Wrote Zen patch container {patch_base.name} (files: {list(out_files.keys())})")
-                    except Exception as e:
-                        logger.error(f"Failed to compile Zen patch container for {utoc_rel}: {e}")
-                        raise
+                # Write LOOSE, like _inject_into_paks. retoc `to-zen` CANNOT pack a
+                # `.locres` (it expects `.uasset` — verified: a to-zen of a lone .locres
+                # yields a container with only a ContainerHeader, no chunk), so the old
+                # `<stem>_P` IoStore approach here produced EMPTY containers that
+                # delivered nothing. The engine reads the loose path anyway, so emit it
+                # directly. (In practice no shipped mod stores .locres inside its .utoc —
+                # they all keep it in the sibling .pak — so this branch rarely fires, but
+                # it must not produce a dead container when it does.)
+                import os, hashlib
+                from .base import update_metadata
+                mod_dir = uf.parent
+                while mod_dir != mod_dir.parent and mod_dir.name.lower() in ("windows", "paks", "content"):
+                    mod_dir = mod_dir.parent
+                for inner_path, data in out_files.items():
+                    loose = _loose_locres_path(mod_dir, inner_path)
+                    if loose.exists():
+                        self.backup_file(root, str(loose))
+                    loose.parent.mkdir(parents=True, exist_ok=True)
+                    loose.write_bytes(data)
+                    rel_to_root = os.path.relpath(str(loose), root).replace("\\", "/")
+                    sha = hashlib.sha256(data).hexdigest()
+                    update_metadata(root, rel_to_root, "", sha, "created")
+                    logger.info("Wrote loose locres %s", rel_to_root)
         return written
 
     def _write_sml_plugin(self, root: str, out_files: dict[str, bytes]) -> None:

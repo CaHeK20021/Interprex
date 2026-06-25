@@ -1103,6 +1103,39 @@ Patch files go to BOTH `Configs/ContentLib/<Folder>/` AND
 `.interprex_backups/metadata.json` as `type: created` for clean removal on
 backup restore.
 
+### `inject()` runs THREE independent passes — never `if/else` (2026-06-25 bug)
+`inject()` must run loose-locres, packed-locres, AND ContentLib `_inject_into_uassets`
+EVERY time — they are independent (a mod's text can live in all three at once). A prior
+version gated them: `files = loose .locres; if not files: <packed-locres + ContentLib>;
+else: <only loose locres>`. The moment ANY loose `.locres` existed (even one stray test
+file), the ENTIRE ContentLib pass — names/descriptions/recipes, the BULK of mod text —
+was SKIPPED for every mod. Symptom: inject finishes suspiciously fast, game is mostly
+English, only ~3 patches on disk. Verified fix: a full 89-mod run went 3 → 3582
+ContentLib patches (`Successful: 114/114 items, 698/698 recipes, 2770/2770 CDOs`, 0
+reject in the game log). The three passes are now sequential and unconditional.
+
+### Mod `.locres` ships as a LOOSE file, NOT a `_P` container (2026-06-25)
+A mod's translated `.locres` is written LOOSE to
+`<ModDir>/Content/Localization/<Mod>/<lang>/<Mod>.locres` (`_inject_into_paks` /
+`_inject_into_utocs`), NOT as a `<stem>_<lang>_P.pak` or a `to-zen` `_P` container. Two
+ground-truth facts from the game log forced this:
+- The engine NEVER mounts a sibling `<Mod>_ru_P.pak` for localization override (it never
+  appears in "Mounted Pak file" lines). It instead tries to OPEN the loose path directly:
+  `LogTextLocalizationResource: LocRes '.../Localization/<Mod>/ru/<Mod>.locres' could not
+  be opened for reading!` — so we place the file exactly there and the error goes away.
+- `retoc to-zen` CANNOT pack a `.locres` (it expects `.uasset`; a to-zen of a lone
+  `.locres` yields a container with only a `ContainerHeader`, 64-byte `.ucas`, no chunk),
+  so the old utoc `_P` path silently shipped EMPTY containers.
+`mod_dir` = walk up from the `.pak`/`.utoc` stripping `Windows`/`Paks`/`Content`. The
+loose file is registered in metadata as `type: created`. **No shipped mod stores
+`.locres` inside its `.utoc`** (all keep it in the sibling `.pak`), so the utoc branch
+rarely fires — but it must write loose too, never a dead `_P`. NOTE: many mods ship an
+EMPTY `.locres` (e.g. GeothermalMk 37 B / 0 entries, XeSS none) — the game still probes
+for `ru/` and logs "could not be opened"; that is benign (nothing to translate). Only
+mods with real entries (e.g. AB_FluidExtras 102, InfiniteNudge 42) produce output.
+Guard: `check_unreal4_5_pak` + `check_unreal4_5_utoc` assert the loose file is written
+and NO `_P`/`_ru_P` container is produced.
+
 ### Inherited Blueprint CDO properties (the half-translated-building bug)
 A Blueprint CHILD class stores in its CDO ONLY the properties it OVERRIDES; an
 inherited property is baked into the PARENT's CDO and is ABSENT from the child

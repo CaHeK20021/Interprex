@@ -370,7 +370,13 @@ export default function App() {
   } | null>(null);
   const shouldRestartRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  // Search query for string filtering
+  // Search box: `searchInput` is the raw, instant value bound to the <input> (so
+  // typing never lags). `searchQuery` is the DEBOUNCED value the heavy filter
+  // (filteredStrings, a pass over all 7000+ rows) actually reads — synced ~180ms
+  // after the last keystroke. Without this split, every keystroke re-ran the full
+  // filter + re-rendered 500 rows synchronously, blocking input (the "lags on every
+  // letter" bug on big projects).
+  const [searchInput, setSearchInput] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   // Search mode: all fields, original only, translation only, or none
   const [searchMode, setSearchMode] = useState<"all" | "original" | "translation" | "none">("all");
@@ -405,11 +411,26 @@ export default function App() {
     };
   }, []);
 
-  // Reset page to 0 on search input change
+  // Reset page to 0 on search input change. Updates the INSTANT input value only;
+  // the debounce effect below propagates it to searchQuery (which drives the filter).
   const handleSearchChange = (val: string) => {
-    setSearchQuery(val);
-    setPage(0);
+    setSearchInput(val);
   };
+
+  // Debounce: push the typed value into searchQuery ~180ms after the last keystroke.
+  // Clearing ("") applies immediately so the X button feels instant.
+  useEffect(() => {
+    if (searchInput === "") {
+      setSearchQuery("");
+      setPage(0);
+      return;
+    }
+    const h = setTimeout(() => {
+      setSearchQuery(searchInput);
+      setPage(0);
+    }, 180);
+    return () => clearTimeout(h);
+  }, [searchInput]);
 
   const handleSearchModeCheckbox = (field: "original" | "translation", checked: boolean) => {
     setPage(0);
@@ -2773,10 +2794,10 @@ export default function App() {
               type="text"
               className="search-input"
               placeholder="Поиск по таблице..."
-              value={searchQuery}
+              value={searchInput}
               onChange={(e) => handleSearchChange(e.target.value)}
             />
-            {searchQuery && (
+            {searchInput && (
               <button className="search-clear" onClick={() => handleSearchChange("")}>
                 ✕
               </button>
