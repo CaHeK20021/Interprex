@@ -1625,15 +1625,12 @@ export default function App() {
   async function handleInjectEditedMods() {
     if (editedModPaths.size === 0) return;
     const originalSelected = [...selectedModPaths];
-    const validEdited = Array.from(editedModPaths).filter((p) =>
-      detectedMods.some((m) => m.path === p)
-    );
-    if (validEdited.length === 0) return;
+    const editedList = Array.from(editedModPaths);
 
-    setSelectedModPaths(validEdited);
+    setSelectedModPaths(editedList);
 
     try {
-      await writeBack(project ?? undefined, validEdited);
+      await writeBack(project ?? undefined, editedList);
     } catch (err) {
       console.error(err);
     } finally {
