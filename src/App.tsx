@@ -40,6 +40,7 @@ import {
   saveProviderKeys,
 } from "./lib/settings";
 import type { Engine, FontStyle, ProjectFile, TranslationString } from "./lib/types";
+import { engineLabel } from "./lib/types";
 import FolderPicker from "./FolderPicker";
 import UpdateOverlay from "./UpdateOverlay";
 import {
@@ -2162,7 +2163,7 @@ export default function App() {
             {isPaused ? t("btnResume") : t("btnPause")}
           </button>
         )}
-        {engine && <span className={`badge engine-${engine}`}>{engine === "unreal4_5" ? "unreal4/5" : engine}</span>}
+        {engine && <span className={`badge engine-${engine}`}>{engineLabel(engine, translationMode === "mods")}</span>}
         {busy && <span className="phase">{phaseLabel}…</span>}
         {hasBackup && (
           <div className="backup-group">

@@ -127,6 +127,51 @@ def _build_uasset_path_key(item: dict) -> list[str]:
     return base
 
 
+# --- ContentLib patch routing ------------------------------------------------
+# WHICH ContentLib patch folder an asset goes to is decided by its PARENT UE class
+# (the same type ContentLib gates on: "Was not FGRecipe after loading"), NOT by its
+# filename. Routing by name over-matched categories/input-actions that merely sit in
+# a /Recipes/ folder or contain "Recipe" (CAT_PP, RecipeCatUpgrade, IA_Smart_Recipe*)
+# -> they failed as RecipePatches. The parent class (Program.cs SuperClass) is the
+# ground truth; HasIngredientsAndProduct is the fallback when retoc erased the parent.
+_RECIPE_SUPERS = {"FGRecipe"}
+_CATEGORY_SUPERS = {
+    "FGItemCategory", "FGCategory", "FGRecipeCategory",
+    "FGBuildCategory", "FGBuildableCategory",
+}
+_ITEM_SUPERS = {"FGItemDescriptor"}
+# parents retoc to-legacy erased (direct base-game inheritance) -> use prop fallback
+_ERASED_SUPERS = {"", "UnknownExport", "<null>", "None"}
+
+
+def _route_patch_kind(super_class: str, has_ing_prod: bool, asset_leaf: str) -> str:
+    """Decide the ContentLib patch kind ("recipes"|"items"|"cdos") from the asset's
+    PARENT UE class (ground truth), with a property-set fallback for assets whose
+    parent retoc erased to UnknownExport. asset_leaf (lowercased asset name) is used
+    ONLY as a last-resort name heuristic so an old/missing-metadata build degrades to
+    the previous behaviour instead of mis-routing."""
+    sc = (super_class or "").strip()
+    if sc in _RECIPE_SUPERS:
+        return "recipes"
+    if sc in _CATEGORY_SUPERS:
+        # ContentLib has no category patch; CDO patches mDisplayName by raw name with
+        # no type gate -> the right home for a category caption.
+        return "cdos"
+    if sc in _ITEM_SUPERS:
+        return "items"
+    if sc in _ERASED_SUPERS:
+        if has_ing_prod:
+            return "recipes"            # Recipe_MK*, Rec_packing* (erased but real recipes)
+        if asset_leaf.startswith("desc_"):
+            return "items"
+        if asset_leaf.startswith("recipe_"):
+            return "recipes"
+        return "cdos"                   # CAT_PP, IA_Smart_*, and any unknown -> safe CDO
+    # Any other concrete parent (FGSchematic, a mod intermediate, a non-FG class) ->
+    # CDO is the safe catch-all (patches any class with no type gate).
+    return "cdos"
+
+
 def _export_index_from_name(export_name: str) -> int:
     """ExportName is `ObjectName#<exportTableIndex>` (the index disambiguates
     repeated ObjectNames). Pull the index back out for the byte-patch locator."""
@@ -240,6 +285,11 @@ def _process_utoc_worker(args: tuple[str, str, str, str, str]) -> list[dict]:
                 cdo = _extract_cdo_meta(item)
                 if cdo:
                     rec["_cdo"] = cdo
+                # ContentLib routing facts (stripped in the parent, stored in _route_meta).
+                rec["_route"] = {
+                    "super": item.get("SuperClass") or "",
+                    "has_ing_prod": bool(item.get("HasIngredientsAndProduct")),
+                }
                 results.append(rec)
         return results
     except Exception:
@@ -1081,6 +1131,9 @@ class UnrealEngine4_5Parser(BaseParser):
         # Populated alongside extraction so inject (which re-runs this) can emit
         # array-replace CDO patches without re-extracting structure.
         self._cdo_meta = {}
+        # Per-string ContentLib routing facts (super class + recipe-prop signal),
+        # keyed by string id. inject reads this to pick recipes/items/cdos.
+        self._route_meta = {}
 
         paks = list(iter_pak_files(root))
         utocs = list(iter_utoc_files(root))
@@ -1145,6 +1198,10 @@ class UnrealEngine4_5Parser(BaseParser):
                     cdo = _extract_cdo_meta(item)
                     if cdo:
                         self._cdo_meta[ts.id] = cdo
+                    self._route_meta[ts.id] = {
+                        "super": item.get("SuperClass") or "",
+                        "has_ing_prod": bool(item.get("HasIngredientsAndProduct")),
+                    }
 
         # 2. Extract from .utoc/ucas files via retoc to-legacy (assembles proper .uasset files)
         #    Each mod is processed in a separate process for true parallelism.
@@ -1175,10 +1232,13 @@ class UnrealEngine4_5Parser(BaseParser):
                     dicts = future.result(timeout=120)
                     for d in dicts:
                         cdo = d.pop("_cdo", None)
+                        route = d.pop("_route", None)
                         ts = TranslationString(**d)
                         out.append(ts)
                         if cdo:
                             self._cdo_meta[ts.id] = cdo
+                        if route:
+                            self._route_meta[ts.id] = route
                 except Exception as e:
                     logger.error(f"Parallel utoc extraction failed: {e}")
 
@@ -1247,10 +1307,12 @@ class UnrealEngine4_5Parser(BaseParser):
             self._uasset_cache_key = cache_key
         uasset_strings = self._uasset_cache
         
-        # Group translations by (mod, asset, ContentLib kind). We emit THREE kinds:
-        #   - RecipePatches : Recipe_* assets (FGRecipe)               -> docs ItemPatch-style file
-        #   - ItemPatches   : Desc_*   assets (FGItemDescriptor)       -> docs ItemPatch-style file
-        #   - CDOs          : EVERYTHING ELSE incl. Build_* buildables -> CDO file
+        # Group translations by (mod, asset, ContentLib kind). Kind is decided by the
+        # asset's PARENT UE class (see _route_patch_kind), not its filename:
+        #   - RecipePatches : parent FGRecipe (or erased + has mIngredients+mProduct)
+        #   - ItemPatches   : parent FGItemDescriptor (Desc_*)
+        #   - CDOs          : categories, schematics, buildables, input-actions, and
+        #                     anything else -> CDO patches any class with no type gate
         # WHY CDO for Build_*: ContentLib's ItemPatch loader rejects any class that
         # is `Was not FGItemDescriptor` — Build_* buildables are NOT descriptors, so
         # 485/550 item patches failed. The CDO feature patches ANY class by raw UE
@@ -1342,12 +1404,18 @@ class UnrealEngine4_5Parser(BaseParser):
 
             patches_by_mod.setdefault(mod_name, {"recipes": {}, "items": {}, "cdos": {}})
 
-            if asset_leaf.startswith("recipe_") or "recipe" in internal_path.lower():
-                kind = "recipes"
-            elif asset_leaf.startswith("desc_"):
-                kind = "items"
-            else:
-                kind = "cdos"   # Build_* and anything else not a descriptor/recipe
+            # Route by the asset's PARENT UE class (ground truth ContentLib gates on),
+            # not by filename — the old `"recipe" in internal_path` sent categories and
+            # input-actions in a /Recipes/ folder to RecipePatches where they were
+            # rejected ("Was not FGRecipe"). Falls back to the name heuristic if the
+            # extractor predates SuperClass (graceful degradation, no mis-route on a
+            # rebuilt exe).
+            route = (getattr(self, "_route_meta", {}) or {}).get(string_id, {})
+            kind = _route_patch_kind(
+                route.get("super", ""),
+                bool(route.get("has_ing_prod")),
+                asset_leaf,
+            )
 
             target_map = patches_by_mod[mod_name][kind]
 
@@ -1511,7 +1579,7 @@ class UnrealEngine4_5Parser(BaseParser):
         (stored in self._cdo_meta), so each edit lands on the right value.
         """
         import json as _json
-        from .base import update_metadata
+        from .base import update_metadata, make_id
 
         cdo_meta = getattr(self, "_cdo_meta", {})
         if not cdo_meta:
@@ -1611,6 +1679,31 @@ class UnrealEngine4_5Parser(BaseParser):
                 "--version", ue_ver, "--no-shaders", "--no-script-objects"
             ], check=True, capture_output=True, timeout=120)
 
+            # 1b. Filter out assets whose imports contain UnknownExport stubs
+            # (retoc replaces base-game refs with UnknownExport). UAssetAPI can
+            # rewrite these but the game can't resolve the broken outer-link chain.
+            _bad_assets: set[str] = set()
+            for e in edits:
+                asset_rel = e.get("AssetPath", "")
+                if not asset_rel:
+                    continue
+                asset_path = tmp_legacy / asset_rel
+                if not asset_path.is_file():
+                    continue
+                try:
+                    raw = asset_path.read_bytes()
+                    if b"UnknownExport" in raw:
+                        _bad_assets.add(asset_rel)
+                except Exception:
+                    pass
+            if _bad_assets:
+                logger.info(
+                    f"Byte-patch: skipping {len(_bad_assets)} asset(s) with "
+                    f"UnknownExport imports in {uf.name}")
+                edits = [e for e in edits if e.get("AssetPath", "") not in _bad_assets]
+                if not edits:
+                    return 0
+
             # 2. write edits in place (AssetPath is relative to tmp_legacy)
             edits_file = Path(tmp_dir) / "edits.json"
             edits_file.write_text(_json.dumps(edits, ensure_ascii=False), encoding="utf-8")
@@ -1619,24 +1712,59 @@ class UnrealEngine4_5Parser(BaseParser):
                 "--base-dir", str(tmp_legacy), "--engine", f"VER_{ue_ver}"
             ], check=True, capture_output=True, text=True, timeout=120)
             applied = 0
+            written_abs: list[str] = []
             try:
-                applied = int(_json.loads(res.stdout.strip().splitlines()[-1]).get("applied", 0))
+                result_obj = _json.loads(res.stdout.strip().splitlines()[-1])
+                applied = int(result_obj.get("applied", 0))
+                # The C# side gates each asset on round-trip fidelity (export type) and
+                # returns ONLY the assets it actually wrote — Blueprints whose Kismet
+                # bytecode UAssetAPI can't faithfully re-serialize are SKIPPED (writing
+                # them would NULL the class → SML crash). We pack ONLY `written` into the
+                # _P container, never the requested-but-skipped set.
+                written_abs = [str(p).replace("\\", "/") for p in result_obj.get("written", [])]
             except Exception:
                 pass
-            if applied == 0:
-                logger.warning(f"Byte-patch: 0 edits applied for {uf.name}")
+            if applied == 0 or not written_abs:
+                logger.warning(f"Byte-patch: 0 round-trip-safe edits applied for {uf.name}")
+                # No safe assets to ship. If a PRIOR (buggy) run left a `_P` here that
+                # bundled a corrupt Blueprint, it would keep crashing the game — remove
+                # any stale `_P` we own so the mod loads vanilla instead.
+                for ext in (".utoc", ".ucas", ".pak"):
+                    stale = uf.parent / f"{uf.stem}_P{ext}"
+                    if stale.exists():
+                        try:
+                            stale.unlink()  # our own created artifact, not a game original
+                            logger.info(f"Removed stale byte-patch container {stale.name}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove stale {stale.name}: {e}")
                 return 0
 
-            # 3. copy ONLY the edited assets (.uasset + .uexp) into the zen input,
-            #    preserving their relative paths so the package path is unchanged.
-            edited_rel = {e["AssetPath"].replace("\\", "/") for e in edits}
-            for rel in edited_rel:
+            # 3. copy ONLY the assets the extractor actually wrote (safe, round-trip
+            #    verified) into the zen input, preserving their relative paths so the
+            #    package path is unchanged. Skipped (unsafe) assets never enter _P.
+            tmp_legacy_abs = str(tmp_legacy).replace("\\", "/").rstrip("/")
+            written_rel = set()
+            for ab in written_abs:
+                ab_norm = ab.replace("\\", "/")
+                if ab_norm.startswith(tmp_legacy_abs + "/"):
+                    written_rel.add(ab_norm[len(tmp_legacy_abs) + 1:])
+                else:
+                    # fall back to basename match if path normalization drifts
+                    written_rel.add(Path(ab_norm).name)
+            copied = 0
+            for rel in written_rel:
+                base = rel[:-len(".uasset")] if rel.endswith(".uasset") else rel
                 for ext in (".uasset", ".uexp", ".ubulk"):
-                    src = tmp_legacy / (rel[:-len(".uasset")] + ext if rel.endswith(".uasset") else rel + ext)
+                    src = tmp_legacy / (base + ext)
                     if src.is_file():
                         dst = tmp_zen / src.relative_to(tmp_legacy)
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(str(src), str(dst))
+                        if ext == ".uasset":
+                            copied += 1
+            if copied == 0:
+                logger.warning(f"Byte-patch: no written assets copied for {uf.name}")
+                return 0
 
             # 4. repack as a `_P` patch container next to the original mod utoc.
             # LIMITATION: the locres inject (`_inject_into_utocs`) writes the SAME

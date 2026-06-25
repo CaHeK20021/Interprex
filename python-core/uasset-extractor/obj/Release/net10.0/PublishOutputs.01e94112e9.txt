@@ -1,0 +1,8 @@
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetExtractor.exe
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetExtractor.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetExtractor.deps.json
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetExtractor.runtimeconfig.json
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetExtractor.pdb
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\Newtonsoft.Json.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\UAssetAPI.dll
+C:\Users\Alexandr\Desktop\Interprex\python-core\bin\ZstdSharp.dll

@@ -33,6 +33,17 @@ namespace UAssetExtractor
         public string? ArrayName { get; set; }
         public string? ContainerPath { get; set; }
         public string? ExportName { get; set; }
+        // ContentLib patch routing (export-level facts; Python decides the kind).
+        //   SuperClass — the owning ClassExport's parent (SuperStruct) ObjectName,
+        //     e.g. FGRecipe / FGItemCategory / FGItemDescriptor / FGSchematic. This
+        //     is the ground truth ContentLib type-gates on ("Was not FGRecipe").
+        //     retoc to-legacy erases a base-game parent to "UnknownExport"/"" — for
+        //     that case Python falls back to HasIngredientsAndProduct.
+        //   HasIngredientsAndProduct — the export carries BOTH mIngredients and
+        //     mProduct => it's a recipe even when SuperClass was erased. Categories
+        //     have only mDisplayName/mMenuPriority, so this stays false for them.
+        public string? SuperClass { get; set; }
+        public bool HasIngredientsAndProduct { get; set; }
         // CDO full-array-replace support (Part B). A value that lives inside a
         // struct array can only be patched by replacing the WHOLE array via a CDO
         // (ContentLib can't edit a single array element). For such a value we emit:
@@ -554,6 +565,55 @@ namespace UAssetExtractor
         static string EditKey(int exportIndex, string containerPath, string propName)
             => $"{exportIndex}{containerPath}{propName}";
 
+        // Fidelity gate: is this asset safe to re-serialize with UAssetAPI?
+        // A Blueprint-class asset carries compiled Kismet bytecode (Class/Function/
+        // Struct exports). UAssetAPI does NOT model that bytecode, so re-emitting the
+        // asset on Write drops/garbles ~half the .uexp — the loaded class becomes NULL
+        // and SML crashes ("Attempt to register NULL ModSubsystem"). DataAssets (e.g.
+        // FGUserSetting_IntSelector selector options) have ONLY NormalExports and round-
+        // trip byte-exact, so they are safe to byte-patch. We gate on EXPORT TYPE — the
+        // ground-truth structural marker — not on a fragile byte compare. The earlier
+        // byte-compare approach was unreliable: a plain load→Write of a Blueprint can
+        // serialize clean while the actual property EDIT still corrupts it.
+        static readonly Type[] _bytecodeExportTypes = new[]
+        {
+            typeof(UAssetAPI.ExportTypes.ClassExport),
+            typeof(UAssetAPI.ExportTypes.FunctionExport),
+            typeof(UAssetAPI.ExportTypes.StructExport),
+        };
+
+        static bool IsLoadWriteRoundTripSafe(string path, EngineVersion version,
+            UAssetAPI.Unversioned.Usmap? mappings)
+        {
+            try
+            {
+                var probe = mappings != null ? new UAsset(path, version, mappings) : new UAsset(path, version);
+                foreach (var export in probe.Exports)
+                {
+                    // Any compiled-script export means UAssetAPI can't faithfully rewrite
+                    // this asset. RawExport = UAssetAPI itself couldn't parse the export
+                    // (kept as raw bytes) → also unsafe to round-trip.
+                    if (export is UAssetAPI.ExportTypes.RawExport) return false;
+                    var t = export.GetType();
+                    foreach (var bt in _bytecodeExportTypes)
+                        if (bt.IsAssignableFrom(t)) return false;
+                }
+                // retoc to-legacy replaces base-game imports (parent class, outer objects)
+                // with UnknownExport stubs (ObjectName="UnknownExport", ClassPackage varies).
+                // When UAssetAPI rewrites the asset, the sub-object outer-link chain breaks
+                // in-game because the engine can't resolve the stub import. Detect by
+                // checking if any import has ObjectName "UnknownExport" — these assets are
+                // unsafe to rewrite.
+                foreach (var imp in probe.Imports)
+                {
+                    if (imp.ObjectName?.ToString() == "UnknownExport")
+                        return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
         static bool TryEditText(TextPropertyData tp, int exportIndex, string containerPath,
             string propName, Dictionary<string, AssetEdit> byKey)
         {
@@ -582,20 +642,46 @@ namespace UAssetExtractor
         // grouped by AssetPath; each asset is opened, patched across its exports,
         // and written back via UAssetAPI (recomputes .uexp offsets). Returns total
         // edits applied. Never throws on one bad asset.
-        static int ApplyEdits(List<AssetEdit> edits, EngineVersion version)
+        // Returns (appliedCount, writtenAssetPaths). Only assets that round-trip with
+        // byte-perfect fidelity (VerifyBinaryEquality before any edit) are written; an
+        // asset UAssetAPI can't faithfully re-serialize (Blueprints — their bytecode is
+        // not modelled, a no-op Write mangles ~half the .uexp and the loaded class goes
+        // NULL → SML crash) is SKIPPED entirely. DataAssets (e.g. FGUserSetting_IntSelector
+        // selector options) round-trip exactly, so they ARE patched. This is the
+        // "translate everything we safely can" gate: unsafe assets stay English, never crash.
+        static (int applied, List<string> written) ApplyEdits(
+            List<AssetEdit> edits, EngineVersion version, UAssetAPI.Unversioned.Usmap? mappings = null)
         {
             int total = 0;
+            var written = new List<string>();
             foreach (var grp in edits.GroupBy(e => e.AssetPath))
             {
                 string? path = grp.Key;
                 if (string.IsNullOrEmpty(path) || !File.Exists(path)) continue;
                 try
                 {
-                    var asset = new UAsset(path, version);
                     var byKey = new Dictionary<string, AssetEdit>();
                     foreach (var e in grp)
                         byKey[EditKey(e.ExportIndex, e.ContainerPath ?? "", e.PropName ?? "")] = e;
 
+                    // GATE: serialize a fresh load to a temp file and require it to match
+                    // pristine disk BYTE-FOR-BYTE. UAssetAPI re-emits each export from its
+                    // property tree on Write; for a Blueprint that tree is incomplete (the
+                    // bytecode isn't modelled), so even a plain load→Write loses ~half the
+                    // .uexp — which NULLs the loaded class and crashes SML. DataAssets
+                    // re-serialize byte-identical. Unsafe assets are skipped entirely
+                    // (stay English, never crash). Pristine bytes are read inside, before
+                    // any write touches `path`.
+                    bool safe = IsLoadWriteRoundTripSafe(path, version, mappings);
+                    if (!safe)
+                    {
+                        Console.Error.WriteLine($"SKIP (not round-trip safe): {Path.GetFileName(path)}");
+                        continue;
+                    }
+
+                    var asset = mappings != null
+                        ? new UAsset(path, version, mappings)
+                        : new UAsset(path, version);
                     int applied = 0;
                     int exportIdx = -1;
                     foreach (var export in asset.Exports.OfType<NormalExport>())
@@ -607,6 +693,7 @@ namespace UAssetExtractor
                     {
                         asset.Write(path);   // rewrites .uasset (+ .uexp) with new offsets
                         total += applied;
+                        written.Add(path);
                     }
                 }
                 catch (Exception ex)
@@ -614,17 +701,29 @@ namespace UAssetExtractor
                     Console.Error.WriteLine($"ApplyEdits failed for {path}: {ex.Message}");
                 }
             }
-            return total;
+            return (total, written);
         }
 
         // Extract all translatable items from ONE .uasset. Returns [] (and never
         // throws) on a failed/unreadable asset so a batch run skips it cleanly.
         static List<ExtractedItem> ProcessAsset(string filePath, EngineVersion version)
         {
+            return ProcessAsset(filePath, version, out _, out _);
+        }
+
+        // Overload that also reports the asset's RAW package path (FolderName, used to
+        // build the package->file index for inheritance) and one CdoExportRecord per
+        // CDO export (consumed in batch pass 2 to synthesize inherited items).
+        static List<ExtractedItem> ProcessAsset(string filePath, EngineVersion version,
+            out string rawFolderName, out List<CdoExportRecord> cdoRecords)
+        {
             var items = new List<ExtractedItem>();
+            rawFolderName = "";
+            cdoRecords = new List<CdoExportRecord>();
             try
             {
                 var asset = new UAsset(filePath, version);
+                rawFolderName = asset.FolderName?.Value ?? "";
                 string internalPath = asset.FolderName?.Value ?? "";
                 if (!string.IsNullOrEmpty(internalPath) && !internalPath.StartsWith("/Game/"))
                 {
@@ -656,6 +755,45 @@ namespace UAssetExtractor
                         catch {}
                     }
 
+                    // Resolve the PARENT class (SuperStruct) of this export's class so
+                    // Python can route the ContentLib patch by the same type ContentLib
+                    // gates on. export.ClassIndex -> the "<Name>_C" ClassExport (a
+                    // StructExport); its SuperStruct is the parent (FGRecipe / FGItem-
+                    // Category / FGItemDescriptor / FGSchematic ...). Base-game parents
+                    // are imports; a mod intermediate parent is an export. retoc erases
+                    // a direct base-game parent to UnknownExport -> we leave "" and let
+                    // HasIngredientsAndProduct decide.
+                    string superClass = "";
+                    try
+                    {
+                        if (export.ClassIndex.IsExport() &&
+                            export.ClassIndex.ToExport(asset) is UAssetAPI.ExportTypes.StructExport se)
+                        {
+                            var sup = se.SuperStruct;
+                            if (!sup.IsNull())
+                            {
+                                if (sup.IsImport())
+                                    superClass = sup.ToImport(asset)?.ObjectName?.ToString() ?? "";
+                                else if (sup.IsExport())
+                                    superClass = sup.ToExport(asset)?.ObjectName?.ToString() ?? "";
+                            }
+                        }
+                    }
+                    catch { /* unresolvable -> "" -> Python uses the property fallback */ }
+
+                    // Recipe signal that survives retoc parent-erasure: a recipe export
+                    // carries BOTH mIngredients and mProduct at top level; a category
+                    // has only mDisplayName/mMenuPriority.
+                    bool hasIngProd = false;
+                    try
+                    {
+                        var topNames = new HashSet<string>(
+                            export.Data.Select(p => p.Name?.ToString() ?? ""),
+                            StringComparer.OrdinalIgnoreCase);
+                        hasIngProd = topNames.Contains("mIngredients") && topNames.Contains("mProduct");
+                    }
+                    catch {}
+
                     int before = items.Count;
                     ExtractProps(export.Data, export, asset, filePath, internalPath, assetClass,
                         items, false, null, -1, "", exportIdx);
@@ -668,7 +806,36 @@ namespace UAssetExtractor
                     // stable id is reproducible across runs.
                     string exportName = (export.ObjectName?.ToString() ?? "") + "#" + exportIdx;
                     for (int k = before; k < items.Count; k++)
+                    {
                         items[k].ExportName = exportName;
+                        items[k].SuperClass = superClass;
+                        items[k].HasIngredientsAndProduct = hasIngProd;
+                    }
+
+                    // Record this CDO export so batch pass 2 can resolve inherited
+                    // translatable props (present in the parent's CDO but absent here).
+                    // Only the "Default__..._C" CDO export has a meaningful parent link.
+                    string superPkg = GetSuperPackagePath(export, asset);
+                    if (!string.IsNullOrEmpty(superPkg))
+                    {
+                        var ownProps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in export.Data)
+                        {
+                            var n = p.Name?.ToString();
+                            if (!string.IsNullOrEmpty(n)) ownProps.Add(n!);
+                        }
+                        cdoRecords.Add(new CdoExportRecord
+                        {
+                            FilePath = filePath,
+                            InternalPath = internalPath,
+                            SuperPackagePath = superPkg,
+                            ExportName = exportName,
+                            AssetClass = assetClass,
+                            SuperClass = superClass,
+                            HasIngredientsAndProduct = hasIngProd,
+                            OwnTopLevelProps = ownProps,
+                        });
+                    }
                 }
             }
             catch
@@ -704,6 +871,188 @@ namespace UAssetExtractor
             }
             catch {}
             return "";
+        }
+
+        // === Inherited translatable property resolution ======================
+        // A Blueprint child class stores in its CDO ONLY the properties it OVERRIDES;
+        // an inherited property (e.g. a variant that keeps the parent's mDescription)
+        // is baked into the PARENT's CDO and is absent from the child .uasset. So the
+        // child's inherited caption never extracts -> never translates -> stays English
+        // (real bug: Build_GlassTank_4Pipes had a RU name but EN description; its
+        // sibling Build_GlassTank_Child had the opposite). Patching the parent does NOT
+        // cascade (ContentLib loads the child as a separate object whose inherited value
+        // was already compiled in). Fix: for each child CDO, find which translatable
+        // props are MISSING vs its parent chain, read them from the parent .uasset, and
+        // emit them as additional items stamped with the CHILD's coordinates so they
+        // translate and get patched onto the CHILD's class.
+
+        // One resolved translatable top-level CDO prop (already filtered).
+        class ResolvedProp
+        {
+            public string Value = "";
+            public string Type = "Text";   // "Text" | "Str"
+            public string? HistoryType;
+            public string? Namespace;
+        }
+
+        // A parent asset's translatable top-level CDO props + its own parent link,
+        // cached per raw package path so N children of one parent resolve in O(1).
+        class ResolvedCdo
+        {
+            public string SuperPackagePath = "";  // raw pkg path of THIS asset's parent ("" if base/erased)
+            public Dictionary<string, ResolvedProp> Props =
+                new(StringComparer.OrdinalIgnoreCase);   // translatable props this asset DEFINES
+        }
+
+        // Per-child CDO export record captured in pass 1, consumed in pass 2 to
+        // synthesize inherited items. Carries the CHILD's coordinates/routing facts.
+        class CdoExportRecord
+        {
+            public string FilePath = "";
+            public string InternalPath = "";       // post-/Game/Mods rewrite (child)
+            public string SuperPackagePath = "";   // raw parent pkg path (from GetSuperPackagePath)
+            public string ExportName = "";         // "Default__X_C#<idx>"
+            public string AssetClass = "";
+            public string SuperClass = "";
+            public bool HasIngredientsAndProduct;
+            public HashSet<string> OwnTopLevelProps = new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        // Read a CDO export's ClassExport.SuperStruct -> the parent CLASS import ->
+        // its Package outer ObjectName = the parent's RAW package path (the same form
+        // as FolderName, e.g. "/GlassFluidTank/Build_GlassTank"). Returns "" when the
+        // super is null/erased (UnknownExport / UnknownPackage = base-game parent).
+        static string GetSuperPackagePath(NormalExport cdoExport, UAsset asset)
+        {
+            try
+            {
+                // CDO export's ClassIndex -> the "<Name>_C" ClassExport (a StructExport).
+                var ci = cdoExport.ClassIndex;
+                if (!ci.IsExport()) return "";
+                if (ci.ToExport(asset) is not UAssetAPI.ExportTypes.StructExport se) return "";
+                var sup = se.SuperStruct;
+                if (sup.IsNull() || !sup.IsImport()) return "";
+                var parentClassImp = sup.ToImport(asset);
+                if (parentClassImp == null) return "";
+                // parent class import's outer is a Package import -> its ObjectName is
+                // the parent's package path.
+                var outer = parentClassImp.OuterIndex;
+                if (!outer.IsImport()) return "";
+                var pkgImp = outer.ToImport(asset);
+                string pkg = pkgImp?.ObjectName?.ToString() ?? "";
+                if (string.IsNullOrEmpty(pkg) || pkg.StartsWith("/Engine/")) return "";
+                return pkg;
+            }
+            catch { return ""; }
+        }
+
+        // Load (and cache) one asset's translatable top-level CDO props + its super
+        // link. Returns null if the package isn't a mod asset on disk (so the chain
+        // stops). NEVER throws.
+        static ResolvedCdo? ResolveCdo(string pkgPath, Dictionary<string, string> packageIndex,
+            Dictionary<string, ResolvedCdo?> cache, EngineVersion version)
+        {
+            if (cache.TryGetValue(pkgPath, out var cached)) return cached;
+            ResolvedCdo? result = null;
+            try
+            {
+                if (packageIndex.TryGetValue(pkgPath, out var file) && File.Exists(file))
+                {
+                    var asset = new UAsset(file, version);
+                    var rc = new ResolvedCdo();
+                    foreach (var export in asset.Exports.OfType<NormalExport>())
+                    {
+                        // The CDO is the "Default__..._C" export. Read its super link
+                        // once and collect its translatable top-level props.
+                        if (string.IsNullOrEmpty(rc.SuperPackagePath))
+                            rc.SuperPackagePath = GetSuperPackagePath(export, asset);
+                        foreach (var prop in export.Data)
+                        {
+                            var rp = TryReadTranslatableTopLevel(prop);
+                            if (rp == null) continue;
+                            string pn = prop.Name?.ToString() ?? "";
+                            if (string.IsNullOrEmpty(pn)) continue;
+                            if (!rc.Props.ContainsKey(pn)) rc.Props[pn] = rp;
+                        }
+                    }
+                    result = rc;
+                }
+            }
+            catch { result = null; }
+            cache[pkgPath] = result;
+            return result;
+        }
+
+        // Walk the SuperStruct chain from a child to the first ancestor that DEFINES a
+        // translatable value for `propName`. Nearest-parent wins (UE inheritance).
+        // Returns null if none, or the chain ends at a non-mod parent. NEVER throws.
+        static ResolvedProp? ResolveInheritedProp(string childSuperPkgPath, string propName,
+            Dictionary<string, string> packageIndex, Dictionary<string, ResolvedCdo?> cache,
+            EngineVersion version)
+        {
+            string pkg = childSuperPkgPath;
+            var guard = new HashSet<string>(StringComparer.OrdinalIgnoreCase);  // cycle guard
+            while (!string.IsNullOrEmpty(pkg) && guard.Add(pkg))
+            {
+                var rc = ResolveCdo(pkg, packageIndex, cache, version);
+                if (rc == null) return null;       // parent not on disk (base-game) -> stop
+                if (rc.Props.TryGetValue(propName, out var rp)) return rp;
+                pkg = rc.SuperPackagePath;
+            }
+            return null;
+        }
+
+        // Collect every translatable top-level prop NAME defined anywhere up the parent
+        // chain (used to know which props a child could inherit). NEVER throws.
+        static HashSet<string> CollectInheritablePropNames(string childSuperPkgPath,
+            Dictionary<string, string> packageIndex, Dictionary<string, ResolvedCdo?> cache,
+            EngineVersion version)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string pkg = childSuperPkgPath;
+            var guard = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (!string.IsNullOrEmpty(pkg) && guard.Add(pkg))
+            {
+                var rc = ResolveCdo(pkg, packageIndex, cache, version);
+                if (rc == null) break;
+                foreach (var k in rc.Props.Keys) names.Add(k);
+                pkg = rc.SuperPackagePath;
+            }
+            return names;
+        }
+
+        // Read a single TOP-LEVEL translatable value from a property, applying the SAME
+        // filters as ExtractProps (StringTableEntry refs, technical props, identifiers).
+        // Returns null for non-translatable / non-text props. Mirrors the Text/Str
+        // branches of ExtractProps at the top level (insideStruct == false).
+        static ResolvedProp? TryReadTranslatableTopLevel(PropertyData prop)
+        {
+            try
+            {
+                string propName = prop.Name?.ToString() ?? "";
+                if (IsTechnicalProp(propName)) return null;
+                if (prop is TextPropertyData tp)
+                {
+                    string ht = tp.HistoryType.ToString();
+                    if (IsStringTableRef(ht)) return null;
+                    string? v = null;
+                    if (tp.CultureInvariantString != null && !string.IsNullOrEmpty(tp.CultureInvariantString.Value))
+                        v = tp.CultureInvariantString.Value;
+                    else if (tp.Value != null && !string.IsNullOrEmpty(tp.Value.Value))
+                        v = tp.Value.Value;
+                    if (string.IsNullOrEmpty(v) || LooksLikeIdentifier(v!)) return null;
+                    return new ResolvedProp { Value = v!, Type = "Text",
+                        HistoryType = ht, Namespace = tp.Namespace?.Value };
+                }
+                if (prop is StrPropertyData sp && sp.Value != null && !string.IsNullOrEmpty(sp.Value.Value))
+                {
+                    string sv = sp.Value.Value;
+                    if (!IsTranslatable(sv) || LooksLikeIdentifier(sv)) return null;
+                    return new ResolvedProp { Value = sv, Type = "Str" };
+                }
+            }
+            catch { }
+            return null;
         }
 
         // TEMP DIAGNOSTIC (remove before ship): dump the property tree of one asset
@@ -758,6 +1107,7 @@ namespace UAssetExtractor
             string outputPath = "";
             string applyEdits = "";   // path to edits JSON
             string baseDir = "";      // legacy asset dir the edits' AssetPath is relative to
+            string mappingsPath = ""; // .usmap mappings for honest unversioned-property round-trip
             bool dumpTree = false;
             EngineVersion version = EngineVersion.VER_UE5_4;
 
@@ -782,6 +1132,10 @@ namespace UAssetExtractor
                 if (args[i] == "--base-dir" && i + 1 < args.Length)
                 {
                     baseDir = args[i + 1];
+                }
+                if (args[i] == "--mappings" && i + 1 < args.Length)
+                {
+                    mappingsPath = args[i + 1];
                 }
                 if (args[i] == "--engine" && i + 1 < args.Length)
                 {
@@ -811,8 +1165,17 @@ namespace UAssetExtractor
                         && !Path.IsPathRooted(e.AssetPath))
                         e.AssetPath = Path.Combine(baseDir, e.AssetPath);
                 }
-                int applied = ApplyEdits(edits, version);
-                Console.WriteLine($"{{\"applied\":{applied},\"requested\":{edits.Count}}}");
+                UAssetAPI.Unversioned.Usmap? mappings = null;
+                if (!string.IsNullOrEmpty(mappingsPath) && File.Exists(mappingsPath))
+                {
+                    try { mappings = new UAssetAPI.Unversioned.Usmap(mappingsPath); }
+                    catch (Exception ex) { Console.Error.WriteLine($"Usmap load failed (continuing without): {ex.Message}"); }
+                }
+                var (applied, written) = ApplyEdits(edits, version, mappings);
+                // Emit the absolute paths actually written so the caller packs ONLY
+                // those into the _P container (skipped/unsafe assets are excluded).
+                var resultObj = new { applied, requested = edits.Count, written };
+                Console.WriteLine(JsonConvert.SerializeObject(resultObj));
                 return;
             }
 
@@ -865,9 +1228,51 @@ namespace UAssetExtractor
                     Environment.Exit(1);
                 }
                 var all = new List<ExtractedItem>();
+                // Pass 1: extract every asset's own strings; build the package->file
+                // index (raw FolderName) and gather CDO export records for inheritance.
+                var packageIndex = new Dictionary<string, string>();   // raw pkg path -> file
+                var cdoRecords = new List<CdoExportRecord>();
                 foreach (var f in Directory.EnumerateFiles(inputDir, "*.uasset", SearchOption.AllDirectories))
                 {
-                    all.AddRange(ProcessAsset(f, version));
+                    all.AddRange(ProcessAsset(f, version, out string folder, out var recs));
+                    if (!string.IsNullOrEmpty(folder) && !packageIndex.ContainsKey(folder))
+                        packageIndex[folder] = f;
+                    cdoRecords.AddRange(recs);
+                }
+                // Pass 2: for each child CDO, resolve translatable props it INHERITS
+                // (present up the parent chain but absent in its own CDO) and emit them
+                // as items stamped with the CHILD's coordinates, so they translate and
+                // get patched onto the child's class. Read-only on parents; never throws.
+                var cdoCache = new Dictionary<string, ResolvedCdo?>(StringComparer.OrdinalIgnoreCase);
+                foreach (var rec in cdoRecords)
+                {
+                    if (string.IsNullOrEmpty(rec.SuperPackagePath)) continue;
+                    var inheritable = CollectInheritablePropNames(
+                        rec.SuperPackagePath, packageIndex, cdoCache, version);
+                    foreach (var propName in inheritable)
+                    {
+                        if (rec.OwnTopLevelProps.Contains(propName)) continue;   // child overrides it
+                        var rp = ResolveInheritedProp(
+                            rec.SuperPackagePath, propName, packageIndex, cdoCache, version);
+                        if (rp == null) continue;
+                        all.Add(new ExtractedItem
+                        {
+                            AssetPath = rec.FilePath,
+                            InternalPath = rec.InternalPath,
+                            PropName = propName,
+                            Value = rp.Value,
+                            Type = rp.Type,
+                            AssetClass = rec.AssetClass,
+                            HistoryType = rp.HistoryType,
+                            Namespace = rp.Namespace,
+                            ArrayIndex = -1,
+                            ArrayName = null,
+                            ContainerPath = "",
+                            ExportName = rec.ExportName,
+                            SuperClass = rec.SuperClass,
+                            HasIngredientsAndProduct = rec.HasIngredientsAndProduct,
+                        });
+                    }
                 }
                 string batchJson = JsonConvert.SerializeObject(all, Formatting.Indented);
                 if (!string.IsNullOrEmpty(outputPath))

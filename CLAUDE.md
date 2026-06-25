@@ -764,24 +764,109 @@ side dict, id→meta) carries the metadata from extract to inject.
   the Class Default Object / sub-object, but the game displays these FText from a
   DIFFERENT live object (DataAsset instances / the subsystem's own per-build state),
   which the CDO edit never touches. Net: 1354 inert patch files, zero visible change.
-- Decision: emit NOTHING for array-element strings (no clutter). They still extract
-  (Part A keeps them unique in the table) — they're just not applicable via
-  ContentLib. The only viable future path is **rewriting the FText in the `.uasset`
-  bytes and repacking the mod `.utoc/.ucas`** (UAssetAPI write + retoc `to-zen`),
-  bypassing ContentLib entirely — same stance as base-game locres repack.
+- Decision: emit NOTHING for array-element strings via ContentLib (no clutter). They
+  still extract (Part A keeps them unique in the table) — they're just not applicable
+  via ContentLib. They ARE reachable via the **byte-patch path** below.
+
+### ⚠️ Asset byte-patch — works ONLY for DataAssets, NEVER Blueprints (fidelity gate)
+The array-element FText that ContentLib can't reach (selector options
+`FGUserSetting_IntSelector.IntegerSelectionValues` — "Overclocking Mode",
+"Linear/Exponential", "3x/5x"; and Blueprint subsystem build descriptions) can be
+translated by **rewriting the FText in the `.uasset` bytes + repacking the mod into a
+`_P.utoc/.ucas` patch container** (`retoc to-zen`), bypassing ContentLib. Enabled by
+`_ENABLE_ASSET_BYTEPATCH = True` (`parsers/unreal4_5.py`); runs in `inject()` AFTER
+ContentLib. C# `UAssetExtractor.exe --apply-edits <editsJson> --base-dir <legacyDir>`
+writes via UAssetAPI 1.1.0 `asset.Write(path)`.
+
+**THE LOAD-BEARING CONSTRAINT (a real shipped crash, 2026-06):** UAssetAPI does NOT
+model compiled **Kismet bytecode**. Re-serializing a Blueprint-class asset
+(`BP_MkPlusSubsystem` — class/function/struct exports) drops/garbles ~half its
+`.uexp` the moment ANY property is written (even a no-op edit to the SAME value:
+44127→43851 bytes, ~22k differ). The loaded class then becomes NULL →
+`Assertion failed: SubsystemClass … Attempt to register NULL ModSubsystem` → SML
+crash on map load. **DataAssets** (only `NormalExport`s, e.g.
+`FGUserSetting_IntSelector`) re-serialize **byte-exact** and patch cleanly (verified:
+selector translated, file identical except the string).
+
+**The gate (`Program.cs::IsLoadWriteRoundTripSafe`):** SKIP any asset whose export
+list contains a `ClassExport`/`FunctionExport`/`StructExport` (compiled script) or a
+`RawExport` (UAssetAPI couldn't parse it), **OR whose import table contains an
+`UnknownExport` stub** (ObjectName == "UnknownExport"). The UnknownExport check
+catches assets where `retoc to-legacy` replaced base-game imports with stubs because
+Satisfactory doesn't ship a `ScriptObjects` chunk — without it, retoc cannot resolve
+script imports (class names like FGUserSettingManufacturer). A `_P` container built
+from such an asset would have broken imports → the game fails to load them (80
+`LoadFailed` errors on MkPlus selectors). Gate on EXPORT TYPE + IMPORT TABLE, the
+ground-truth structural markers — NOT a byte compare. **Python-side belt-and-suspenders:**
+`_bytepatch_one_mod` also scans assembled .uasset bytes for `b"UnknownExport"` after
+`retoc to-legacy` and filters those assets from edits before they reach the C#
+extractor (defense-in-depth). Skipped assets stay English; they NEVER enter the `_P`
+container, so the game can't crash. Guard: `check_unreal4_5_bytepatch` in
+`selftest.py`.
+
+**Net coverage:** selector options and DataAsset FText stay English (broken imports
+→ untranslatable via byte-patch); Blueprint subsystem descriptions also English.
+ContentLib CDO/ItemPatch/RecipePatch for top-level properties (mDisplayName etc.)
+are NOT affected — they write JSON patches, not `_P` containers. This is the
+"translate everything we safely can" line — top-level props yes, struct-array FText
+no (retoc import resolution ceiling). Verified offline: OCMode assets correctly
+skipped (`applied:0, written:[]`), stale `_P` containers cleaned up. Guard:
+`check_unreal4_5_bytepatch` in `selftest.py`.
 
 **Hard ceiling, unrelated to us:** some mod strings exist ONLY in a compiled C++
 DLL (e.g. EnhancedConveyors belt descriptions "Transports up to N resources per
 minute" — `Binaries/Win64/*.dll`, nothing in any `.uasset`/`.locres`).
 Untranslatable by any asset/ContentLib approach.
 
-### `Ingredients` is unrecoverable in assembled legacy assets
+### Path to 100%: ScriptObjects from `.usmap`
+The root cause of UnknownExport stubs is missing ScriptObjects in .utoc files.
+Satisfactory ships `CommunityResources/FactoryGame.usmap` (2.6 MB) — this IS the
+reflection data we need. File is NOT Oodle-compressed (compression=0, body at
+offset 1812, 2678775 bytes). If we can parse it → generate ScriptObjects → retoc
+resolves all imports → UnknownExport disappears → struct-array FText becomes
+translatable.
+
+**`.usmap` format (verified):** magic(u16)=0x30C4, version(u8)=1 (PackageVersioning).
+Header: magic(2) + version(1) + has_ver(4) + fv4(4) + fv5(4) + cv_count(4) +
+cv[89*20] + net_cl(4) + compression(1=Oodle/0=None) + csize(4) + dsize(4).
+Body: names → enums(u8 entry count for v1) → structs → extensions(CEXT/PPTH/EATR/ENVP).
+Struct format: name_idx(u32) + super_idx(u32) + prop_count(u16) + serializable_count(u16)
++ [properties]. Property: schema_idx(u16) + array_dim(u8) + name_idx(u32) + type(u8) +
+sub-data. **ByteProperty (type 0) ALWAYS has u32 enum_name** — skip +4.
+Other types with sub-data: 8=Array→inner, 9=Struct→u32, 24=Map→key+val, 25=Set→key,
+26=Enum→inner+u32, 28=Optional→inner.
+
+**Struct parsing BLOCKED:** parses 1512/13795 structs, then 7-byte overrun at struct 1512
+prop 118. Root cause unknown — one property somewhere consumes extra bytes. usmap-rs
+crate also fails (has GUID 20-byte bug, fixed locally but struct parsing still broken).
+
+**jmap_dumper --pid DEAD END:** patternsleuth can't find GUObjectArray/FNamePool in
+Satisfactory's custom UE5.6 build. All module scans fail. Requires manual address
+finding via debugger — not viable for end users.
+
+**What's needed for 100% (priority order):**
+1. Parse `.usmap` struct section fully (fix 7-byte overrun) → generate ScriptObjects
+   → retoc resolves imports → UnknownExport disappears
+2. OR: find pre-generated ScriptObjects for Satisfactory in community
+3. OR: write Zen-format binary patcher (bypass retoc entirely — complex, ~2-3 weeks)
+
+**Current state: 97.9% (3707/3787)** — 80 selector strings stay English.
+UnknownExport gate prevents crashes. This is the architectural ceiling without
+ScriptObjects.
+
+### `Ingredients` and all base-game imports are unrecoverable in assembled legacy assets
 `retoc to-legacy` replaces base-game item refs (`Ingredients[].ItemClass`) with
 `/Engine/UnknownPackage.UnknownExport` — the item NAME is gone (verified in the
 import table: outer chain points at the stub package, object is literally named
-`UnknownExport`). `Buildable`/`Recipe` (mod-owned) DO resolve. So a full-array CDO
-replace would blank `Ingredients` → broken recipe. `SerializeArrayForCdo` therefore
-OMITS any field holding an unresolved object (`omitted=True` surfaced). Moot while
+`UnknownExport`). This affects ALL base-game imports (parent classes, outer
+objects), not just Ingredients. Root cause: Satisfactory doesn't ship a
+`ScriptObjects` chunk in any `.utoc`, so retoc cannot resolve script imports
+(class names from /Script/FactoryGame etc.). The `--no-script-objects` flag is
+required for retoc to produce output at all (without it, 537/537 assets fail);
+with it, UnknownExport stubs are created for every unresolved base-game import.
+`Buildable`/`Recipe` (mod-owned) DO resolve. So a full-array CDO replace would
+blank `Ingredients` → broken recipe. `SerializeArrayForCdo` therefore OMITS any
+field holding an unresolved object (`omitted=True` surfaced). Moot while
 Part B is off, but documents why subsystem array-replace is doubly unsafe.
 
 ### retoc/extractor version flags (gotcha)
@@ -949,16 +1034,40 @@ but different inner log lines — read the INNER line, not the count:**
    STILL fail. The frozen sidecar's text-mode `open` did NOT translate `\n`→`\r\n`
    (worked in dev venv → classic build trap). Fix: build body then
    `.replace("\r\n","\n").replace("\n","\r\n")`, write `open(...,newline="")`.
-4. **Patch TYPE per asset class (the "all mods" rule).** ContentLib `ItemPatch`
-   accepts ONLY `FGItemDescriptor` (= `Desc_*`); a `Build_*` BUILDABLE → rejected
-   `"Was not FGItemDescriptor after loading"` (485/550 of ours). Each buildable has
-   BOTH `Build_*` (buildable; sometimes a junk `mDisplayName` like "Build_AIPacker")
-   and a sibling `Desc_*` (descriptor; the real name); WHICH drives the in-game name
-   varies per mod (`Desc_ABFlareTower` is EMPTY → name from `Build_`; FluidPacker's
-   real name is in `Desc_`). So route by asset-leaf prefix:
-   - `Recipe_*` → `RecipePatches/` (FGRecipe), ItemPatch-style file
-   - `Desc_*`   → `ItemPatches/`   (FGItemDescriptor), ItemPatch-style file
-   - `Build_*` + anything else → `CDOs/` (the catch-all)
+4. **Patch TYPE per asset — route by the PARENT UE CLASS, not the filename**
+   (`_route_patch_kind` in `unreal4_5.py`). ContentLib type-gates each folder
+   (`ItemPatch` accepts ONLY `FGItemDescriptor`; `RecipePatch` ONLY `FGRecipe`),
+   rejecting a wrong-type asset with `"Was not FGRecipe/FGItemDescriptor after
+   loading"`. The OLD name-based router (`"recipe" in internal_path.lower()`) was
+   wrong in BOTH directions: it over-matched categories + input-actions that merely
+   sit in a `/Recipes/` folder or contain "Recipe" (`CAT_PP`, `RecipeCatUpgrade`,
+   `IA_Smart_RecipeMode/_Adjust` → 4 RecipePatch rejects, `Recipe Patches 165/169`
+   in the game log), and real recipes often LACK a `Recipe_` prefix
+   (`advanced-circuit`, `battery`, `Rec_packing*`, `Recipe-MinerMk5`). Fix: the C#
+   extractor (`Program.cs`) emits the asset's PARENT class via `ClassExport.
+   SuperStruct` (`SuperClass`) plus a `HasIngredientsAndProduct` recipe signal; the
+   Python `_route_patch_kind(super, has_ing_prod, leaf)` decides:
+   - super `FGRecipe` → `RecipePatches/`
+   - super `FGItemCategory`/`FGCategory`/… → `CDOs/` (categories: no ContentLib
+     category patch; CDO patches `mDisplayName` by raw name with no type gate)
+   - super `FGItemDescriptor` → `ItemPatches/`
+   - super erased by retoc (`UnknownExport`/`""`, base-game direct inheritance) →
+     fall back to props: has `mIngredients`+`mProduct` → recipes (catches
+     `Recipe_MK*`, `Rec_packing*`), else `desc_`/`recipe_` name heuristic, else CDO
+   - any other concrete parent (`FGSchematic`, mod intermediate, non-FG) → CDO
+   Facts ride from extract→inject on a `self._route_meta` sidecar dict (keyed by
+   string id, like `_cdo_meta`); id is unaffected (id = hash(engine+file+path+
+   original)). Old exe/cache without `SuperClass` → empty route_meta → graceful
+   degradation to the name heuristic. Verified on real mods: 67 ProductionPlus
+   `FGRecipe` stay in recipes, the 4 mis-routed assets move to CDO; guarded by
+   `check_unreal4_5_routing` (16 cases) in `selftest.py`.
+
+   Each buildable still has BOTH `Build_*` (buildable; sometimes a junk
+   `mDisplayName` like "Build_AIPacker") and a sibling `Desc_*` (descriptor; the
+   real name); WHICH drives the in-game name varies per mod (`Desc_ABFlareTower` is
+   EMPTY → name from `Build_`; FluidPacker's real name is in `Desc_`). `Build_*`
+   (super not FGItemDescriptor/FGRecipe) → `CDOs/`, `Desc_*` (FGItemDescriptor) →
+   `ItemPatches/`.
 
    **CDO file format is DIFFERENT** (`Configs/ContentLib/CDOs/`, a supported
    folder): NO first-line comment — the target is the JSON `Class` field — and
@@ -979,6 +1088,50 @@ Patch files go to BOTH `Configs/ContentLib/<Folder>/` AND
 `FactoryGame/Configs/ContentLib/<Folder>/` (SML version compat). Registered in
 `.interprex_backups/metadata.json` as `type: created` for clean removal on
 backup restore.
+
+### Inherited Blueprint CDO properties (the half-translated-building bug)
+A Blueprint CHILD class stores in its CDO ONLY the properties it OVERRIDES; an
+inherited property is baked into the PARENT's CDO and is ABSENT from the child
+`.uasset`. So the child's inherited caption never extracts → never translates →
+stays English. Real bug (GlassFluidTank): `Build_GlassTank_4Pipes` overrides
+`mDisplayName` ("…4 pipes") but inherits `mDescription` → RU name, EN description;
+its sibling `Build_GlassTank_Child` is the opposite (own `mDescription` "400 m³",
+inherited `mDisplayName`). Patching the PARENT does NOT cascade — ContentLib loads
+the child as a separate object whose inherited value was already compiled in (game
+log: `Patch_..._4Pipes.json` does `Overwrite mDisplayName` ONLY).
+
+Fix is **read-only in C# extraction** (`Program.cs`, batch `--input-dir` only): a
+two-pass `inputDir` walk. Pass 1 extracts each asset's own strings, builds a
+`packagePath→file` index (raw `FolderName`), and records each CDO export
+(`CdoExportRecord`: child internal path, super package path, own prop names,
+routing facts). Pass 2, per child, walks the parent chain via
+`GetSuperPackagePath` (`ClassExport.SuperStruct` import → its `Package` outer
+ObjectName = parent's raw package path), loads each parent `.uasset` (cached
+`ResolvedCdo` per package, `ResolveInheritedProp`/`CollectInheritablePropNames`),
+and for every translatable prop the parent defines that the child does NOT override,
+emits an ADDITIONAL `ExtractedItem` stamped with the CHILD's coordinates
+(InternalPath, ExportName, SuperClass, HasIngredientsAndProduct) and the parent's
+value. Same translatable filters as own props (`TryReadTranslatableTopLevel` mirrors
+the Text/Str branches of `ExtractProps`). Chain stops at a non-mod parent
+(`/Engine/UnknownPackage` → base-game, nothing to inherit); cycle-guarded; never
+throws (a missing/unreadable parent → prop stays English, batch continues).
+
+Consequences:
+- The inherited item is a TOP-LEVEL prop on the child's CDO export, so
+  `_build_uasset_path_key` → `[childInternalPath, propName, childExportName]` — a
+  NEW, unique stable id (correct: it's a genuinely new translatable string). Own
+  items are untouched (only additions), so no id churn / no re-translate.
+- Multi-level inheritance works: `Child_Child` inherits its description from
+  `Child` (nearest parent wins), not from the base.
+- Python is UNCHANGED — inherited items flow through both extract sites and get
+  `_route_meta` from the child's super. At inject, the child's own prop and the
+  inherited prop share `internal_path` but differ in `prop_name`, so the CDO branch
+  (`entry["_seen"]` dedups by prop NAME) appends BOTH as two `Edits` in ONE child
+  CDO file → variant gets `Overwrite mDisplayName + mDescription` (both RU).
+- Single-file `--input` mode does NOT resolve inheritance (no tree); the real
+  pipeline uses `--input-dir`. Verified on GlassFluidTank: 5 → 8 GlassTank strings
+  (each building now has both name+description). Guarded by
+  `check_unreal4_5_inherited` in `selftest.py` (the two-Edits-one-CDO contract).
 
 ### `detect_mods` and game root resolution
 When the user selects `FactoryGame/Mods` in mods mode, the sidecar needs the
@@ -1254,3 +1407,163 @@ All runtime code injected into `_interprex_font.rpy` must be verified via automa
 ## Reference
 GameStringer — same Tauri + TS + Python-sidecar approach; look there for how it
 bundles the sidecar and handles complex binary engines.
+
+## ScriptObjects from `.usmap` — IN PROGRESS (2026-06-24)
+
+### Problem
+80 selector strings in MkPlus (e.g. "Overclocking Mode: Linear") live inside
+`FGUserSetting_IntSelector.IntegerSelectionValues` struct-array properties.
+ContentLib can't patch array elements. Byte-patching via `_P` containers causes
+`LoadFailed` because `retoc to-legacy` replaces base-game imports with
+`UnknownExport` stubs (Satisfactory doesn't ship ScriptObjects in .utoc files).
+
+### Solution path
+Parse Satisfactory's `CommunityResources/FactoryGame.usmap` → generate
+ScriptObjects → feed to retoc → imports resolve → UnknownExport disappears →
+struct-array FText becomes translatable.
+
+### Dead ends (DO NOT RETRY)
+- **jmap_dumper --pid**: patternsleuth patterns don't match Satisfactory's custom
+  UE5.6 build. ALL patterns fail on live game PID 27204. Fundamental incompatibility.
+- **Import-table splice**: `retoc unpack` outputs Zen format, not .uasset. UAssetAPI
+  can't read Zen. Dead end.
+- **CUE4Parse**: Read-only library, can't write IoStore containers. Not a solution.
+
+### `.usmap` format (VERIFIED from usmap-rs source + real file analysis)
+
+**File**: `G:\SteamLibrary\steamapps\common\Satisfactory\CommunityResources\FactoryGame.usmap`
+**File size**: 2680184 bytes (NOT 2680587 — old estimate was wrong)
+
+**Header** (1812 bytes):
+```
+magic: u16 = 0x30C4
+version: u8 = 1 (PackageVersioning)
+has_versioning: i32 = 1 (>0 → versioning present)
+file_version_ue4: i32 = 522
+file_version_ue5: i32 = 1017
+custom_version_count: u32 = 89
+custom_versions[89]: each = guid(16 bytes) + version_number(i32) = 20 bytes each
+net_cl: i32 = 42
+compression_method: u8 = 0 (None)
+compressed_size: u32 = 2678372
+decompressed_size: u32 = 2678372
+```
+
+**Body** (2678372 bytes, UNCOMPRESSED):
+```
+names: u32 count(57909) + per name: u8 length + bytes[length]
+  /Script/FactoryGame at index 19378
+
+enums: u32 count(2593) + per enum: u32 name_idx + u8 entry_count + entries×u32 name_idx
+
+structs: u32 count(13794) + per struct:
+  u32 name_idx
+  u32 super_idx (0xFFFFFFFF = None, no super)
+  u16 prop_count (= sum of all array_dim values)
+  u16 serializable_count (= number of property entries to read)
+  per property (serializable_count iterations):
+    u16 schema_idx
+    u8 array_dim
+    u32 name_idx
+    u8 property_type
+    type-specific data (see below)
+```
+
+**Property types with sub-data** (from usmap-rs `read_property_inner`):
+```
+ByteProperty (0):     NO sub-data
+BoolProperty (1):     NO sub-data
+IntProperty (2):      NO sub-data
+FloatProperty (3):    NO sub-data
+ObjectProperty (4):   NO sub-data
+NameProperty (5):     NO sub-data
+DelegateProperty (6): NO sub-data
+DoubleProperty (7):   NO sub-data
+ArrayProperty (8):    recursive inner type (1 byte type + sub-data)
+StructProperty (9):   u32 name_idx (struct type name)
+StrProperty (10):     NO sub-data
+TextProperty (11):    NO sub-data
+InterfaceProperty (12): NO sub-data
+MulticastDelegate (13): NO sub-data
+WeakObject (14):      NO sub-data
+LazyObject (15):      NO sub-data
+AssetObject (16):     NO sub-data
+SoftObject (17):      NO sub-data
+UInt64Property (18):  NO sub-data
+UInt32Property (19):  NO sub-data
+UInt16Property (20):  NO sub-data
+Int64Property (21):   NO sub-data
+Int16Property (22):   NO sub-data
+Int8Property (23):    NO sub-data
+MapProperty (24):     recursive key type + recursive value type
+SetProperty (25):     recursive key type
+EnumProperty (26):    recursive inner type + u32 name_idx
+FieldPathProperty (27): NO sub-data
+OptionalProperty (28): recursive inner type
+Utf8StrProperty (29): NO sub-data
+AnsiStrProperty (30): NO sub-data
+Unknown (0xFF):       NO sub-data
+```
+
+**Extensions** (after structs):
+```
+CEXT|PPTH|EATR|ENVP tag (4 bytes) + tag-specific data
+EOF = UnexpectedEof (end of file)
+```
+
+### CRITICAL: prop_count vs serializable_count
+From usmap-rs line 647: `for _ in 0..serializable_prop_count`
+- `prop_count` = sum of all array_dim values (e.g. a property with array_dim=5
+  counts as 5 toward prop_count but 1 toward serializable_count)
+- `serializable_count` = number of distinct property entries to read
+- **Loop must iterate serializable_count times**, NOT prop_count
+
+### CRITICAL: ByteProperty has NO extra data
+Previous sessions incorrectly claimed "ByteProperty (type 0) ALWAYS has u32
+enum_name". The usmap-rs source (line 697) shows: `EPropertyType::ByteProperty
+=> PropertyInner::Byte` — no extra bytes. The 97538 ByteProperty occurrences in
+the file consume 0 bytes of sub-data each.
+
+### Current parsing status
+- **1164/13794 structs parse successfully** with correct property types
+- No drift detected between parsed struct boundaries (self-consistent)
+- After 1164 structs: 78424 bytes remain, but need ≥151560 for remaining 12630
+- After failed struct 1165: boff=2678370, remaining=2 bytes `0a 7d`
+- **ROOT CAUSE OF FAILURE**: Unknown — enum section may be consuming wrong
+  number of bytes, or struct count is wrong, or names section is wrong
+
+### Next steps (for next session)
+1. **Run `python-core/debug_usmap6.py`** — tests all combinations of:
+   - Name length: u8 vs u16
+   - Enum format: u8 entries + u32 values vs u16 entries + i64+u32 values
+   - Checks which combination gives valid struct count and successful parsing
+2. If no combination works: binary-search the enum section boundary by trying
+   different offsets and checking if struct parsing succeeds
+3. Alternative approach: **scan body for known struct names** (e.g.
+   "FGUserSetting_IntSelector") — they appear as name_idx references. Find all
+   valid struct name_idx+super_idx pairs without needing to parse properties
+4. Once all structs parse: generate ScriptObjects JSON with correct
+   CityHash64-based object names
+5. Wire into retoc: `retoc gen-script-objects` or direct ZenScriptObjects binary
+   generation
+6. Test on real MkPlus: verify selector translations work
+
+### Debug scripts
+- `python-core/debug_usmap.py` — basic struct parsing with drift detection
+- `python-core/debug_usmap2.py` — raw hex dumps of first structs
+- `python-core/debug_usmap3.py` — detailed struct parsing with all property types
+- `python-core/debug_usmap4.py` — struct 9 detailed analysis + extra field detection
+- `python-core/debug_usmap5.py` — drift detection across all parsed structs
+- `python-core/debug_usmap6.py` — NOT YET RUN — tests name_length × enum format combos
+- `python-core/gen_so_fixed.py` — ScriptObjects generator (currently parses 1050 structs)
+
+### usmap-rs source location
+`C:\Users\Alexandr\.cargo\git\checkouts\jmap-b1fc8a569bf5f3e0\909bce9\usmap\src\lib.rs`
+(961 lines, Apache-2.0 licensed)
+
+### Key file paths
+- `.usmap`: `G:\SteamLibrary\steamapps\common\Satisfactory\CommunityResources\FactoryGame.usmap`
+- retoc: `G:\Games\retoc-v0.13.0-windows\retoc.exe`
+- UAssetExtractor: `python-core/bin/UAssetExtractor.exe`
+- unreal4_5 parser: `python-core/parsers/unreal4_5.py`
+- ZenScriptObjects format: verified from retoc source `retoc/src/script_objects.rs`
