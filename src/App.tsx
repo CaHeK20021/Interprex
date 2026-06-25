@@ -242,6 +242,44 @@ function getModNameForString(
   return byName ? byName.name : "—";
 }
 
+// Helper to get the mod path containing this TranslationString
+function getModPathForString(
+  s: TranslationString,
+  detectedMods: any[],
+  gameRoot: string | null,
+  modsDir: string | null,
+): string | null {
+  if (!modsDir || !gameRoot) return null;
+  const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+
+  // uasset:// path — mod path is the segment before "!"
+  if (s.file.startsWith("uasset://")) {
+    const inner = s.file.slice("uasset://".length);
+    const sepIdx = inner.indexOf("!");
+    const modPath = sepIdx >= 0 ? inner.slice(0, sepIdx) : inner;
+    const modPathNorm = norm(modPath);
+    const matchingMod = detectedMods.find((mod) => {
+      const mp = norm(mod.path);
+      return modPathNorm === mp || modPathNorm.startsWith(mp + "/");
+    });
+    if (matchingMod) return matchingMod.path;
+    return modPath;
+  }
+
+  // Regular path — try matching against mod filesystem paths
+  const strAbs = norm(`${gameRoot}/${s.file}`);
+  const matchingMod = detectedMods.find((mod) => {
+    const modAbs = norm(`${modsDir}/${mod.path}`);
+    return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
+  });
+  if (matchingMod) return matchingMod.path;
+
+  // Fallback — check if any mod name appears in the file path
+  const fileLower = s.file.toLowerCase();
+  const byName = detectedMods.find((mod) => fileLower.includes(norm(mod.path)));
+  return byName ? byName.path : null;
+}
+
 // Highlight foreign words inside translations, ignoring Ren'Py formatting tags and technical tokens.
 function highlightLatin(text: string, targetLang: TargetLang) {
   if (!text) return "";
@@ -374,7 +412,7 @@ const TableRow = memo(({
               ? "tr-cell"
               : "tr-cell empty"
         }
-        onClick={() => startEdit(s.id, translated ?? "")}
+        onClick={isEditing ? undefined : () => startEdit(s.id, translated ?? "")}
       >
         {isEditing ? (
           <textarea
@@ -382,10 +420,14 @@ const TableRow = memo(({
             value={editingVal}
             onChange={(e) => setEditingVal(e.target.value)}
             onBlur={() => commitEdit(s.id, s.original)}
+            onClick={(e) => e.stopPropagation()}
             onKeyDown={(e) => {
               if (e.key === "Escape") {
                 e.preventDefault();
                 setEditingId(null);
+              } else if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                e.currentTarget.blur();
               }
             }}
           />
@@ -404,7 +446,7 @@ const TableRow = memo(({
   return prevProps.isSelected === nextProps.isSelected &&
          prevProps.isJustTranslated === nextProps.isJustTranslated &&
          prevProps.isEditing === nextProps.isEditing &&
-         prevProps.editingVal === nextProps.editingVal &&
+         (!nextProps.isEditing || prevProps.editingVal === nextProps.editingVal) &&
          prevProps.metadata === nextProps.metadata &&
          prevProps.target === nextProps.target &&
          prevProps.translated === nextProps.translated &&
@@ -565,6 +607,7 @@ export default function App() {
   const handleSearchQueryChange = useCallback((val: string) => {
     setSearchQuery(val);
     setPage(0);
+    setJustTranslatedIds(new Set());
   }, []);
 
   const handleSearchModeCheckbox = (field: "original" | "translation", checked: boolean) => {
@@ -797,6 +840,8 @@ export default function App() {
   const [injectProgress, setInjectProgress] = useState<
     { doneMod: number; totalMods: number; modName: string } | null
   >(null);
+  // Track mods edited during the current session
+  const [editedModPaths, setEditedModPaths] = useState<Set<string>>(new Set());
 
   const providerInfo = PROVIDERS.find((p) => p.id === provider)!;
   // How many API keys feed the worker pool. Total workers = threads * keyCount
@@ -813,6 +858,7 @@ export default function App() {
   // Clear recently translated highlight when changing active directory/engine
   useEffect(() => {
     setJustTranslatedIds(new Set());
+    setEditedModPaths(new Set());
   }, [root, modsDir, translationMode]);
 
   useEffect(() => {
@@ -894,6 +940,34 @@ export default function App() {
       if (unlistenFn) unlistenFn();
     };
   }, []);
+
+  // Dynamically update Tauri window title to match active engine/project.
+  useEffect(() => {
+    import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      const w = getCurrentWindow();
+      let title = "Interprex";
+      if (engine) {
+        const engineNameMap: Record<string, string> = {
+          rpgmaker: "RPG Maker",
+          renpy: "Ren'Py",
+          godot: "Godot",
+          gamemaker: "GameMaker",
+          unity: "Unity",
+          unreal: "Unreal Engine",
+          unreal4_5: translationMode === "mods" ? "Satisfactory Mods" : "Unreal Engine 4/5",
+          csharp: "C# / Unity",
+          fusion: "Clickteam Fusion",
+          mmf2: "Multimedia Fusion 2",
+          qsp: "QSP",
+          twine: "Twine",
+          i18n: "I18n",
+        };
+        const mapped = engineNameMap[engine] || engine;
+        title += ` - ${mapped}`;
+      }
+      w.setTitle(title).catch(console.error);
+    });
+  }, [engine, translationMode]);
 
   // Discover the backend's models whenever the connection details change.
   // Debounced so typing a base URL / API key doesn't hammer the sidecar. The
@@ -1000,6 +1074,21 @@ export default function App() {
         next.delete(id);
         return next;
       });
+    }
+
+    const prevVal = entry?.translated ?? "";
+    if (editingVal !== prevVal) {
+      const strObj = strings.find((s) => s.id === id);
+      if (strObj && translationMode === "mods") {
+        const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+        if (mPath) {
+          setEditedModPaths((prev) => {
+            const next = new Set(prev);
+            next.add(mPath);
+            return next;
+          });
+        }
+      }
     }
 
     const updated: ProjectFile = {
@@ -1162,13 +1251,11 @@ export default function App() {
       .filter((m) => m.total_count !== undefined && m.total_count > 0)
       .map((m) => m.path);
     setSelectedModPaths(allPaths);
-    await scanSelectedMods(allPaths);
   }
 
   async function handleDeselectAllMods() {
     if (busy && !isPaused) return;
     setSelectedModPaths([]);
-    await scanSelectedMods([]);
   }
 
   async function pickFolder(picked: string) {
@@ -1357,6 +1444,23 @@ export default function App() {
             if (Object.keys(p.translations).length) {
               currentProject = mergeTranslations(currentProject, p.translations, strings);
               setProject(currentProject);
+              if (translationMode === "mods") {
+                setEditedModPaths((prev) => {
+                  const next = new Set(prev);
+                  let changed = false;
+                  for (const id of Object.keys(p.translations)) {
+                    const strObj = strings.find((s) => s.id === id);
+                    if (strObj) {
+                      const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+                      if (mPath && !next.has(mPath)) {
+                        next.add(mPath);
+                        changed = true;
+                      }
+                    }
+                  }
+                  return changed ? next : prev;
+                });
+              }
               saveProject(currentProject).catch((e) => {
                 console.error("Auto-save batch failed:", e);
                 setError(`Auto-save batch failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -1375,6 +1479,23 @@ export default function App() {
         // Carry measured font-shrink factors to the writeBack/inject step.
         sizeFixesRef.current = result.sizeFixes ?? {};
         setProject(currentProject);
+        if (translationMode === "mods") {
+          setEditedModPaths((prev) => {
+            const next = new Set(prev);
+            let changed = false;
+            for (const id of Object.keys(result.translations)) {
+              const strObj = strings.find((s) => s.id === id);
+              if (strObj) {
+                const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+                if (mPath && !next.has(mPath)) {
+                  next.add(mPath);
+                  changed = true;
+                }
+              }
+            }
+            return changed ? next : prev;
+          });
+        }
         setPhase("saving");
         await saveProject(currentProject);
         setPhase("idle");
@@ -1414,7 +1535,7 @@ export default function App() {
     return { ok, project: ok ? currentProject : undefined };
   }
 
-  async function writeBack(proj?: ProjectFile): Promise<boolean> {
+  async function writeBack(proj?: ProjectFile, forceModPaths?: string[]): Promise<boolean> {
     const p = proj ?? project;
     const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!p || !engine || !activeRoot) return false;
@@ -1433,7 +1554,14 @@ export default function App() {
       for (const s of strings) {
         const entry = p.strings[s.id];
         if (entry?.translated) {
-          filesToBackup.add(s.file);
+          if (forceModPaths) {
+            const mPath = getModPathForString(s, detectedMods, gameRoot, modsDir);
+            if (mPath && forceModPaths.includes(mPath)) {
+              filesToBackup.add(s.file);
+            }
+          } else {
+            filesToBackup.add(s.file);
+          }
         }
       }
 
@@ -1447,7 +1575,7 @@ export default function App() {
       for (const [id, entry] of Object.entries(p.strings)) {
         if (entry.translated) translations[id] = entry.translated;
       }
-      const modsForInject = translationMode === "mods" ? selectedModPaths : undefined;
+      const modsForInject = translationMode === "mods" ? (forceModPaths ?? selectedModPaths) : undefined;
       // Build a path→name map for showing human-readable mod names in progress
       const modNameMap = new Map(detectedMods.map((m) => [m.path, m.name]));
       const { written } = await injectStringsStream(
@@ -1484,12 +1612,32 @@ export default function App() {
       setHasBackup(has_backup);
       setPhase("idle");
       setInjectProgress(null);
+      setEditedModPaths(new Set());
       setError(translationMode === "mods" ? (t("wroteBackMods")(written) as string) : (t("wroteBack")(written) as string));
       return true;
     } catch (e) {
       getBackupStatus(activeRoot).then(({ has_backup }) => setHasBackup(has_backup)).catch(() => {});
       fail(e);
       return false;
+    }
+  }
+
+  async function handleInjectEditedMods() {
+    if (editedModPaths.size === 0) return;
+    const originalSelected = [...selectedModPaths];
+    const validEdited = Array.from(editedModPaths).filter((p) =>
+      detectedMods.some((m) => m.path === p)
+    );
+    if (validEdited.length === 0) return;
+
+    setSelectedModPaths(validEdited);
+
+    try {
+      await writeBack(project ?? undefined, validEdited);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setSelectedModPaths(originalSelected);
     }
   }
 
@@ -1983,13 +2131,26 @@ export default function App() {
     const all = new Set<string>();
     const done = new Set<string>();
     for (const s of strings) {
+      if (translationMode === "mods" && modsDir && gameRoot) {
+        const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+        const filePath = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
+        const strAbs = norm(`${gameRoot}/${filePath}`);
+        const isExcluded = Array.from(filterHiddenModPaths).some((hiddenPath) => {
+          const modAbs = norm(`${modsDir}/${hiddenPath}`);
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
+        }) || !selectedModPaths.some((modPath) => {
+          const modAbs = norm(`${modsDir}/${modPath}`);
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
+        });
+        if (isExcluded) continue;
+      }
       const key = `${s.original}\x00${s.context}`;
       all.add(key);
       const entry = project.strings[s.id];
       if (entry?.translated || entry?.approved) done.add(key);
     }
     return { doneUnique: done.size, totalUnique: all.size };
-  }, [project, strings]);
+  }, [project, strings, translationMode, modsDir, gameRoot, filterHiddenModPaths, selectedModPaths]);
 
   const selectedModsInfo = detectedMods.filter((m) => selectedModPaths.includes(m.path));
   const selectedEngines = Array.from(new Set(selectedModsInfo.map((m) => m.engine).filter(Boolean)));
@@ -2022,10 +2183,10 @@ export default function App() {
         const isExcluded = Array.from(filterHiddenModPaths).some((hiddenPath) => {
           const modAbs = norm(`${modsDir}/${hiddenPath}`);
           return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
-        }) || (selectedModPaths.length > 0 && !selectedModPaths.some((modPath) => {
+        }) || !selectedModPaths.some((modPath) => {
           const modAbs = norm(`${modsDir}/${modPath}`);
           return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
-        }));
+        });
         return !isExcluded;
       });
     }
@@ -2167,8 +2328,9 @@ export default function App() {
       let translated = mod.translated_count ?? 0;
 
       const isSelected = selectedModPaths.includes(mod.path);
+      const isExtracted = extractedModPaths.has(mod.path);
 
-      if (isSelected && strings.length > 0) {
+      if (isExtracted && strings.length > 0) {
         const modAbs = norm(`${modsDir || ""}/${mod.path}`);
         const modStrings = strings.filter((str) => {
           const filePath = str.file.startsWith("uasset://") ? str.file.substring(9) : str.file;
@@ -2185,10 +2347,11 @@ export default function App() {
       const hasStrings = total > 0;
       const isDisabled = !hasStrings;
       const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
+      const finalIsSelected = hasStrings && isSelected;
 
       const isCurrentlyExtracting =
         phase === "extracting" &&
-        isSelected &&
+        finalIsSelected &&
         !extractedModPaths.has(mod.path);
 
       return {
@@ -2196,7 +2359,7 @@ export default function App() {
         total,
         translated,
         hasStrings,
-        isSelected,
+        isSelected: finalIsSelected,
         isDisabled,
         percent,
         isCurrentlyExtracting,
@@ -2213,6 +2376,10 @@ export default function App() {
     project,
     phase
   ]);
+
+  const selectableMods = useMemo(() => renderModsList.filter((m) => !m.isDisabled), [renderModsList]);
+  const isAllModsSelected = selectableMods.length > 0 && selectableMods.every((m) => m.isSelected);
+  const isHeaderCheckboxDisabled = (busy && !isPaused) || selectableMods.length === 0;
 
   // Pagination math. pageCount is at least 1 so "page 1 of 1" reads right on a
   // small project. Clamp the current page in case strings shrank under it (e.g.
@@ -2652,12 +2819,21 @@ export default function App() {
       {busy && phase !== "translating" && (
         <div className="progress">
           <div className="progressbar">
-            <div className={`progressfill indeterminate engine-${engine || "none"}`} />
+            {injectProgress && injectProgress.totalMods > 1 ? (
+              <div
+                className={`progressfill engine-${engine || "none"}`}
+                style={{
+                  width: `${Math.round((injectProgress.doneMod / injectProgress.totalMods) * 100)}%`,
+                }}
+              />
+            ) : (
+              <div className={`progressfill indeterminate engine-${engine || "none"}`} />
+            )}
           </div>
           <span className={`progresslabel engine-${engine || "none"}`}>
             {phaseLabel}…
             {injectProgress && injectProgress.totalMods > 1 && (
-              <> {injectProgress.doneMod}/{injectProgress.totalMods} ({injectProgress.modName})</>
+              <> {injectProgress.doneMod}/{injectProgress.totalMods} (<span className="progress-mod-name" title={injectProgress.modName}>{injectProgress.modName}</span>)</>
             )}
           </span>
         </div>
@@ -2665,7 +2841,9 @@ export default function App() {
 
       <div className="controls provider-row">
         <label className="field">
-          <span>{t("provider")}</span>
+          <span className={`control-label engine-${engine || "none"}`}>
+            <strong>{t("provider")}</strong>
+          </span>
           <select
             value={provider}
             onChange={(e) => {
@@ -2697,7 +2875,9 @@ export default function App() {
         </label>
 
         <label className="field">
-          <span>{t("model")}</span>
+          <span className={`control-label engine-${engine || "none"}`}>
+            <strong>{t("model")}</strong>
+          </span>
           {models.length ? (
             <select
               value={models.includes(model) ? model : ""}
@@ -2769,7 +2949,9 @@ export default function App() {
         {providerInfo.needsKey && (
           <>
             <label className="field" title={t("threadsHint") as string}>
-              <span>{t("threads")}</span>
+              <span className={`control-label engine-${engine || "none"}`}>
+                <strong>{t("threads")}</strong>
+              </span>
               <select
                 value={threads}
                 onChange={(e) => {
@@ -2785,7 +2967,9 @@ export default function App() {
               </select>
             </label>
             <label className="field" title={t("rpmLimitHint") as string}>
-              <span>{t("rpmLimit")}</span>
+              <span className={`control-label engine-${engine || "none"}`}>
+                <strong>{t("rpmLimit")}</strong>
+              </span>
               {/* type=text + digit filter, so no ugly native number spinners. */}
               <input
                 type="text"
@@ -2819,7 +3003,9 @@ export default function App() {
 
         {provider === "openrouter" && (
           <label className="field">
-            <span>{t("onlyFreeModels")}</span>
+            <span className={`control-label engine-${engine || "none"}`}>
+              <strong>{t("onlyFreeModels")}</strong>
+            </span>
             <input
               type="checkbox"
               checked={freeOnly}
@@ -2834,21 +3020,52 @@ export default function App() {
         )}
 
         <label className="field" title={t("maxBatchSizeHint")}>
-          <span>{t("maxBatchSize")}: {maxBatchSize}</span>
-          <input
-            type="range"
-            min={10}
-            max={100}
-            step={1}
-            value={maxBatchSize}
-            style={{ minWidth: 100, verticalAlign: "middle" }}
-            onChange={(e) => {
-              const n = Number(e.target.value);
-              setMaxBatchSize(n);
-              saveSetting("maxBatchSize", String(n));
-            }}
-            disabled={busy && !isFullyPaused}
-          />
+          <span className={`control-label engine-${engine || "none"}`}>
+            <strong>{t("maxBatchSize")}: <span style={{ display: "inline-block", width: "24px" }}>{maxBatchSize}</span></strong>
+          </span>
+          {(() => {
+            const getEngineColor = (eng: string | null): string => {
+              switch (eng) {
+                case "rpgmaker": return "#ffa033";
+                case "renpy": return "#ff66a0";
+                case "godot": return "#3cd4ff";
+                case "gamemaker": return "#32e06b";
+                case "unity": return "#c084fc";
+                case "unreal": return "#eab308";
+                case "unreal4_5": return "#f0883e";
+                case "csharp": return "#818cf8";
+                case "fusion": return "#2dd4bf";
+                case "mmf2": return "#fb7185";
+                case "qsp": return "#f97316";
+                case "twine": return "#d946ef";
+                default: return "#5b8cff";
+              }
+            };
+            const color = getEngineColor(engine);
+            const pct = ((maxBatchSize - 10) / 90) * 100;
+            return (
+              <input
+                type="range"
+                className={`engine-${engine || "none"}`}
+                min={10}
+                max={100}
+                step={1}
+                value={maxBatchSize}
+                style={{
+                  minWidth: 100,
+                  verticalAlign: "middle",
+                  "--slider-value-percent": `${pct}%`,
+                  "--slider-color": color
+                } as React.CSSProperties}
+                onChange={(e) => {
+                  const n = Number(e.target.value);
+                  setMaxBatchSize(n);
+                  saveSetting("maxBatchSize", String(n));
+                }}
+                disabled={busy && !isFullyPaused}
+              />
+            );
+          })()}
         </label>
 
 
@@ -2884,7 +3101,9 @@ export default function App() {
         {providerInfo.needsKey && (
           apiKeys.length <= 1 ? (
             <label className="field api-key-field">
-              <span>{t("apiKey")}</span>
+              <span className={`control-label engine-${engine || "none"}`}>
+                <strong>{t("apiKey")}</strong>
+              </span>
               <input
                 type={shownKeys.has(0) ? "text" : "password"}
                 value={apiKeys[0] ?? ""}
@@ -2895,7 +3114,7 @@ export default function App() {
               />
               <button
                 type="button"
-                className="api-key-add btn-secondary"
+                className={`api-key-add btn-secondary engine-${engine || "none"}`}
                 onClick={() => updateKeys([...apiKeys, ""])}
                 disabled={busy && !isFullyPaused}
                 title={t("addKey") as string}
@@ -2906,10 +3125,12 @@ export default function App() {
           ) : (
             <div className="api-keys-block">
               <div className="api-keys-head">
-                <span>{t("apiKey")}</span>
+                <span className={`control-label engine-${engine || "none"}`}>
+                  <strong>{t("apiKey")}</strong>
+                </span>
                 <button
                   type="button"
-                  className="api-key-add btn-secondary"
+                  className={`api-key-add btn-secondary engine-${engine || "none"}`}
                   onClick={() => updateKeys([...apiKeys, ""])}
                   disabled={busy && !isFullyPaused}
                   title={t("addKey") as string}
@@ -2967,7 +3188,20 @@ export default function App() {
             </div>
           </div>
           <div className="mods-list-header">
-            <span className="col-checkbox"></span>
+            <span className="col-checkbox">
+              <input
+                type="checkbox"
+                checked={isAllModsSelected}
+                disabled={isHeaderCheckboxDisabled}
+                onChange={() => {
+                  if (isAllModsSelected) {
+                    void handleDeselectAllMods();
+                  } else {
+                    void handleSelectAllMods();
+                  }
+                }}
+              />
+            </span>
             <span className="col-name">{t("modNameHeader")}</span>
             <span className="col-strings">{t("modStringsHeader")}</span>
             <span className="col-progress">{t("modProgressHeader")}</span>
@@ -3078,14 +3312,14 @@ export default function App() {
           
           <div className="filter-dropdown-container" ref={dropdownRef}>
             <button
-              className={`filter-dropdown-btn ${getActiveFiltersCount() > 0 ? "active" : ""}`}
+              className={`filter-dropdown-btn ${getActiveFiltersCount() > 0 ? "active" : ""} engine-${engine || "none"}`}
               onClick={() => setIsFilterMenuOpen(!isFilterMenuOpen)}
               title="Фильтры и настройки поиска"
             >
               ⚙️ Фильтры {getActiveFiltersCount() > 0 ? `(${getActiveFiltersCount()})` : ""} ▾
             </button>
             {isFilterMenuOpen && (
-              <div className="filter-dropdown-menu">
+              <div className={`filter-dropdown-menu engine-${engine || "none"}`}>
                 <div className="filter-dropdown-item reset-item" onClick={resetAllFilters}>
                   <span>❌ Сбросить все</span>
                 </div>
@@ -3202,6 +3436,17 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {translationMode === "mods" && editedModPaths.size > 0 && (
+            <button
+              className={`btn-inject-dirty engine-${engine || "none"}`}
+              onClick={handleInjectEditedMods}
+              disabled={busy}
+              title={`Внедрить изменения только для измененных модов (${Array.from(editedModPaths).length} шт.)`}
+            >
+              ⚡ Внедрить измененные ({editedModPaths.size})
+            </button>
+          )}
 
 
 

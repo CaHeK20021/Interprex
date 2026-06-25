@@ -1075,7 +1075,16 @@ class UnrealEngine4_5Parser(BaseParser):
         files = list(iter_locres_files(root))
         if sub_paths:
             wanted = {Path(p).as_posix() for p in sub_paths}
-            files = [f for f in files if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)]
+            files = [
+                f for f in files
+                if _is_descendant_of_any(f.relative_to(root).as_posix(), wanted)
+                and (
+                    _inner_culture(f.as_posix()) in SOURCE_CULTURES
+                    or f.relative_to(root).as_posix() in wanted
+                )
+            ]
+        else:
+            files = [f for f in files if _inner_culture(f.as_posix()) in SOURCE_CULTURES]
 
         strings: list[TranslationString] = []
         for f in files:

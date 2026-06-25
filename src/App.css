@@ -195,8 +195,23 @@ body {
   100% { margin-left: 100%; }
 }
 .progresslabel {
+  display: inline-block;
   font-size: 12px;
   color: var(--accent);
+  white-space: nowrap;
+  text-align: right;
+  min-width: 120px;
+  max-width: 320px;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.progress-mod-name {
+  display: inline-block;
+  max-width: 140px;
+  vertical-align: bottom;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -579,6 +594,12 @@ button.btn-danger:hover:not(:disabled) {
   text-transform: uppercase;
   color: rgba(255, 255, 255, 0.35);
 }
+.mods-list-header .col-strings,
+.mods-list-header .col-status {
+  color: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+}
 .col-checkbox {
   display: flex;
   align-items: center;
@@ -867,6 +888,12 @@ button.btn-danger:hover:not(:disabled) {
 .progresslabel.engine-qsp { color: #f97316; }
 .progresslabel.engine-twine { color: #d946ef; }
 .progresslabel.engine-i18n, .progresslabel.engine-none { color: #5b8cff; }
+
+.control-label {
+  font-size: 12px;
+  white-space: nowrap;
+  color: #cbd5e1;
+}
 
 /* Engine specific mode switcher borders and active button backgrounds */
 .mode-switcher.engine-rpgmaker {
@@ -1182,6 +1209,44 @@ input[type="checkbox"]:disabled {
 }
 
 
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--slider-color, var(--accent)) 0%, var(--slider-color, var(--accent)) var(--slider-value-percent, 0%), var(--line) var(--slider-value-percent, 0%), var(--line) 100%);
+  height: 6px;
+  border-radius: 3px;
+  width: 100%;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--slider-color, var(--accent));
+  margin-top: -4px;
+  transition: transform 0.1s ease, background-color 0.1s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+input[type="range"]::-webkit-slider-thumb:active {
+  transform: scale(0.9);
+}
+
 /* --- live per-thread worker status panel (collapsible grid) --------------- */
 .workers-panel {
   margin: 8px 0 4px;
@@ -1364,12 +1429,20 @@ input[type="checkbox"]:disabled {
   border-color: #e0564b;
   background: color-mix(in srgb, #e0564b 12%, var(--panel));
 }
-/* The "+ add key" pill picks up the active engine accent. */
+/* The "+ add key" pill has a bold style and neutral colors. */
 .api-key-add {
   padding: 3px 10px;
   font-size: 11px;
   line-height: 1.5;
   border-radius: 999px;
+  font-weight: bold;
+  color: #cbd5e1;
+  border-color: var(--line);
+}
+.api-key-add:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 /* --- themed folder browser (FolderPicker) --------------------------------- */
@@ -2033,6 +2106,36 @@ table input[type="checkbox"] {
   color: #ffffff;
 }
 
+.filter-dropdown-btn:hover:not(.active).engine-rpgmaker { border-color: #ffa033; }
+.filter-dropdown-btn:hover:not(.active).engine-renpy { border-color: #ff66a0; }
+.filter-dropdown-btn:hover:not(.active).engine-godot { border-color: #3cd4ff; }
+.filter-dropdown-btn:hover:not(.active).engine-gamemaker { border-color: #32e06b; }
+.filter-dropdown-btn:hover:not(.active).engine-unity { border-color: #c084fc; }
+.filter-dropdown-btn:hover:not(.active).engine-unreal { border-color: #eab308; }
+.filter-dropdown-btn:hover:not(.active).engine-unreal4_5 { border-color: #f0883e; }
+.filter-dropdown-btn:hover:not(.active).engine-csharp { border-color: #818cf8; }
+.filter-dropdown-btn:hover:not(.active).engine-fusion { border-color: #2dd4bf; }
+.filter-dropdown-btn:hover:not(.active).engine-mmf2 { border-color: #fb7185; }
+.filter-dropdown-btn:hover:not(.active).engine-qsp { border-color: #f97316; }
+.filter-dropdown-btn:hover:not(.active).engine-twine { border-color: #d946ef; }
+.filter-dropdown-btn:hover:not(.active).engine-i18n,
+.filter-dropdown-btn:hover:not(.active).engine-none { border-color: #5b8cff; }
+
+.filter-dropdown-btn.active.engine-rpgmaker { background: #ffa033; border-color: #ffa033; color: #0f1115; }
+.filter-dropdown-btn.active.engine-renpy { background: #ff66a0; border-color: #ff66a0; color: #0f1115; }
+.filter-dropdown-btn.active.engine-godot { background: #3cd4ff; border-color: #3cd4ff; color: #0f1115; }
+.filter-dropdown-btn.active.engine-gamemaker { background: #32e06b; border-color: #32e06b; color: #0f1115; }
+.filter-dropdown-btn.active.engine-unity { background: #c084fc; border-color: #c084fc; color: #0f1115; }
+.filter-dropdown-btn.active.engine-unreal { background: #eab308; border-color: #eab308; color: #0f1115; }
+.filter-dropdown-btn.active.engine-unreal4_5 { background: #f0883e; border-color: #f0883e; color: #0f1115; }
+.filter-dropdown-btn.active.engine-csharp { background: #818cf8; border-color: #818cf8; color: #0f1115; }
+.filter-dropdown-btn.active.engine-fusion { background: #2dd4bf; border-color: #2dd4bf; color: #0f1115; }
+.filter-dropdown-btn.active.engine-mmf2 { background: #fb7185; border-color: #fb7185; color: #0f1115; }
+.filter-dropdown-btn.active.engine-qsp { background: #f97316; border-color: #f97316; color: #0f1115; }
+.filter-dropdown-btn.active.engine-twine { background: #d946ef; border-color: #d946ef; color: #0f1115; }
+.filter-dropdown-btn.active.engine-i18n,
+.filter-dropdown-btn.active.engine-none { background: #5b8cff; border-color: #5b8cff; color: #ffffff; }
+
 .filter-dropdown-menu {
   position: absolute;
   top: calc(100% + 5px);
@@ -2080,6 +2183,21 @@ table input[type="checkbox"] {
   height: 14px;
   margin: 0;
 }
+
+.filter-dropdown-menu.engine-rpgmaker .filter-dropdown-item input[type="checkbox"] { accent-color: #ffa033; }
+.filter-dropdown-menu.engine-renpy .filter-dropdown-item input[type="checkbox"] { accent-color: #ff66a0; }
+.filter-dropdown-menu.engine-godot .filter-dropdown-item input[type="checkbox"] { accent-color: #3cd4ff; }
+.filter-dropdown-menu.engine-gamemaker .filter-dropdown-item input[type="checkbox"] { accent-color: #32e06b; }
+.filter-dropdown-menu.engine-unity .filter-dropdown-item input[type="checkbox"] { accent-color: #c084fc; }
+.filter-dropdown-menu.engine-unreal .filter-dropdown-item input[type="checkbox"] { accent-color: #eab308; }
+.filter-dropdown-menu.engine-unreal4_5 .filter-dropdown-item input[type="checkbox"] { accent-color: #f0883e; }
+.filter-dropdown-menu.engine-csharp .filter-dropdown-item input[type="checkbox"] { accent-color: #818cf8; }
+.filter-dropdown-menu.engine-fusion .filter-dropdown-item input[type="checkbox"] { accent-color: #2dd4bf; }
+.filter-dropdown-menu.engine-mmf2 .filter-dropdown-item input[type="checkbox"] { accent-color: #fb7185; }
+.filter-dropdown-menu.engine-qsp .filter-dropdown-item input[type="checkbox"] { accent-color: #f97316; }
+.filter-dropdown-menu.engine-twine .filter-dropdown-item input[type="checkbox"] { accent-color: #d946ef; }
+.filter-dropdown-menu.engine-i18n .filter-dropdown-item input[type="checkbox"],
+.filter-dropdown-menu.engine-none .filter-dropdown-item input[type="checkbox"] { accent-color: #5b8cff; }
 
 .filter-dropdown-select-wrap {
   padding: 4px 12px 6px 12px;
@@ -2181,6 +2299,13 @@ tr.just-translated-row td {
   }
 }
 
+.search-count {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  margin-left: auto;
+}
+
 .floating-action-bar .selected-count {
   font-size: 11px;
   color: var(--text);
@@ -2191,6 +2316,70 @@ tr.just-translated-row td {
 .floating-action-bar .selected-count strong {
   color: var(--accent);
 }
+
+.btn-inject-dirty.engine-rpgmaker { --inject-color: #f59e0b; --inject-color-dark: #d97706; }
+.btn-inject-dirty.engine-renpy { --inject-color: #f472b6; --inject-color-dark: #db2777; }
+.btn-inject-dirty.engine-godot { --inject-color: #38bdf8; --inject-color-dark: #0284c7; }
+.btn-inject-dirty.engine-gamemaker { --inject-color: #34d399; --inject-color-dark: #059669; }
+.btn-inject-dirty.engine-unity { --inject-color: #a78bfa; --inject-color-dark: #7c3aed; }
+.btn-inject-dirty.engine-unreal { --inject-color: #facc15; --inject-color-dark: #ca8a04; }
+.btn-inject-dirty.engine-unreal4_5 { --inject-color: #fb923c; --inject-color-dark: #ea580c; }
+.btn-inject-dirty.engine-csharp { --inject-color: #818cf8; --inject-color-dark: #4f46e5; }
+.btn-inject-dirty.engine-fusion { --inject-color: #2dd4bf; --inject-color-dark: #0d9488; }
+.btn-inject-dirty.engine-mmf2 { --inject-color: #fb7185; --inject-color-dark: #e11d48; }
+.btn-inject-dirty.engine-qsp { --inject-color: #f97316; --inject-color-dark: #ea580c; }
+.btn-inject-dirty.engine-twine { --inject-color: #e879f9; --inject-color-dark: #c026d3; }
+.btn-inject-dirty.engine-i18n,
+.btn-inject-dirty.engine-none { --inject-color: #60a5fa; --inject-color-dark: #2563eb; }
+
+.btn-inject-dirty {
+  --pulse-color: color-mix(in srgb, var(--inject-color, #f97316) 40%, transparent);
+  --pulse-color-transparent: color-mix(in srgb, var(--inject-color, #f97316) 0%, transparent);
+  background: linear-gradient(135deg, var(--inject-color, #f97316) 0%, var(--inject-color-dark, #ea580c) 100%);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.2s ease;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--inject-color, #ea580c) 30%, transparent);
+  animation: pulse-border 2s infinite;
+}
+
+.btn-inject-dirty:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 0 15px color-mix(in srgb, var(--inject-color, #ea580c) 50%, transparent);
+  background: linear-gradient(135deg, var(--inject-color, #ea580c) 0%, color-mix(in srgb, var(--inject-color-dark, #ea580c) 80%, #000) 100%);
+}
+
+.btn-inject-dirty:disabled {
+  background: #334155;
+  color: #64748b;
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+  animation: none;
+}
+
+@keyframes pulse-border {
+  0% {
+    box-shadow: 0 0 0 0 var(--pulse-color);
+  }
+  70% {
+    box-shadow: 0 0 0 6px var(--pulse-color-transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 var(--pulse-color-transparent);
+  }
+}
+
+
 
 
 
