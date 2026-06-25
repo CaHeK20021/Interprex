@@ -654,6 +654,9 @@ button.btn-danger:hover:not(:disabled) {
   cursor: default;
   user-select: text;
 }
+.mod-item.zero-strings {
+  opacity: 0.45;
+}
 .mod-item.disabled input[type="checkbox"] {
   cursor: default;
 }

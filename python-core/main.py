@@ -1285,6 +1285,71 @@ def extract_stream(req: ExtractReq) -> StreamingResponse:
                              media_type="application/x-ndjson")
 
 
+def _inject_stream(req: InjectReq):
+    """NDJSON stream: one event per mod as its injection completes, so the UI can
+    show which mod is being written and how many are left."""
+    import inspect
+    parser = get_parser(req.engine)
+    mods = list(req.sub_paths or [])
+    inject_params = inspect.signature(parser.inject).parameters
+
+    if not mods:
+        # No mod selection — single whole-root inject, emit one event.
+        try:
+            kwargs = {}
+            if "font_style" in inject_params:
+                kwargs["font_style"] = req.font_style
+                if "size_fixes" in inject_params and req.size_fixes:
+                    kwargs["size_fixes"] = req.size_fixes
+            written = parser.inject(req.root, req.translations, req.target_lang,
+                                    req.sub_paths, **kwargs)
+            if hasattr(parser, "finalize_backups"):
+                parser.finalize_backups(req.root)
+        except Exception as e:
+            logger.error(f"inject_stream whole-root failed: {e}")
+            written = 0
+        yield json.dumps({"type": "mod", "path": "", "written": written,
+                          "done_mods": 1, "total_mods": 1},
+                         ensure_ascii=False) + "\n"
+        yield json.dumps({"type": "done", "written": written},
+                         ensure_ascii=False) + "\n"
+        return
+
+    total = len(mods)
+    done = 0
+    total_written = 0
+
+    for mod_path in mods:
+        try:
+            kwargs = {}
+            if "font_style" in inject_params:
+                kwargs["font_style"] = req.font_style
+                if "size_fixes" in inject_params and req.size_fixes:
+                    kwargs["size_fixes"] = req.size_fixes
+            written = parser.inject(req.root, req.translations, req.target_lang,
+                                    [mod_path], **kwargs)
+            total_written += written
+        except Exception as e:
+            logger.error(f"inject_stream mod {mod_path} failed: {e}")
+            written = 0
+        done += 1
+        yield json.dumps({"type": "mod", "path": mod_path, "written": written,
+                          "done_mods": done, "total_mods": total},
+                         ensure_ascii=False) + "\n"
+
+    if hasattr(parser, "finalize_backups"):
+        parser.finalize_backups(req.root)
+
+    yield json.dumps({"type": "done", "written": total_written},
+                     ensure_ascii=False) + "\n"
+
+
+@app.post("/inject_stream")
+def inject_stream(req: InjectReq) -> StreamingResponse:
+    return StreamingResponse(_inject_stream(req),
+                             media_type="application/x-ndjson")
+
+
 @app.post("/inject")
 def inject(req: InjectReq) -> dict:
     from fastapi import HTTPException

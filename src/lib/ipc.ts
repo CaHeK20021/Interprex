@@ -152,6 +152,83 @@ export function injectStrings(
   });
 }
 
+/** One mod's injection progress from the streaming endpoint. */
+export interface InjectModEvent {
+  path: string;
+  written: number;
+  doneMods: number;
+  totalMods: number;
+}
+
+/**
+ * Streaming inject: one NDJSON event per mod as its injection completes,
+ * so the UI can show "Записываю мод 3/17 (MkPlus)..." in the progress bar.
+ */
+export async function injectStringsStream(
+  root: string,
+  engine: Engine,
+  translations: Record<string, string>,
+  targetLang?: string,
+  subPaths?: string[],
+  fontStyle?: FontStyle,
+  sizeFixes?: Record<string, number>,
+  onMod?: (ev: InjectModEvent) => void,
+  signal?: AbortSignal,
+): Promise<{ written: number }> {
+  const res = await fetch(`${BASE}/inject_stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      root,
+      engine,
+      translations,
+      target_lang: targetLang,
+      sub_paths: subPaths || [],
+      font_style: fontStyle || "smooth",
+      size_fixes: sizeFixes || {},
+    }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`sidecar inject_stream failed (${res.status}): ${detail}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let written = 0;
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const evt = JSON.parse(trimmed);
+    if (evt.type === "mod") {
+      onMod?.({
+        path: evt.path,
+        written: evt.written ?? 0,
+        doneMods: evt.done_mods ?? 0,
+        totalMods: evt.total_mods ?? 0,
+      });
+    } else if (evt.type === "done") {
+      written = evt.written ?? 0;
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf("\n")) !== -1) {
+      handleLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+    }
+  }
+  if (buffer.trim()) handleLine(buffer);
+  return { written };
+}
+
 export interface ModInfo {
   name: string;
   path: string;

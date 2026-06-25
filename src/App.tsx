@@ -1,11 +1,11 @@
-import { useEffect, useState, useRef, useCallback, useMemo } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ping,
   detectEngine,
   extractStrings,
   extractStreaming,
-  injectStrings,
+  injectStringsStream,
   listModels,
   getBackupStatus,
   restoreBackup,
@@ -212,12 +212,34 @@ function getModNameForString(
 ): string {
   if (!modsDir || !gameRoot) return "—";
   const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+
+  // uasset:// path — mod path is the segment before "!"
+  if (s.file.startsWith("uasset://")) {
+    const inner = s.file.slice("uasset://".length);
+    const sepIdx = inner.indexOf("!");
+    const modPath = sepIdx >= 0 ? inner.slice(0, sepIdx) : inner;
+    const modPathNorm = norm(modPath);
+    const matchingMod = detectedMods.find((mod) => {
+      const mp = norm(mod.path);
+      return modPathNorm === mp || modPathNorm.startsWith(mp + "/");
+    });
+    if (matchingMod) return matchingMod.name;
+    // fallback — leaf directory name
+    return modPath.split("/").pop() || "—";
+  }
+
+  // Regular path — try matching against mod filesystem paths
   const strAbs = norm(`${gameRoot}/${s.file}`);
   const matchingMod = detectedMods.find((mod) => {
     const modAbs = norm(`${modsDir}/${mod.path}`);
     return strAbs === modAbs || strAbs.startsWith(modAbs + "/");
   });
-  return matchingMod ? matchingMod.name : "—";
+  if (matchingMod) return matchingMod.name;
+
+  // Fallback — check if any mod name appears in the file path
+  const fileLower = s.file.toLowerCase();
+  const byName = detectedMods.find((mod) => fileLower.includes(norm(mod.path)));
+  return byName ? byName.name : "—";
 }
 
 // Highlight foreign words inside translations, ignoring Ren'Py formatting tags and technical tokens.
@@ -261,6 +283,133 @@ function highlightLatin(text: string, targetLang: TargetLang) {
     );
   });
 }
+
+interface SearchBoxProps {
+  onChange: (value: string) => void;
+  placeholder?: string;
+}
+
+const SearchBox = memo(({ onChange, placeholder }: SearchBoxProps) => {
+  const [value, setValue] = useState("");
+
+  useEffect(() => {
+    if (value === "") {
+      onChange("");
+      return;
+    }
+    const h = setTimeout(() => {
+      onChange(value);
+    }, 500);
+    return () => clearTimeout(h);
+  }, [value, onChange]);
+
+  return (
+    <div className="search-wrapper">
+      <span className="search-icon">🔍</span>
+      <input
+        type="text"
+        className="search-input"
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+      />
+      {value && (
+        <button className="search-clear" onClick={() => setValue("")}>
+          ✕
+        </button>
+      )}
+    </div>
+  );
+});
+
+interface TableRowProps {
+  s: TranslationString;
+  translated?: string;
+  isSelected: boolean;
+  isJustTranslated: boolean;
+  isEditing: boolean;
+  editingVal: string;
+  metadata: string;
+  target: TargetLang;
+  startEdit: (id: string, current: string) => void;
+  commitEdit: (id: string, original: string) => void;
+  setEditingVal: (val: string) => void;
+  setEditingId: (id: string | null) => void;
+  onDragSelectStart: (id: string, isSelected: boolean) => void;
+  onDragSelectEnter: (id: string) => void;
+}
+
+const TableRow = memo(({
+  s,
+  translated,
+  isSelected,
+  isJustTranslated,
+  isEditing,
+  editingVal,
+  metadata,
+  target,
+  startEdit,
+  commitEdit,
+  setEditingVal,
+  setEditingId,
+  onDragSelectStart,
+  onDragSelectEnter
+}: TableRowProps) => {
+  return (
+    <tr className={isJustTranslated ? "just-translated-row" : ""}>
+      <td style={{ textAlign: "center" }}>
+        <input
+          type="checkbox"
+          checked={isSelected}
+          onMouseDown={(e) => { e.preventDefault(); onDragSelectStart(s.id, isSelected); }}
+          onMouseEnter={() => onDragSelectEnter(s.id)}
+        />
+      </td>
+      <td>{s.original}</td>
+      <td
+        className={
+          isEditing
+            ? "tr-edit"
+            : translated
+              ? "tr-cell"
+              : "tr-cell empty"
+        }
+        onClick={() => startEdit(s.id, translated ?? "")}
+      >
+        {isEditing ? (
+          <textarea
+            autoFocus
+            value={editingVal}
+            onChange={(e) => setEditingVal(e.target.value)}
+            onBlur={() => commitEdit(s.id, s.original)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setEditingId(null);
+              }
+            }}
+          />
+        ) : translated ? (
+          highlightLatin(translated, target)
+        ) : (
+          "—"
+        )}
+      </td>
+      <td className="where" title={`${s.file}\n${s.path.join(" › ")}`}>
+        {metadata}
+      </td>
+    </tr>
+  );
+}, (prevProps, nextProps) => {
+  return prevProps.isSelected === nextProps.isSelected &&
+         prevProps.isJustTranslated === nextProps.isJustTranslated &&
+         prevProps.isEditing === nextProps.isEditing &&
+         prevProps.editingVal === nextProps.editingVal &&
+         prevProps.metadata === nextProps.metadata &&
+         prevProps.target === nextProps.target &&
+         prevProps.translated === nextProps.translated &&
+         prevProps.s === nextProps.s;
+});
 
 export default function App() {
   const { t, lang } = useT();
@@ -370,13 +519,10 @@ export default function App() {
   } | null>(null);
   const shouldRestartRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  // Search box: `searchInput` is the raw, instant value bound to the <input> (so
-  // typing never lags). `searchQuery` is the DEBOUNCED value the heavy filter
-  // (filteredStrings, a pass over all 7000+ rows) actually reads — synced ~180ms
-  // after the last keystroke. Without this split, every keystroke re-ran the full
-  // filter + re-rendered 500 rows synchronously, blocking input (the "lags on every
-  // letter" bug on big projects).
-  const [searchInput, setSearchInput] = useState("");
+  // Search box: `searchQuery` is the DEBOUNCED value that the heavy filter
+  // (filteredStrings, a pass over all 7000+ rows) actually reads.
+  // The instant input state is isolated inside the SearchBox component so that
+  // typing does not trigger parent re-renders, preventing input lag on big projects.
   const [searchQuery, setSearchQuery] = useState("");
   // Search mode: all fields, original only, translation only, or none
   const [searchMode, setSearchMode] = useState<"all" | "original" | "translation" | "none">("all");
@@ -384,6 +530,8 @@ export default function App() {
   const [onlyLatinInTranslation, setOnlyLatinInTranslation] = useState(false);
   // Selected translation string IDs for batch operations
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Drag-select: mousedown on a checkbox, drag over others to select/deselect
+  const dragRef = useRef<{ active: boolean; selecting: boolean; ids: string[] } | null>(null);
   // IDs of strings that were just translated in the current/last batch run
   const [justTranslatedIds, setJustTranslatedIds] = useState<Set<string>>(new Set());
   // Filter strings by source type: all, regular strings (say, screen, define), python (uscore), or none
@@ -405,32 +553,19 @@ export default function App() {
         setIsFilterMenuOpen(false);
       }
     };
+    const handleMouseUp = () => { dragRef.current = null; };
     document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("mouseup", handleMouseUp);
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("mouseup", handleMouseUp);
     };
   }, []);
 
-  // Reset page to 0 on search input change. Updates the INSTANT input value only;
-  // the debounce effect below propagates it to searchQuery (which drives the filter).
-  const handleSearchChange = (val: string) => {
-    setSearchInput(val);
-  };
-
-  // Debounce: push the typed value into searchQuery ~180ms after the last keystroke.
-  // Clearing ("") applies immediately so the X button feels instant.
-  useEffect(() => {
-    if (searchInput === "") {
-      setSearchQuery("");
-      setPage(0);
-      return;
-    }
-    const h = setTimeout(() => {
-      setSearchQuery(searchInput);
-      setPage(0);
-    }, 180);
-    return () => clearTimeout(h);
-  }, [searchInput]);
+  const handleSearchQueryChange = useCallback((val: string) => {
+    setSearchQuery(val);
+    setPage(0);
+  }, []);
 
   const handleSearchModeCheckbox = (field: "original" | "translation", checked: boolean) => {
     setPage(0);
@@ -495,14 +630,22 @@ export default function App() {
     return count;
   };
 
-  const toggleSelectId = (id: string) => {
+  // Drag-select: mousedown on one checkbox, drag to select/deselect a range
+  const onDragSelectStart = (id: string, isCurrentlySelected: boolean) => {
+    dragRef.current = { active: true, selecting: !isCurrentlySelected, ids: [id] };
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+      if (isCurrentlySelected) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const onDragSelectEnter = (id: string) => {
+    if (!dragRef.current?.active) return;
+    dragRef.current.ids.push(id);
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (dragRef.current!.selecting) next.add(id); else next.delete(id);
       return next;
     });
   };
@@ -532,6 +675,43 @@ export default function App() {
   // null = nothing is being edited.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingVal, setEditingVal] = useState("");
+
+  // Stable wrappers to prevent TableRow from re-rendering due to changing callbacks
+  const handlersRef = useRef({
+    startEdit,
+    commitEdit,
+    setEditingVal,
+    setEditingId,
+    onDragSelectStart,
+    onDragSelectEnter
+  });
+  handlersRef.current = {
+    startEdit,
+    commitEdit,
+    setEditingVal,
+    setEditingId,
+    onDragSelectStart,
+    onDragSelectEnter
+  };
+
+  const stableStartEdit = useCallback((id: string, current: string) => {
+    handlersRef.current.startEdit(id, current);
+  }, []);
+  const stableCommitEdit = useCallback((id: string, original: string) => {
+    handlersRef.current.commitEdit(id, original);
+  }, []);
+  const stableSetEditingVal = useCallback((val: string) => {
+    handlersRef.current.setEditingVal(val);
+  }, []);
+  const stableSetEditingId = useCallback((id: string | null) => {
+    handlersRef.current.setEditingId(id);
+  }, []);
+  const stableOnDragSelectStart = useCallback((id: string, isSelected: boolean) => {
+    handlersRef.current.onDragSelectStart(id, isSelected);
+  }, []);
+  const stableOnDragSelectEnter = useCallback((id: string) => {
+    handlersRef.current.onDragSelectEnter(id);
+  }, []);
   // Live translation progress (strings done / total), null when not translating.
   const [progress, setProgress] = useState<TranslateProgress | null>(null);
   const [keyStatuses, setKeyStatuses] = useState<Record<number, string>>({});
@@ -612,6 +792,10 @@ export default function App() {
   // needed — the stage label tells the user what the number means.
   const [pyProgress, setPyProgress] = useState<
     { done: number; total: number; stage: "classify" | "translate" } | null
+  >(null);
+  // Streaming inject progress: which mod is being written + count.
+  const [injectProgress, setInjectProgress] = useState<
+    { doneMod: number; totalMods: number; modName: string } | null
   >(null);
 
   const providerInfo = PROVIDERS.find((p) => p.id === provider)!;
@@ -780,6 +964,7 @@ export default function App() {
     setError(e instanceof Error ? e.message : String(e));
     setPhase("idle");
     setProgress(null);
+    setInjectProgress(null);
     setKeyStatuses({});
     setWorkerPhases({});
     setIsPaused(false);
@@ -969,7 +1154,6 @@ export default function App() {
       ? selectedModPaths.filter((p) => p !== path)
       : [...selectedModPaths, path];
     setSelectedModPaths(nextPaths);
-    await scanSelectedMods(nextPaths);
   }
 
   async function handleSelectAllMods() {
@@ -1213,6 +1397,7 @@ export default function App() {
       if (e instanceof Error && e.name === "AbortError" || (e instanceof DOMException && e.name === "AbortError")) {
         setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
         setProgress(null);
+        setInjectProgress(null);
         setKeyStatuses({});
         setWorkerPhases({});
         setIsPaused(false);
@@ -1256,20 +1441,33 @@ export default function App() {
       setPhase("backing_up");
       await createBackup(activeRoot, Array.from(filesToBackup));
 
-      // 3. Perform the injection phase
+      // 3. Perform the injection phase (streaming: one event per mod)
       setPhase("injecting");
       const translations: Record<string, string> = {};
       for (const [id, entry] of Object.entries(p.strings)) {
         if (entry.translated) translations[id] = entry.translated;
       }
-      const { written } = await injectStrings(
+      const modsForInject = translationMode === "mods" ? selectedModPaths : undefined;
+      // Build a path→name map for showing human-readable mod names in progress
+      const modNameMap = new Map(detectedMods.map((m) => [m.path, m.name]));
+      const { written } = await injectStringsStream(
         activeRoot,
         engine,
         translations,
         target,
-        translationMode === "mods" ? selectedModPaths : undefined,
+        modsForInject,
         fontStyle,
         sizeFixesRef.current,
+        (ev) => {
+          if (ev.totalMods > 1) {
+            setInjectProgress({
+              doneMod: ev.doneMods,
+              totalMods: ev.totalMods,
+              modName: modNameMap.get(ev.path) || ev.path.split("/").pop() || ev.path,
+            });
+          }
+        },
+        abortController?.signal,
       );
       // 4. Ren'Py inline-Python (blog, status, search history) — apply from the
       //    translation cache only, NO API. This makes "Write translation" lay
@@ -1285,6 +1483,7 @@ export default function App() {
       const { has_backup } = await getBackupStatus(activeRoot);
       setHasBackup(has_backup);
       setPhase("idle");
+      setInjectProgress(null);
       setError(translationMode === "mods" ? (t("wroteBackMods")(written) as string) : (t("wroteBack")(written) as string));
       return true;
     } catch (e) {
@@ -1779,7 +1978,7 @@ export default function App() {
   // readout matches the live progress bar exactly. Computed whenever a project
   // is open, so the user sees coverage right after picking the folder, not only
   // once a run starts.
-  const { doneUnique, totalUnique } = (() => {
+  const { doneUnique, totalUnique } = useMemo(() => {
     if (!project || !strings.length) return { doneUnique: 0, totalUnique: 0 };
     const all = new Set<string>();
     const done = new Set<string>();
@@ -1790,7 +1989,7 @@ export default function App() {
       if (entry?.translated || entry?.approved) done.add(key);
     }
     return { doneUnique: done.size, totalUnique: all.size };
-  })();
+  }, [project, strings]);
 
   const selectedModsInfo = detectedMods.filter((m) => selectedModPaths.includes(m.path));
   const selectedEngines = Array.from(new Set(selectedModsInfo.map((m) => m.engine).filter(Boolean)));
@@ -1812,19 +2011,22 @@ export default function App() {
   const filteredStrings = useMemo(() => {
     let result = strings;
 
-    // Filter by mod paths if in mods mode and some mods are hidden
-    if (translationMode === "mods" && filterHiddenModPaths.size > 0 && modsDir && gameRoot) {
+    // Filter by mod paths if in mods mode — only show strings from selected mods
+    if (translationMode === "mods" && modsDir && gameRoot) {
       const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
       result = result.filter((s) => {
         if (justTranslatedIds.has(s.id)) return true;
         const filePath = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
         const strAbs = norm(`${gameRoot}/${filePath}`);
-        // Check if this string belongs to any HIDDEN mod
-        const isHidden = Array.from(filterHiddenModPaths).some((hiddenPath) => {
+        // Check if this string belongs to any hidden or unselected mod
+        const isExcluded = Array.from(filterHiddenModPaths).some((hiddenPath) => {
           const modAbs = norm(`${modsDir}/${hiddenPath}`);
           return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
-        });
-        return !isHidden;
+        }) || (selectedModPaths.length > 0 && !selectedModPaths.some((modPath) => {
+          const modAbs = norm(`${modsDir}/${modPath}`);
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
+        }));
+        return !isExcluded;
       });
     }
 
@@ -1855,29 +2057,31 @@ export default function App() {
     // Filter only those that contain foreign words in their translation (ignoring Ren'Py tags)
     if (onlyLatinInTranslation) {
       const foreignRegex = getForeignWordRegex(target);
-      result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
-        
+      // Pre-compute latin text length ONCE per string, then filter + sort from the map
+      const lenMap = new Map<string, number>();
+      for (const s of result) {
         const entry = project?.strings[s.id];
         const trans = entry?.translated || "";
-        if (!trans) return false;
-
+        if (!trans) { lenMap.set(s.id, 0); continue; }
+        let len = 0;
         const parts = trans.split(/(\{.*?\}|\[.*?\])/g);
-        return parts.some((part) => {
-          if (part.startsWith('{') || part.startsWith('[')) return false;
-          
+        for (const part of parts) {
+          if (part.startsWith('{') || part.startsWith('[')) continue;
           foreignRegex.lastIndex = 0;
           let match;
           while ((match = foreignRegex.exec(part)) !== null) {
-            const word = match[0];
-            const idx = match.index;
-            if (!isTechnicalWord(word, part, idx)) {
-              return true;
+            if (!isTechnicalWord(match[0], part, match.index)) {
+              len += match[0].length;
             }
           }
-          return false;
-        });
+        }
+        lenMap.set(s.id, len);
+      }
+      result = result.filter((s) => {
+        if (justTranslatedIds.has(s.id)) return true;
+        return (lenMap.get(s.id) || 0) > 0;
       });
+      result = [...result].sort((a, b) => (lenMap.get(b.id) || 0) - (lenMap.get(a.id) || 0));
     }
 
     if (searchQuery) {
@@ -1912,7 +2116,103 @@ export default function App() {
     }
 
     return result;
-  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds, translationStatusFilter]);
+  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds, translationStatusFilter, translationMode, selectedModPaths, modsDir, gameRoot, filterHiddenModPaths]);
+
+  // Memoize mod list statistics to avoid expensive loops on every render (e.g., during checkbox selection).
+  const renderModsList = useMemo(() => {
+    if (translationMode !== "mods" || detectedMods.length === 0) return [];
+
+    const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
+    
+    // 1. Determine if we have any mods with zero strings
+    const hasZeroStringMods = extractedModPaths.size > 0 && detectedMods.some((mod) => {
+      if (!extractedModPaths.has(mod.path)) return false;
+      const mAbs = norm(`${modsDir || ""}/${mod.path}`);
+      for (const s of strings) {
+        const fp = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
+        const sAbs = norm(`${gameRoot || ""}/${fp}`);
+        if (sAbs === mAbs || sAbs.startsWith(mAbs + "/") || sAbs.startsWith(mAbs + "!")) return false;
+      }
+      return true;
+    });
+
+    // 2. Separate zero-string mods if necessary
+    let sortedMods = detectedMods;
+    if (hasZeroStringMods) {
+      const withStrings: ModInfo[] = [];
+      const zeroStrings: ModInfo[] = [];
+      for (const mod of detectedMods) {
+        if (!extractedModPaths.has(mod.path)) {
+          withStrings.push(mod);
+          continue;
+        }
+        const mAbs = norm(`${modsDir || ""}/${mod.path}`);
+        let count = 0;
+        for (const s of strings) {
+          const fp = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
+          const sAbs = norm(`${gameRoot || ""}/${fp}`);
+          if (sAbs === mAbs || sAbs.startsWith(mAbs + "/") || sAbs.startsWith(mAbs + "!")) {
+            count++;
+            break;
+          }
+        }
+        if (count > 0) withStrings.push(mod); else zeroStrings.push(mod);
+      }
+      sortedMods = [...withStrings, ...zeroStrings];
+    }
+
+    // 3. Precalculate statistics for each mod
+    return sortedMods.map((mod) => {
+      let total = mod.total_count ?? 0;
+      let translated = mod.translated_count ?? 0;
+
+      const isSelected = selectedModPaths.includes(mod.path);
+
+      if (isSelected && strings.length > 0) {
+        const modAbs = norm(`${modsDir || ""}/${mod.path}`);
+        const modStrings = strings.filter((str) => {
+          const filePath = str.file.startsWith("uasset://") ? str.file.substring(9) : str.file;
+          const strAbs = norm(`${gameRoot || ""}/${filePath}`);
+          return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
+        });
+        total = modStrings.length;
+        translated = modStrings.filter((str) => {
+          const entry = project?.strings[str.id];
+          return entry && entry.translated && entry.translated.trim() !== "";
+        }).length;
+      }
+
+      const hasStrings = total > 0;
+      const isDisabled = !hasStrings;
+      const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
+
+      const isCurrentlyExtracting =
+        phase === "extracting" &&
+        isSelected &&
+        !extractedModPaths.has(mod.path);
+
+      return {
+        mod,
+        total,
+        translated,
+        hasStrings,
+        isSelected,
+        isDisabled,
+        percent,
+        isCurrentlyExtracting,
+      };
+    });
+  }, [
+    translationMode,
+    detectedMods,
+    extractedModPaths,
+    modsDir,
+    strings,
+    gameRoot,
+    selectedModPaths,
+    project,
+    phase
+  ]);
 
   // Pagination math. pageCount is at least 1 so "page 1 of 1" reads right on a
   // small project. Clamp the current page in case strings shrank under it (e.g.
@@ -1934,11 +2234,11 @@ export default function App() {
           <button
             className="retranslate-btn"
             onClick={() => {
-              handleTranslate(Array.from(selectedIds));
-              setSelectedIds(new Set()); // Reset selection after translation
+              translateAll(Array.from(selectedIds));
+              setSelectedIds(new Set());
             }}
             disabled={busy && !isPaused}
-            title="Перевести выбранные строки заново с помощью выбранной модели"
+            title="Перевести выбранные строки заново (только в кэш, без внедрения в игру)"
           >
             🔄 Переперевести
           </button>
@@ -2354,7 +2654,12 @@ export default function App() {
           <div className="progressbar">
             <div className={`progressfill indeterminate engine-${engine || "none"}`} />
           </div>
-          <span className={`progresslabel engine-${engine || "none"}`}>{phaseLabel}…</span>
+          <span className={`progresslabel engine-${engine || "none"}`}>
+            {phaseLabel}…
+            {injectProgress && injectProgress.totalMods > 1 && (
+              <> {injectProgress.doneMod}/{injectProgress.totalMods} ({injectProgress.modName})</>
+            )}
+          </span>
         </div>
       )}
 
@@ -2669,38 +2974,16 @@ export default function App() {
             <span className="col-status">{t("modStatusHeader")}</span>
           </div>
           <div className="mods-list">
-            {detectedMods.map((mod) => {
-              const isSelected = (mod.total_count ?? 0) > 0 && selectedModPaths.includes(mod.path);
-              
-              let total = mod.total_count ?? 0;
-              let translated = mod.translated_count ?? 0;
-
-              if (isSelected && strings.length > 0) {
-                const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
-                const modAbs = norm(`${modsDir || ""}/${mod.path}`);
-                const modStrings = strings.filter((str) => {
-                  const filePath = str.file.startsWith("uasset://") ? str.file.substring(9) : str.file;
-                  const strAbs = norm(`${gameRoot || ""}/${filePath}`);
-                  return strAbs === modAbs || strAbs.startsWith(modAbs + "/") || strAbs.startsWith(modAbs + "!");
-                });
-                total = modStrings.length;
-                translated = modStrings.filter((str) => {
-                  const entry = project?.strings[str.id];
-                  return entry && entry.translated && entry.translated.trim() !== "";
-                }).length;
-              }
-
-              const hasStrings = total > 0;
-              const isDisabled = !hasStrings;
-              const percent = hasStrings ? Math.round((translated / total) * 100) : 0;
-
-              // "calculating…" only until THIS mod's streamed strings have landed;
-              // once it's in extractedModPaths its real counter shows immediately.
-              const isCurrentlyExtracting =
-                phase === "extracting" &&
-                selectedModPaths.includes(mod.path) &&
-                !extractedModPaths.has(mod.path);
-
+            {renderModsList.map(({
+              mod,
+              total,
+              translated,
+              hasStrings,
+              isSelected,
+              isDisabled,
+              percent,
+              isCurrentlyExtracting,
+            }) => {
               let statusText = t("statusNoStrings");
               let statusClass = "status-empty";
               if (mod.already_translated) {
@@ -2725,8 +3008,7 @@ export default function App() {
               return (
                 <div
                   key={mod.path}
-                  className={`mod-item ${isSelected ? "selected" : ""} ${isDisabled ? "disabled" : ""}`}
-                  onClick={(!isDisabled && !busy) ? () => handleToggleMod(mod.path) : undefined}
+                  className={`mod-item ${isSelected ? "selected" : ""} ${isDisabled ? "disabled" : ""} ${extractedModPaths.has(mod.path) && total === 0 ? "zero-strings" : ""}`}
                 >
                   <span className="col-checkbox">
                     <input
@@ -2734,6 +3016,7 @@ export default function App() {
                       checked={isSelected}
                       readOnly
                       disabled={isDisabled || busy}
+                      onClick={(!isDisabled && !busy) ? () => handleToggleMod(mod.path) : undefined}
                     />
                   </span>
                   <span className="mod-name col-name" title={mod.name}>
@@ -2788,21 +3071,10 @@ export default function App() {
 
       {strings.length > 0 && (
         <div className="search-container">
-          <div className="search-wrapper">
-            <span className="search-icon">🔍</span>
-            <input
-              type="text"
-              className="search-input"
-              placeholder="Поиск по таблице..."
-              value={searchInput}
-              onChange={(e) => handleSearchChange(e.target.value)}
-            />
-            {searchInput && (
-              <button className="search-clear" onClick={() => handleSearchChange("")}>
-                ✕
-              </button>
-            )}
-          </div>
+          <SearchBox
+            onChange={handleSearchQueryChange}
+            placeholder="Поиск по таблице..."
+          />
           
           <div className="filter-dropdown-container" ref={dropdownRef}>
             <button
@@ -2960,51 +3232,27 @@ export default function App() {
           <tbody>
             {pageRows.map((s) => {
               const entry = project?.strings[s.id];
+              const metadata = translationMode === "mods"
+                ? getModNameForString(s, detectedMods, gameRoot, modsDir)
+                : getStringType(s);
               return (
-                <tr key={s.id} className={justTranslatedIds.has(s.id) ? "just-translated-row" : ""}>
-                  <td style={{ textAlign: "center" }}>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.has(s.id)}
-                      onChange={() => toggleSelectId(s.id)}
-                    />
-                  </td>
-                  <td>{s.original}</td>
-                  <td
-                    className={
-                      editingId === s.id
-                        ? "tr-edit"
-                        : entry?.translated
-                          ? "tr-cell"
-                          : "tr-cell empty"
-                    }
-                    onClick={() => startEdit(s.id, entry?.translated ?? "")}
-                  >
-                    {editingId === s.id ? (
-                      <textarea
-                        autoFocus
-                        value={editingVal}
-                        onChange={(e) => setEditingVal(e.target.value)}
-                        onBlur={() => commitEdit(s.id, s.original)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Escape") {
-                            e.preventDefault();
-                            setEditingId(null);
-                          }
-                        }}
-                      />
-                    ) : entry?.translated ? (
-                      highlightLatin(entry.translated, target)
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td className="where" title={`${s.file}\n${s.path.join(" › ")}`}>
-                    {translationMode === "mods"
-                      ? getModNameForString(s, detectedMods, gameRoot, modsDir)
-                      : getStringType(s)}
-                  </td>
-                </tr>
+                <TableRow
+                  key={s.id}
+                  s={s}
+                  translated={entry?.translated}
+                  isSelected={selectedIds.has(s.id)}
+                  isJustTranslated={justTranslatedIds.has(s.id)}
+                  isEditing={editingId === s.id}
+                  editingVal={editingVal}
+                  metadata={metadata}
+                  target={target}
+                  startEdit={stableStartEdit}
+                  commitEdit={stableCommitEdit}
+                  setEditingVal={stableSetEditingVal}
+                  setEditingId={stableSetEditingId}
+                  onDragSelectStart={stableOnDragSelectStart}
+                  onDragSelectEnter={stableOnDragSelectEnter}
+                />
               );
             })}
           </tbody>
