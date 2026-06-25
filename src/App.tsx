@@ -1444,7 +1444,7 @@ export default function App() {
             if (Object.keys(p.translations).length) {
               currentProject = mergeTranslations(currentProject, p.translations, strings);
               setProject(currentProject);
-              if (translationMode === "mods") {
+              if (translationMode === "mods" && targetIds) {
                 setEditedModPaths((prev) => {
                   const next = new Set(prev);
                   let changed = false;
@@ -1479,7 +1479,7 @@ export default function App() {
         // Carry measured font-shrink factors to the writeBack/inject step.
         sizeFixesRef.current = result.sizeFixes ?? {};
         setProject(currentProject);
-        if (translationMode === "mods") {
+        if (translationMode === "mods" && targetIds) {
           setEditedModPaths((prev) => {
             const next = new Set(prev);
             let changed = false;
