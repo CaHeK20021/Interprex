@@ -376,6 +376,7 @@ interface TableRowProps {
   setEditingId: (id: string | null) => void;
   onDragSelectStart: (id: string, isSelected: boolean) => void;
   onDragSelectEnter: (id: string) => void;
+  onShiftSelectRange: (id: string) => void;
 }
 
 const TableRow = memo(({
@@ -393,7 +394,8 @@ const TableRow = memo(({
   setEditingVal,
   setEditingId,
   onDragSelectStart,
-  onDragSelectEnter
+  onDragSelectEnter,
+  onShiftSelectRange
 }: TableRowProps) => {
   return (
     <tr className={isJustTranslated ? "just-translated-row" : ""}>
@@ -401,7 +403,14 @@ const TableRow = memo(({
         <input
           type="checkbox"
           checked={isSelected}
-          onMouseDown={(e) => { e.preventDefault(); onDragSelectStart(s.id, isSelected); }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            if (e.shiftKey) {
+              onShiftSelectRange(s.id);
+            } else {
+              onDragSelectStart(s.id, isSelected);
+            }
+          }}
           onMouseEnter={() => onDragSelectEnter(s.id)}
         />
       </td>
@@ -678,7 +687,11 @@ export default function App() {
   };
 
   // Drag-select: mousedown on one checkbox, drag to select/deselect a range
+  // lastClickedIdRef: anchor for Shift+click range selection (updated on every plain click).
+  const lastClickedIdRef = useRef<string | null>(null);
+
   const onDragSelectStart = (id: string, isCurrentlySelected: boolean) => {
+    lastClickedIdRef.current = id; // update anchor on plain click
     dragRef.current = { active: true, selecting: !isCurrentlySelected, ids: [id] };
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -693,6 +706,41 @@ export default function App() {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (dragRef.current!.selecting) next.add(id); else next.delete(id);
+      return next;
+    });
+  };
+
+  // Shift+click: select/deselect everything between lastClickedIdRef and `id`
+  // using the current filteredStrings order (all pages, not just current page).
+  const onShiftSelectRange = (id: string) => {
+    const anchor = lastClickedIdRef.current;
+    // Update anchor so chaining Shift+clicks extends from the latest click
+    lastClickedIdRef.current = id;
+    if (!anchor || anchor === id) {
+      // No anchor yet — treat as a plain toggle
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return next;
+      });
+      return;
+    }
+    // Find the two endpoints in the filtered list
+    const ids = filteredStrings.map((s) => s.id);
+    const anchorIdx = ids.indexOf(anchor);
+    const targetIdx = ids.indexOf(id);
+    if (anchorIdx === -1 || targetIdx === -1) return;
+    const lo = Math.min(anchorIdx, targetIdx);
+    const hi = Math.max(anchorIdx, targetIdx);
+    const rangeIds = ids.slice(lo, hi + 1);
+    // Determine intent: if the anchor is currently selected, we select the range;
+    // if it's deselected, we deselect the range.
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const shouldSelect = next.has(anchor);
+      rangeIds.forEach((rid) => {
+        if (shouldSelect) next.add(rid); else next.delete(rid);
+      });
       return next;
     });
   };
@@ -744,7 +792,8 @@ export default function App() {
     setEditingVal,
     setEditingId,
     onDragSelectStart,
-    onDragSelectEnter
+    onDragSelectEnter,
+    onShiftSelectRange
   });
   handlersRef.current = {
     startEdit,
@@ -752,7 +801,8 @@ export default function App() {
     setEditingVal,
     setEditingId,
     onDragSelectStart,
-    onDragSelectEnter
+    onDragSelectEnter,
+    onShiftSelectRange
   };
 
   const stableStartEdit = useCallback((id: string, current: string, bulk?: boolean) => {
@@ -772,6 +822,9 @@ export default function App() {
   }, []);
   const stableOnDragSelectEnter = useCallback((id: string) => {
     handlersRef.current.onDragSelectEnter(id);
+  }, []);
+  const stableOnShiftSelectRange = useCallback((id: string) => {
+    handlersRef.current.onShiftSelectRange(id);
   }, []);
   // Live translation progress (strings done / total), null when not translating.
   const [progress, setProgress] = useState<TranslateProgress | null>(null);
@@ -1433,8 +1486,12 @@ export default function App() {
       // unchecked some — translate (and size the progress bar to) ONLY the
       // selected mods. Same mod-path resolver the table filter uses. Outside
       // mods mode there's no selection, so the scope is all strings.
+      // EXCEPTION: when the user explicitly selected specific cells (targetIds),
+      // respect that selection unconditionally — don't silently drop cells that
+      // belong to a mod whose checkbox happens to be unchecked.
       const selectedSet = new Set(selectedModPaths);
       const inScope = (s: TranslationString): boolean => {
+        if (targetIds) return true; // explicit selection — always in scope
         if (translationMode !== "mods") return true;
         const mPath = getModPathForString(s, detectedMods, gameRoot, modsDir);
         return mPath !== null && selectedSet.has(mPath);
@@ -3618,6 +3675,7 @@ export default function App() {
                   setEditingId={stableSetEditingId}
                   onDragSelectStart={stableOnDragSelectStart}
                   onDragSelectEnter={stableOnDragSelectEnter}
+                  onShiftSelectRange={stableOnShiftSelectRange}
                 />
               );
             })}
