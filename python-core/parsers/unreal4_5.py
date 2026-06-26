@@ -1602,7 +1602,15 @@ class UnrealEngine4_5Parser(BaseParser):
                         sub = cls.split(":")[-1] if ":" in cls else ""
                         asset_name = "arr_" + asset_pkg + (("_" + sub) if sub else "")
                     else:
-                        asset_name = internal_path.split("/")[-1]
+                        mount_path = internal_path
+                        if mount_path.startswith("/Game/Mods/"):
+                            mount_path = "/" + mount_path[len("/Game/Mods/"):]
+                        clean_path = mount_path.lstrip("/")
+                        parts = clean_path.split("/")
+                        if len(parts) > 1:
+                            asset_name = "_".join(parts[1:])
+                        else:
+                            asset_name = clean_path
                     file_name = f"Patch_{mod_name}_{asset_name}.json"
 
                     try:
