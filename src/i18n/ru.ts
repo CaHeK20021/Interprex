@@ -190,6 +190,10 @@ const ru: Strings = {
     `Переведено ${done} из ${total} строк — почините движок и нажмите «Перевести» снова, чтобы доперевести остальное.`,
   translateErrors: (n: number) =>
     `Готово, но ${n} батч(ей) не перевелись и остались пустыми. Нажмите «Перевести» ещё раз, чтобы повторить их.`,
+  translateSuccess: (unique: number, total: number) =>
+    total > unique
+      ? `Применено к ${total} ячейкам (уникальных: ${unique})`
+      : `Переведено ячеек: ${unique}`,
   backupStatusLabel: "Создан бэкап:",
   restoreSuccess: "Оригинальные файлы успешно восстановлены!",
   deleteBackupSuccess: "Резервная копия удалена.",

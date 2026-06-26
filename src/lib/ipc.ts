@@ -270,6 +270,8 @@ export interface SidecarTranslateReq {
   font_style?: string;
   group_small_files?: string;
   items: { id: string; text: string; context: string; file: string; path?: string[] }[];
+  /** Optional one-time instruction for this run only (Shift+Переперевести). */
+  extra_instruction?: string;
 }
 
 /** Per-batch progress from the streaming /translate endpoint. */

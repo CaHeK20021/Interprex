@@ -92,6 +92,40 @@ def get_rimworld_folder(target: str) -> str:
     return RIMWORLD_LANGS.get(clean, target)
 
 
+def is_rimworld_mod(root: str) -> bool:
+    """A RimWorld mod is uniquely identified by About/About.xml (<ModMetaData>) —
+    every Workshop/local mod has one, and no other engine ships that marker. This
+    is the single source of truth so a mod with ONLY Defs/ or ONLY a .dll (no
+    Languages/ yet) is still recognized as RimWorld (engine i18n), instead of
+    falling through to unity/csharp. Used by detect() here AND by csharp/unity to
+    yield. Checks root + one level of version subfolders (1.5/About, 1.6/About)."""
+    import xml.etree.ElementTree as _ET
+
+    def _has_modmetadata(about_xml: str) -> bool:
+        if not os.path.isfile(about_xml):
+            return False
+        try:
+            # utf-8-sig: About.xml commonly ships with a BOM.
+            with open(about_xml, "r", encoding="utf-8-sig") as f:
+                return _ET.parse(f).getroot().tag == "ModMetaData"
+        except Exception:
+            # A malformed About.xml is still a strong RimWorld signal.
+            return True
+
+    for about_rel in ("About/About.xml", "about/About.xml", "About/about.xml"):
+        if _has_modmetadata(os.path.join(root, *about_rel.split("/"))):
+            return True
+    # Version subfolders (1.6/About/About.xml etc.).
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir() and entry.name not in _SKIP_DIRS:
+                if _has_modmetadata(os.path.join(entry.path, "About", "About.xml")):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 _SKIP_DIRS = frozenset({
     "About", "Source", "Defs", "Assemblies", "Textures",
     "Patches", "Sound", "Meshes", "UI", "bin", "obj",
@@ -207,6 +241,402 @@ def _find_rimworld_english_dirs(root: str) -> list[str]:
     return unique
 
 
+# ---------------------------------------------------------------------------
+# RimWorld: generate DefInjected from Defs/
+#
+# Most mods ship NO English DefInjected — the translatable text (label,
+# description, work reports, letters, abilities, ...) lives directly in
+# Defs/*.xml. We walk each Def and synthesize the engine's DefInjected key
+# `<defName.fieldPath>` so those strings can be translated. RimWorld does NOT
+# crash on unknown/extra DefInjected keys (it logs a warning), so a tight
+# field whitelist + exact paths is safe.
+# ---------------------------------------------------------------------------
+
+# Translatable leaf field names (case-sensitive). Derived from the real
+# frequency of leaf tags across 5730 shipped DefInjected files in the user's
+# mod library. A field is emitted ONLY if its leaf tag is here — everything
+# else (defName, thingClass, texPath, statBases numbers, ...) is never emitted.
+# Adding a name only widens coverage; it never changes an existing id (the id
+# depends on file + dotted key + text, and the key already contains the field).
+#
+# ⚠️ NEVER add grammar/RulePack fields here. `rulesStrings`, `rulesHidden`,
+# `rules`, `rep`, `trans`, `untranslatedRules`, `compClass`-style symbol fields
+# hold the engine's GRAMMAR SYNTAX (`keyword->value`, `[TAG]`, `(p=weight)`),
+# NOT display text. Translating them corrupts RimWorld's GrammarResolver, which
+# then throws on EVERY text resolution and the WHOLE UI falls back to English
+# (real bug: tabs/research/build menu went English, grammar "Bad string pass").
+# Translatable fields are user-visible captions ONLY.
+_RIMWORLD_TRANSLATABLE_FIELDS = frozenset({
+    "label", "description", "reportString", "jobString", "verb", "gerund",
+    "tip", "jobReportString", "labelNoun", "helpText", "GizmoLabel",
+    "ResearchLabel", "ResearchDesc", "ResearchDescDisc", "groupingLabel",
+    "stuffAdjective", "labelPlural", "useLabel", "headerTip",
+    "letterText", "letterLabel", "labelSocial", "labelFemale", "labelMale",
+    "labelFemalePlural", "labelMalePlural", "ingestCommandString",
+    "ingestReportString", "deathMessage", "fixedName", "pawnLabel",
+    "baseInspectLine", "customLabel", "labelShort",
+    "skillLabel", "summary", "title", "beginLetterLabel",
+    "beginLetter", "endMessage", "recoveryMessage", "deflationMessage",
+    "calledOffMessage", "gerundLabel", "pawnsPlural", "pawnLabelPlural",
+    "successfullyRemovedHediffMessage", "StepLabel", "StepDesc",
+    "ProjTypeLabel", "useLabelNoun",
+    "ritualExplanation", "extraTooltip", "overrideLabel", "labelTip",
+    "onMapInstruction", "approachOrderString", "approachingReportString",
+    "spectatorsLabel", "spectateLeadJobString",
+})
+
+
+def _looks_translatable(text: str) -> bool:
+    """Second safety net behind the whitelist: skip values that are NOT plain
+    display text. Critically this rejects RimWorld GRAMMAR/RulePack syntax — a
+    field may be whitelisted yet hold a grammar rule (e.g. a `<rules>` list, or a
+    caption that is actually a `keyword->value` rule). Translating those corrupts
+    GrammarResolver and the whole UI falls back to English."""
+    import re
+    t = text.strip()
+    if not t:
+        return False
+    if t.lower() in ("true", "false"):
+        return False
+    if re.match(r'^-?\d+(\.\d+)?$', t):
+        return False
+    # Grammar rule: "keyword->value" (the RulePack/rulesStrings syntax). The "->"
+    # IS the rule separator; never translate these.
+    if "->" in t:
+        return False
+    # A value that is ENTIRELY a single grammar symbol/tag, e.g. "[INITIATOR_label]"
+    # or "(p=2)" — these are interpolation tokens, not prose.
+    if re.fullmatch(r'\[[^\]]+\]', t) or re.fullmatch(r'\([^)]*\)', t):
+        return False
+    return True
+
+
+def _find_rimworld_defs_dirs(root: str) -> list[str]:
+    """Find Defs/ directories under root. If version subfolders exist (1.5/,
+    1.6/), returns ONLY the latest version's dirs. Falls back to root-level
+    Defs/ if no versioned dirs found. Mirrors _find_rimworld_english_dirs."""
+    import re
+    defs_dirs: list[str] = []
+
+    # 1. Root level Defs/
+    root_defs = os.path.join(root, "Defs")
+    if os.path.isdir(root_defs):
+        defs_dirs.append(root_defs)
+
+    # 2. One level of version subfolders (1.0, 1.5, 1.6, ...). _SKIP_DIRS
+    #    contains "Defs" but it's only applied to the version-folder name here,
+    #    so it doesn't block the root-level Defs check above.
+    try:
+        for entry in os.scandir(root):
+            if entry.is_dir() and entry.name not in _SKIP_DIRS:
+                d = os.path.join(entry.path, "Defs")
+                if os.path.isdir(d):
+                    defs_dirs.append(d)
+    except OSError:
+        pass
+
+    # Version selection: if any are inside a version folder, keep only latest.
+    versioned: list[tuple[float, str]] = []
+    root_dirs: list[str] = []
+    for path in defs_dirs:
+        parts = os.path.normpath(path).split(os.sep)
+        found_version = False
+        for part in parts:
+            m = re.match(r'^(\d+\.\d+)$', part)
+            if m:
+                versioned.append((float(m.group(1)), path))
+                found_version = True
+                break
+        if not found_version:
+            root_dirs.append(path)
+
+    if versioned:
+        versioned.sort(key=lambda v: -v[0])
+        latest = versioned[0][0]
+        return [p for ver, p in versioned if ver == latest]
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in root_dirs:
+        real = os.path.realpath(p)
+        if real not in seen:
+            seen.add(real)
+            unique.append(p)
+    return unique
+
+
+def _walk_def_element(el, prefix_path: list[str], out: list[tuple[list[str], str]]) -> None:
+    """Recursively collect (field_path_segments, text) for translatable leaves
+    inside a Def element. prefix_path is the dotted path so far (after defName).
+
+    - whitelisted leaf  -> emit (prefix + [tag], text)
+    - <li> list:
+        * plain-string li -> emit (prefix + [tag, i], li.text) only if tag is
+          whitelisted (e.g. rulesStrings.0, stats.0)
+        * object li       -> recurse with (prefix + [tag, i])
+    - generic container  -> recurse with (prefix + [tag])
+    - everything else    -> skip
+    """
+    for child in el:
+        tag = child.tag
+        if not isinstance(tag, str) or tag == "defName":
+            continue
+
+        # Children that are real elements (ignore comments/PIs).
+        elem_children = [c for c in child if isinstance(c.tag, str)]
+        li_children = [c for c in elem_children if c.tag == "li"]
+
+        if li_children:
+            # A list. Index by position among <li> children, document order.
+            for i, li in enumerate(li_children):
+                li_elem_children = [c for c in li if isinstance(c.tag, str)]
+                if li_elem_children:
+                    # Object li -> recurse.
+                    _walk_def_element(li, prefix_path + [tag, str(i)], out)
+                else:
+                    # Plain-string li -> only emit for whitelisted list fields.
+                    if tag in _RIMWORLD_TRANSLATABLE_FIELDS and li.text and _looks_translatable(li.text):
+                        out.append((prefix_path + [tag, str(i)], li.text))
+        elif elem_children:
+            # Generic container (e.g. <comps><CompProperties_X>...) -> recurse.
+            _walk_def_element(child, prefix_path + [tag], out)
+        else:
+            # Leaf.
+            if tag in _RIMWORLD_TRANSLATABLE_FIELDS and child.text and _looks_translatable(child.text):
+                out.append((prefix_path + [tag], child.text))
+
+
+def _definjected_rel_dir(defs_dir: str, root: str) -> str:
+    """Given an absolute Defs/ directory, return the DefInjected output directory
+    RELATIVE TO ROOT, mirroring the mod's own layout. E.g.
+      <root>/1055485938/1.6/Defs        -> "1055485938/1.6/Languages/English/DefInjected"
+      <root>/MyMod/Defs                 -> "MyMod/Languages/English/DefInjected"
+      <root>/Defs                       -> "Languages/English/DefInjected"
+    The path PREFIX before "Defs" (mod folder + optional version) is preserved so
+    the generated string's `file` resolves to the right mod (the table filter and
+    inject both key off this), exactly like curated English files do."""
+    rel = os.path.relpath(defs_dir, root).replace("\\", "/")
+    # Strip the trailing "Defs" segment, keep everything before it as the prefix.
+    parts = rel.split("/")
+    if parts and parts[-1].lower() == "defs":
+        parts = parts[:-1]
+    prefix = "/".join(parts)
+    if prefix:
+        prefix += "/"
+    return prefix + "Languages/English/DefInjected"
+
+
+def _iter_generated_definjected(base_path: str, root: str):
+    """Single source of truth for Defs->DefInjected generation, shared by
+    extract, inject, and count so the id math is guaranteed identical.
+
+    Yields (synthetic_file, def_type, key, original) where:
+      - synthetic_file = "<verPrefix>Languages/English/DefInjected/<DefType>/<basename>.xml"
+        (forward slashes, relative to root) — mirrors the curated English layout
+        so inject's existing Languages/English -> Languages/<lang> rewrite works.
+      - def_type = the Def's XML tag (ThingDef, PawnKindDef, ...)
+      - key = "<defName>.<fieldPath>"
+      - original = the leaf text
+    """
+    for defs_dir in _find_rimworld_defs_dirs(base_path):
+        definjected_rel = _definjected_rel_dir(defs_dir, root)
+        for dirpath, _, filenames in os.walk(defs_dir):
+            for filename in filenames:
+                if not filename.lower().endswith(".xml"):
+                    continue
+                abspath = os.path.join(dirpath, filename)
+                try:
+                    tree = ET.parse(abspath)
+                    defs_root = tree.getroot()
+                except Exception as e:
+                    print(f"Error reading RimWorld Defs {filename}: {e}")
+                    continue
+
+                basename = filename
+
+                for def_el in defs_root:
+                    def_type = def_el.tag
+                    if not isinstance(def_type, str):
+                        continue
+                    # Skip abstract templates and defs without a defName.
+                    if (def_el.get("Abstract") or "").strip().lower() == "true":
+                        continue
+                    defname_el = def_el.find("defName")
+                    if defname_el is None or not defname_el.text or not defname_el.text.strip():
+                        continue
+                    def_name = defname_el.text.strip()
+
+                    collected: list[tuple[list[str], str]] = []
+                    _walk_def_element(def_el, [], collected)
+                    if not collected:
+                        continue
+
+                    synthetic_file = f"{definjected_rel}/{def_type}/{basename}"
+                    for field_segments, text in collected:
+                        key = ".".join([def_name] + field_segments)
+                        yield (synthetic_file, def_type, key, text)
+
+
+def _dedup_field_key(key: str) -> str:
+    """Normalize a DefInjected key for DEDUP comparison only (not for the id).
+    RimWorld matches a translation key case-insensitively on the FIELD path but
+    the defName is an identifier. Authors sometimes write the field in a different
+    case (`MakeX.jobstring` vs the def's `jobString`) — RimWorld accepts both, so
+    a dup there still crashes. Keep the defName (first segment) verbatim, lower the
+    rest (fields + numeric indices). Used ONLY to compare against author keys."""
+    parts = key.split(".")
+    if len(parts) <= 1:
+        return key
+    return parts[0] + "." + ".".join(p.lower() for p in parts[1:])
+
+
+def _normalize_def_type(def_type: str) -> str:
+    """Normalize a DefInjected folder/def-type name for matching. RimWorld matches
+    a translation to a def by type, and folder names vary between authors and us:
+    the engine treats the trailing plural `s` as equivalent (`ThingDefs` folder
+    holds `ThingDef` translations). Measured in real mods: an author ships
+    `RecipeDefs/` (plural) while we generate `RecipeDef/` (singular, from the XML
+    tag). Without this, dedup misses the author's key and RimWorld crashes with
+    "A translation for X already exists". Lower-case + strip one trailing `s` from
+    a `*defs` name. Keep the type (don't dedup by bare key) so different types with
+    the same defName (ThingDef "Seal" vs RecipeDef "Seal") stay distinct."""
+    dt = def_type.lower().strip()
+    if dt.endswith("defs"):
+        return dt[:-1]
+    return dt
+
+
+def _find_rimworld_target_dirs(root: str, target_lang: str) -> list[str]:
+    """Find Languages/<target_lang>/ dirs (case-insensitive, version-filtered to
+    latest). Mirrors _find_rimworld_english_dirs but for the user's target. Matches
+    both folder forms: long "Russian (Русский)" and short "Russian", any case."""
+    import re
+    target = get_rimworld_folder(target_lang)
+    target_short = target.split(" (")[0] if " (" in target else target
+    target_lower = target.lower()
+    target_short_lower = target_short.lower()
+
+    target_dirs: list[str] = []
+    for path, name in _find_rimworld_lang_dirs(root):
+        name_lower = name.lower()
+        name_short_lower = (name.split(" (")[0] if " (" in name else name).lower()
+        if (name_lower == target_lower or name_lower == target_short_lower
+                or name_short_lower == target_short_lower):
+            target_dirs.append(path)
+
+    versioned: list[tuple[float, str]] = []
+    root_dirs: list[str] = []
+    for path in target_dirs:
+        parts = os.path.normpath(path).split(os.sep)
+        found = False
+        for part in parts:
+            m = re.match(r'^(\d+\.\d+)$', part)
+            if m:
+                versioned.append((float(m.group(1)), path))
+                found = True
+                break
+        if not found:
+            root_dirs.append(path)
+    if versioned:
+        versioned.sort(key=lambda v: -v[0])
+        latest = versioned[0][0]
+        return [p for v, p in versioned if v == latest]
+    return root_dirs
+
+
+def _target_definjected_keys(base_path: str, target_lang: str) -> set:
+    """Set of (_normalize_def_type(folder), key) already present in the target
+    language's DefInjected — author's existing translation we must NOT duplicate."""
+    keys: set = set()
+    for target_dir in _find_rimworld_target_dirs(base_path, target_lang):
+        definjected = os.path.join(target_dir, "DefInjected")
+        if not os.path.isdir(definjected):
+            continue
+        for dirpath, _, filenames in os.walk(definjected):
+            def_type = _normalize_def_type(os.path.basename(dirpath))
+            for filename in filenames:
+                if not filename.lower().endswith(".xml"):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(dirpath, filename))
+                    for child in tree.getroot():
+                        if isinstance(child.tag, str):
+                            keys.add((def_type, _dedup_field_key(child.tag)))
+                except Exception:
+                    pass
+    return keys
+
+
+def _target_keyed_keys(base_path: str, target_lang: str) -> set:
+    """Set of Keyed keys already present in the target language's Keyed/."""
+    keys: set = set()
+    for target_dir in _find_rimworld_target_dirs(base_path, target_lang):
+        keyed = os.path.join(target_dir, "Keyed")
+        if not os.path.isdir(keyed):
+            continue
+        for dirpath, _, filenames in os.walk(keyed):
+            for filename in filenames:
+                if not filename.lower().endswith(".xml"):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(dirpath, filename))
+                    for child in tree.getroot():
+                        if isinstance(child.tag, str):
+                            keys.add(child.tag)
+                except Exception:
+                    pass
+    return keys
+
+
+def _english_definjected_keys(base_path: str) -> set:
+    """Set of (DefType, key) already present in curated Languages/English/
+    DefInjected — used to suppress generated duplicates (curated English wins).
+    DefType = the immediate parent directory of the DefInjected xml."""
+    keys: set = set()
+    for english_dir in _find_rimworld_english_dirs(base_path):
+        definjected = os.path.join(english_dir, "DefInjected")
+        if not os.path.isdir(definjected):
+            continue
+        for dirpath, _, filenames in os.walk(definjected):
+            def_type = os.path.basename(dirpath)
+            for filename in filenames:
+                if not filename.lower().endswith(".xml"):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(dirpath, filename))
+                    for child in tree.getroot():
+                        if isinstance(child.tag, str):
+                            keys.add((def_type, child.tag))
+                except Exception:
+                    pass
+    return keys
+
+
+def count_generated_definjected(root: str, target_lang: str | None = None) -> int:
+    """Count translatable strings generated from Defs/ after dedup vs curated
+    English DefInjected AND vs the target language's existing (author) DefInjected.
+    Used by main.py count_mod_strings — so a partially-translated mod reports only
+    the MISSING strings, not its already-translated ones."""
+    try:
+        english_keys = _english_definjected_keys(root)
+        target_keys = _target_definjected_keys(root, target_lang) if target_lang else set()
+        seen: set = set()
+        count = 0
+        for synthetic_file, def_type, key, original in _iter_generated_definjected(root, root):
+            if (def_type, key) in english_keys:
+                continue
+            if (_normalize_def_type(def_type), _dedup_field_key(key)) in target_keys:
+                continue
+            sid = make_id("i18n", synthetic_file, [key], original)
+            if sid in seen:
+                continue
+            seen.add(sid)
+            count += 1
+        return count
+    except Exception:
+        return 0
+
+
 def get_stardew_code(target: str) -> str:
     clean = target.strip().lower()
     if clean in STARDEW_LANGS:
@@ -288,6 +718,9 @@ class I18nParser(BaseParser):
             "FORMAT SPECIFIERS: preserve {0}, {1}, {player}, %s, %d and similar "
             "patterns EXACTLY — they are filled in at runtime.\n"
             "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
+            "UI TAB/BUTTON LABELS: if a string's context says it is a UI tab or button "
+            "label, the on-screen width is very limited — translate it as SHORT as "
+            "possible (ideally 1-2 words), even if that means a looser wording.\n"
             "TONE: use a neutral, professional register. Avoid overly literary style."
         )
 
@@ -298,7 +731,13 @@ class I18nParser(BaseParser):
         if os.path.isfile(stardew_default):
             return True
 
-        # 2. RimWorld Languages — any language, root or version subfolders
+        # 2. RimWorld — identified by About/About.xml (the one reliable marker).
+        #    Covers mods with only Defs/ or only a .dll and no Languages/ yet.
+        if is_rimworld_mod(root):
+            return True
+
+        # 3. RimWorld Languages — any language, root or version subfolders
+        #    (kept for non-mod folders that lack an About.xml).
         if _find_rimworld_lang_dirs(root):
             return True
 
@@ -346,9 +785,36 @@ class I18nParser(BaseParser):
                                         if sid in seen_ids:
                                             continue
                                         seen_ids.add(sid)
-                                        results.append(self._mk(rel_path, [child.tag], original, f"RimWorld | {filename.replace('.xml', '')} | {child.tag}"))
+                                        ctx = f"RimWorld | {filename.replace('.xml', '')} | {child.tag}"
+                                        # Width-limited UI tab/button label -> ask for a short translation.
+                                        rp = rel_path.lower()
+                                        if "researchtabdef" in rp or "mainbuttondef" in rp:
+                                            ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
+                                        results.append(self._mk(rel_path, [child.tag], original, ctx))
                             except Exception as e:
                                 print(f"Error reading RimWorld XML {filename}: {e}")
+
+            # 3. Generate RimWorld DefInjected from Defs/ (the bulk of mod text
+            #    lives here; most mods ship no curated English DefInjected).
+            #    Curated English wins on (DefType, key) collisions. seen_ids
+            #    spans steps 2 and 3 so generated strings never collide with
+            #    curated ones at the id level.
+            try:
+                english_keys = _english_definjected_keys(base_path)
+                for synthetic_file, def_type, key, original in _iter_generated_definjected(base_path, root):
+                    if (def_type, key) in english_keys:
+                        continue
+                    sid = make_id(self.engine, synthetic_file, [key], original)
+                    if sid in seen_ids:
+                        continue
+                    seen_ids.add(sid)
+                    ctx = f"RimWorld Defs | {def_type} | {key}"
+                    # Width-limited UI tab/button label -> ask for a short translation.
+                    if def_type.lower() in ("researchtabdef", "mainbuttondef"):
+                        ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
+                    results.append(self._mk(synthetic_file, [key], original, ctx))
+            except Exception as e:
+                print(f"Error generating RimWorld DefInjected from Defs: {e}")
 
         return results
 
@@ -362,6 +828,57 @@ class I18nParser(BaseParser):
         paths_to_check = [root] if not sub_paths else [os.path.join(root, p) for p in sub_paths]
 
         for base_path in paths_to_check:
+            # --- RimWorld: dedup against the AUTHOR's existing target translation
+            # so we top up only what's missing and NEVER duplicate a key (a dup
+            # string-translation key crashes RimWorld). "Author" keys = keys in
+            # target-language files we did NOT create ourselves. Our own prior
+            # output is tracked as type='created' in the backup metadata; we
+            # EXCLUDE those files so a re-run overwrites them instead of treating
+            # them as untouchable. (Keying off file provenance, not off which keys
+            # we translated — translating a key that also exists in the author's
+            # file must still skip it, or we'd duplicate and crash.)
+            author_def_keys: set = set()
+            author_keyed_keys: set = set()
+            try:
+                created_files: set = set()
+                meta_path = os.path.join(root, ".interprex_backups", "metadata.json")
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as mf:
+                            meta = json.load(mf)
+                        for rel, info in meta.items():
+                            if isinstance(info, dict) and info.get("type") == "created":
+                                created_files.add(os.path.normpath(os.path.join(root, rel)))
+                    except Exception:
+                        pass
+
+                for target_dir in _find_rimworld_target_dirs(base_path, target_lang):
+                    for sub, is_def in (("DefInjected", True), ("Keyed", False)):
+                        sub_dir = os.path.join(target_dir, sub)
+                        if not os.path.isdir(sub_dir):
+                            continue
+                        for dp, _, fns in os.walk(sub_dir):
+                            dt_norm = _normalize_def_type(os.path.basename(dp))
+                            for fn in fns:
+                                if not fn.lower().endswith(".xml"):
+                                    continue
+                                fpath = os.path.join(dp, fn)
+                                # Skip our own prior output — it's overwritable.
+                                if os.path.normpath(fpath) in created_files:
+                                    continue
+                                try:
+                                    for ch in ET.parse(fpath).getroot():
+                                        if not isinstance(ch.tag, str):
+                                            continue
+                                        if is_def:
+                                            author_def_keys.add((dt_norm, _dedup_field_key(ch.tag)))
+                                        else:
+                                            author_keyed_keys.add(ch.tag)
+                                except Exception:
+                                    pass
+            except Exception as e:
+                print(f"Error computing RimWorld author keys: {e}")
+
             # 1. Inject Stardew JSON
             stardew_default = os.path.join(base_path, "i18n", "default.json")
             if os.path.isfile(stardew_default):
@@ -432,10 +949,25 @@ class I18nParser(BaseParser):
                                 source_tree = ET.parse(source_abspath)
                                 source_root = source_tree.getroot()
 
+                                # Is this a DefInjected or a Keyed file? Used to skip
+                                # keys the author already translated (avoid dup crash).
+                                srl = source_rel.lower()
+                                is_definjected = "definjected" in srl
+                                # DefType = parent folder name (DefInjected/<DefType>/file.xml)
+                                src_def_type = _normalize_def_type(os.path.basename(os.path.dirname(source_abspath)))
+
                                 # Check if we have any translations for this file
                                 file_translations = {}
                                 for child in source_root:
                                     if isinstance(child.tag, str) and child.text is not None:
+                                        # Skip a key the author already provides in the
+                                        # target language — never overwrite/duplicate it.
+                                        if is_definjected:
+                                            if (src_def_type, _dedup_field_key(child.tag)) in author_def_keys:
+                                                continue
+                                        else:
+                                            if child.tag in author_keyed_keys:
+                                                continue
                                         sid = make_id(self.engine, source_rel, [child.tag], child.text)
                                         if sid in translations:
                                             file_translations[child.tag] = translations[sid]
@@ -445,8 +977,9 @@ class I18nParser(BaseParser):
                                     continue
 
                                 # Load or create target XML
+                                file_pre_existed = os.path.isfile(target_filepath)
                                 target_root = None
-                                if os.path.isfile(target_filepath):
+                                if file_pre_existed:
                                     try:
                                         # Backup before writing
                                         self.backup_file(root, target_filepath)
@@ -480,7 +1013,84 @@ class I18nParser(BaseParser):
                                 with open(target_filepath, "w", encoding="utf-8-sig") as f:
                                     f.write(xml_str)
 
+                                # A newly-created file must be registered type='created'
+                                if not file_pre_existed:
+                                    import hashlib
+                                    from .base import update_metadata
+                                    rel_to_root = os.path.relpath(target_filepath, root).replace("\\", "/")
+                                    mod_sha = hashlib.sha256(xml_bytes).hexdigest()
+                                    update_metadata(root, rel_to_root, "", mod_sha, "created")
+
                             except Exception as e:
                                 print(f"Error injecting RimWorld XML {filename}: {e}")
+
+            # 3. Inject generated DefInjected from Defs/. These files don't exist
+            #    on disk, so the loop above can't reach them — drive purely off
+            #    the Defs walk + the translations dict.
+            try:
+                english_keys = _english_definjected_keys(base_path)
+                # output_file_rel -> {key: translated}
+                grouped: dict[str, dict[str, str]] = {}
+                for synthetic_file, def_type, key, original in _iter_generated_definjected(base_path, root):
+                    if (def_type, key) in english_keys:
+                        continue
+                    # Skip keys the author already translated in the target language
+                    # (normalized type so ThingDefs/ folder matches ThingDef def).
+                    if (_normalize_def_type(def_type), _dedup_field_key(key)) in author_def_keys:
+                        continue
+                    sid = make_id(self.engine, synthetic_file, [key], original)
+                    if sid not in translations:
+                        continue
+                    # Same Languages/English -> Languages/<lang> rewrite as step 2.
+                    idx = synthetic_file.find("Languages/English")
+                    if idx != -1:
+                        out_rel = synthetic_file[:idx] + "Languages/" + lang_folder + synthetic_file[idx + len("Languages/English"):]
+                    else:
+                        out_rel = synthetic_file.replace("Languages/English", "Languages/" + lang_folder)
+                    grouped.setdefault(out_rel, {})[key] = translations[sid]
+
+                for out_rel, kv in grouped.items():
+                    target_filepath = os.path.join(root, *out_rel.split("/"))
+                    file_pre_existed = os.path.isfile(target_filepath)
+
+                    # Merge into an existing target file (re-injects, hand edits).
+                    target_root = None
+                    if file_pre_existed:
+                        try:
+                            self.backup_file(root, target_filepath)
+                            target_root = ET.parse(target_filepath).getroot()
+                        except Exception:
+                            target_root = None
+                    if target_root is None:
+                        target_root = ET.Element("LanguageData")
+
+                    existing = {el.tag: el for el in target_root if isinstance(el.tag, str)}
+                    for key in sorted(kv):
+                        trans_val = kv[key]
+                        if key in existing:
+                            existing[key].text = trans_val
+                        else:
+                            new_el = ET.Element(key)
+                            new_el.text = trans_val
+                            target_root.append(new_el)
+                            existing[key] = new_el
+                        written += 1
+
+                    os.makedirs(os.path.dirname(target_filepath), exist_ok=True)
+                    ET.indent(target_root, space="  ")
+                    xml_bytes = ET.tostring(target_root, encoding="utf-8", xml_declaration=True)
+                    with open(target_filepath, "w", encoding="utf-8-sig") as f:
+                        f.write(xml_bytes.decode("utf-8"))
+
+                    # A newly-created file must be registered type='created' so
+                    # backup restore deletes it (it had no original to revert to).
+                    if not file_pre_existed:
+                        import hashlib
+                        from .base import update_metadata
+                        rel_to_root = os.path.relpath(target_filepath, root).replace("\\", "/")
+                        mod_sha = hashlib.sha256(xml_bytes).hexdigest()
+                        update_metadata(root, rel_to_root, "", mod_sha, "created")
+            except Exception as e:
+                print(f"Error injecting generated RimWorld DefInjected: {e}")
 
         return written

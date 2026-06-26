@@ -617,6 +617,11 @@ class UnityParser(BaseParser):
     @staticmethod
     def detect(root: str) -> bool:
         """True if there are any non-system .dll files, level* / *.assets / *.prefab, or Addressables localization bundles."""
+        # RimWorld mods (About/About.xml) are i18n, even when they ship .dll
+        # assemblies and no Languages/ folder yet — must not detect as Unity.
+        from .i18n import is_rimworld_mod
+        if is_rimworld_mod(root):
+            return False
         # Skip mods with i18n/default.json (Stardew Valley) or Languages/ (RimWorld)
         if os.path.isfile(os.path.join(root, "i18n", "default.json")):
             return False

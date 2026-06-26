@@ -400,6 +400,11 @@ td.tr-edit textarea {
   resize: vertical;
   outline: none;
 }
+/* Bulk-edit mode: gold border signals "saves to all duplicates" */
+td.tr-bulk textarea {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.25);
+}
 
 /* ---- Backup and Restore Styling ---- */
 
@@ -466,6 +471,21 @@ button.btn-secondary:hover:not(:disabled) {
   color: var(--text);
 }
 
+/* Primary/accent style for confirming modal actions */
+button.btn-primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+button.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+button.btn-primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* Warning/danger style for Restore Original */
 button.btn-danger {
   border-color: rgba(248, 114, 114, 0.4);
@@ -528,6 +548,56 @@ button.btn-danger:hover:not(:disabled) {
   font-size: 13px;
   font-weight: 500;
 }
+
+.modal-content h2.normal-title {
+  color: var(--text);
+}
+
+.extra-instruction-textarea {
+  width: 100%;
+  height: 100px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+  font-size: 14px;
+  margin-bottom: 8px;
+  outline: none;
+  font-family: inherit;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.extra-instruction-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2),
+              0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+.extra-instruction-hint {
+  font-size: 12px !important;
+  color: var(--muted) !important;
+  margin: 0 0 20px !important;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.extra-instruction-hint kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+}
+
 
 @keyframes fadeIn {
   from { opacity: 0; }
@@ -2064,6 +2134,14 @@ input[type="range"]::-webkit-slider-thumb:active {
   cursor: not-allowed;
 }
 
+/* "Перевести все копии" button — slightly different hue to distinguish from Переперевести */
+.translate-copies-btn {
+  background: #7c3aed;
+}
+.translate-copies-btn:hover {
+  background: #6d28d9;
+}
+
 /* Checkboxes in string table */
 table input[type="checkbox"] {
   accent-color: var(--accent);
@@ -2379,8 +2457,26 @@ tr.just-translated-row td {
   }
 }
 
-
-
-
-
-
+/* ---- Toast notification (bulk-edit confirmation etc.) ---- */
+.toast-notification {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1e293b;
+  color: #f1f5f9;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  padding: 10px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+  z-index: 9999;
+  pointer-events: none;
+  animation: toast-in 0.2s ease-out;
+  white-space: nowrap;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}

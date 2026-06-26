@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback, useMemo, memo } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ping,
@@ -366,10 +366,11 @@ interface TableRowProps {
   isSelected: boolean;
   isJustTranslated: boolean;
   isEditing: boolean;
+  isBulkEdit: boolean;
   editingVal: string;
   metadata: string;
   target: TargetLang;
-  startEdit: (id: string, current: string) => void;
+  startEdit: (id: string, current: string, bulk?: boolean) => void;
   commitEdit: (id: string, original: string) => void;
   setEditingVal: (val: string) => void;
   setEditingId: (id: string | null) => void;
@@ -383,6 +384,7 @@ const TableRow = memo(({
   isSelected,
   isJustTranslated,
   isEditing,
+  isBulkEdit,
   editingVal,
   metadata,
   target,
@@ -407,12 +409,13 @@ const TableRow = memo(({
       <td
         className={
           isEditing
-            ? "tr-edit"
+            ? (isBulkEdit ? "tr-edit tr-bulk" : "tr-edit")
             : translated
               ? "tr-cell"
               : "tr-cell empty"
         }
-        onClick={isEditing ? undefined : () => startEdit(s.id, translated ?? "")}
+        onClick={isEditing ? undefined : (e) => startEdit(s.id, translated ?? "", e.shiftKey)}
+        title={!isEditing ? ("Клик — редактировать | Shift+клик — применить ко всем одинаковым") : undefined}
       >
         {isEditing ? (
           <textarea
@@ -446,6 +449,7 @@ const TableRow = memo(({
   return prevProps.isSelected === nextProps.isSelected &&
          prevProps.isJustTranslated === nextProps.isJustTranslated &&
          prevProps.isEditing === nextProps.isEditing &&
+         prevProps.isBulkEdit === nextProps.isBulkEdit &&
          (!nextProps.isEditing || prevProps.editingVal === nextProps.editingVal) &&
          prevProps.metadata === nextProps.metadata &&
          prevProps.target === nextProps.target &&
@@ -718,6 +722,20 @@ export default function App() {
   // null = nothing is being edited.
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingVal, setEditingVal] = useState("");
+  // true when the user opened the cell with Shift+click → save applies to all duplicates
+  const [isBulkEdit, setIsBulkEdit] = useState(false);
+  // Toast notification (e.g. "Применено к N ячейкам")
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function showToast(msg: string) {
+    setToast(msg);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+  }
+  // Modal for Shift+Переперевести: lets the user type a one-time prompt rule.
+  const [extraInstructionModal, setExtraInstructionModal] = useState<{ ids: string[] } | null>(null);
+  const [extraInstructionText, setExtraInstructionText] = useState("");
 
   // Stable wrappers to prevent TableRow from re-rendering due to changing callbacks
   const handlersRef = useRef({
@@ -737,8 +755,8 @@ export default function App() {
     onDragSelectEnter
   };
 
-  const stableStartEdit = useCallback((id: string, current: string) => {
-    handlersRef.current.startEdit(id, current);
+  const stableStartEdit = useCallback((id: string, current: string, bulk?: boolean) => {
+    handlersRef.current.startEdit(id, current, bulk);
   }, []);
   const stableCommitEdit = useCallback((id: string, original: string) => {
     handlersRef.current.commitEdit(id, original);
@@ -1045,52 +1063,85 @@ export default function App() {
   }
 
   /** Open a cell for inline editing. No-op while a bulk operation is running. */
-  function startEdit(id: string, current: string) {
+  function startEdit(id: string, current: string, bulk?: boolean) {
     if (busy && !isPaused) return;
+    if (closeTimeoutRef.current) {
+      clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
     setEditingId(id);
     setEditingVal(current);
+    setIsBulkEdit(bulk ?? false);
   }
 
   /**
    * Commit the current inline edit: write the new value into the project and
    * save to disk. Called on textarea blur (including when the user clicks away
    * to a different cell or a pagination button).
+   * In bulk mode (Shift+click), applies the translation to ALL strings with
+   * the same original text and shows a toast with the count.
    */
   function commitEdit(id: string, original: string) {
-    setEditingId(null);
+    // Close the editor with a minor delay. If the user clicked another cell,
+    // startEdit will run instantly and cancel this timeout, preventing a flash of null editingId.
+    if (closeTimeoutRef.current) clearTimeout(closeTimeoutRef.current);
+    closeTimeoutRef.current = setTimeout(() => {
+      setEditingId((prev) => (prev === id ? null : prev));
+      closeTimeoutRef.current = null;
+    }, 50);
+
+    const wasBulk = isBulkEdit;
+    setIsBulkEdit(false);
     if (!project) return;
     const entry = project.strings[id];
 
-    // Add to justTranslatedIds if they typed a non-empty translation, so it stays visible under filters
-    if (editingVal.trim() !== "") {
-      setJustTranslatedIds((prev) => {
-        const next = new Set(prev);
-        next.add(id);
-        return next;
-      });
-    } else {
-      setJustTranslatedIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-    }
+    if (wasBulk) {
+      // Bulk mode: apply editingVal to every string that shares this original text
+      const matches = strings.filter((s) => s.original === original);
+      const updatedStrings = { ...project.strings };
+      const newJustTranslated = new Set(justTranslatedIds);
 
-    const prevVal = entry?.translated ?? "";
-    if (editingVal !== prevVal) {
-      const strObj = strings.find((s) => s.id === id);
-      if (strObj && translationMode === "mods") {
-        const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
-        if (mPath) {
-          setEditedModPaths((prev) => {
-            const next = new Set(prev);
-            next.add(mPath);
-            return next;
-          });
+      for (const strObj of matches) {
+        const prev = updatedStrings[strObj.id];
+        const prevTrans = prev?.translated ?? "";
+        updatedStrings[strObj.id] = {
+          original: strObj.original,
+          translated: editingVal,
+          approved: prev?.approved ?? false,
+        };
+        if (editingVal.trim() !== "") {
+          newJustTranslated.add(strObj.id);
+        } else {
+          newJustTranslated.delete(strObj.id);
+        }
+        if (editingVal !== prevTrans && translationMode === "mods") {
+          const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+          if (mPath) {
+            setEditedModPaths((prev) => {
+              const next = new Set(prev);
+              next.add(mPath);
+              return next;
+            });
+          }
         }
       }
+
+      const updated = { ...project, strings: updatedStrings };
+      saveProject(updated).catch(fail);
+      // Defer the heavy table re-render so the next cell opens without waiting
+      startTransition(() => {
+        setJustTranslatedIds(newJustTranslated);
+        setProject(updated);
+      });
+      if (matches.length > 1) {
+        showToast(`Применено к ${matches.length} ячейкам`);
+      }
+      return;
     }
 
+    // Single-cell mode: compute updated project synchronously (cheap),
+    // but defer the state update so the next cell opens immediately.
+    const prevVal = entry?.translated ?? "";
     const updated: ProjectFile = {
       ...project,
       strings: {
@@ -1102,8 +1153,41 @@ export default function App() {
         },
       },
     };
-    setProject(updated);
     saveProject(updated).catch(fail);
+
+    startTransition(() => {
+      // Heavy updates: re-rendering the table row. Deferred so clicking the
+      // next cell is instant — React prioritises startEdit over this render.
+      if (editingVal.trim() !== "") {
+        setJustTranslatedIds((prev) => {
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+      } else {
+        setJustTranslatedIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+
+      if (editingVal !== prevVal) {
+        const strObj = strings.find((s) => s.id === id);
+        if (strObj && translationMode === "mods") {
+          const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+          if (mPath) {
+            setEditedModPaths((prev) => {
+              const next = new Set(prev);
+              next.add(mPath);
+              return next;
+            });
+          }
+        }
+      }
+
+      setProject(updated);
+    });
   }
 
   async function scanSelectedMods(paths: string[], currentMods?: ModInfo[], currentDir?: string) {
@@ -1328,7 +1412,7 @@ export default function App() {
   }
 
 
-  async function translateAll(targetIds?: string[]): Promise<{ ok: boolean; project?: ProjectFile }> {
+  async function translateAll(targetIds?: string[], extraInstruction?: string): Promise<{ ok: boolean; project?: ProjectFile }> {
     if (!project || !engine) return { ok: false };
     runSettingsRef.current = {
       provider,
@@ -1344,7 +1428,20 @@ export default function App() {
       setPhase("translating");
       setIsPaused(false);
       setPyProgress(null);
-      const todo = strings.filter((s) => {
+
+      // In mods mode `strings` holds EVERY extracted mod, but the user may have
+      // unchecked some — translate (and size the progress bar to) ONLY the
+      // selected mods. Same mod-path resolver the table filter uses. Outside
+      // mods mode there's no selection, so the scope is all strings.
+      const selectedSet = new Set(selectedModPaths);
+      const inScope = (s: TranslationString): boolean => {
+        if (translationMode !== "mods") return true;
+        const mPath = getModPathForString(s, detectedMods, gameRoot, modsDir);
+        return mPath !== null && selectedSet.has(mPath);
+      };
+      const scopedStrings = strings.filter(inScope);
+
+      const todo = scopedStrings.filter((s) => {
         const entry = project.strings[s.id];
         if (targetIds) {
           return targetIds.includes(s.id);
@@ -1361,8 +1458,9 @@ export default function App() {
         setJustTranslatedIds(new Set());
       }
 
-      // Calculate unique representatives matching the backend de-duplication
-      const uniqueKeys = new Set(strings.map((s) => `${s.original}\x00${s.context}`));
+      // Calculate unique representatives matching the backend de-duplication,
+      // scoped to the selected mods so the progress total matches the table.
+      const uniqueKeys = new Set(scopedStrings.map((s) => `${s.original}\x00${s.context}`));
       const totalUnique = uniqueKeys.size;
 
       // initialDone must count only FULLY-done unique keys (no untranslated id),
@@ -1413,6 +1511,7 @@ export default function App() {
             delaySeconds: effDelay,
             root: activeRoot ?? undefined,
             fontStyle,
+            extraInstruction: extraInstruction ?? "",
           },
           (p) => {
             setProgress({
@@ -1509,6 +1608,12 @@ export default function App() {
         } else if (result.errors.length) {
           const details = result.errors.map((err) => `• ${err}`).join("\n");
           setError(`${t("translateErrors")(result.errors.length) as string}\n\n${details}`);
+        } else {
+          const uniqueCount = Object.keys(result.translations).length;
+          if (uniqueCount > 0) {
+            const totalCount = targetIds ? targetIds.length : strings.length;
+            showToast((t("translateSuccess") as any)(uniqueCount, totalCount));
+          }
         }
       } finally {
         setAbortController(null);
@@ -1952,7 +2057,7 @@ export default function App() {
   // Steps share ONE .interprex_backups store, so the single Restore button undoes
   // everything. Each step short-circuits the chain if the user aborts or it fails;
   // autofix is best-effort (its own try/catch) and never blocks completion.
-  async function handleTranslate(targetIds?: string[]) {
+  async function handleTranslate(targetIds?: string[], extraInstruction?: string) {
     const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!project || !engine || !activeRoot) return;
 
@@ -1962,7 +2067,7 @@ export default function App() {
     await ensureProxyResolved();
 
     // 1. Translate.
-    const { ok: translated, project: updatedProject } = await translateAll(targetIds);
+    const { ok: translated, project: updatedProject } = await translateAll(targetIds, extraInstruction);
     if (!translated) return;
 
     // 2. Write the tl/ files (must precede autofix — it has nothing to check
@@ -2282,42 +2387,26 @@ export default function App() {
 
     const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
     
-    // 1. Determine if we have any mods with zero strings
-    const hasZeroStringMods = extractedModPaths.size > 0 && detectedMods.some((mod) => {
-      if (!extractedModPaths.has(mod.path)) return false;
-      const mAbs = norm(`${modsDir || ""}/${mod.path}`);
-      for (const s of strings) {
-        const fp = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
-        const sAbs = norm(`${gameRoot || ""}/${fp}`);
-        if (sAbs === mAbs || sAbs.startsWith(mAbs + "/") || sAbs.startsWith(mAbs + "!")) return false;
-      }
-      return true;
-    });
-
-    // 2. Separate zero-string mods if necessary
-    let sortedMods = detectedMods;
-    if (hasZeroStringMods) {
-      const withStrings: ModInfo[] = [];
-      const zeroStrings: ModInfo[] = [];
-      for (const mod of detectedMods) {
-        if (!extractedModPaths.has(mod.path)) {
-          withStrings.push(mod);
-          continue;
-        }
+    // 2. Order mods into three contiguous tiers (the user-requested grouping):
+    //    0 = needs translating (top), 1 = "Уже переведено", 2 = "Нет строк" (bottom).
+    //    Stable sort preserves the backend order (count desc, then name) within a tier.
+    const modHasStrings = (mod: ModInfo): boolean => {
+      if (extractedModPaths.has(mod.path)) {
         const mAbs = norm(`${modsDir || ""}/${mod.path}`);
-        let count = 0;
         for (const s of strings) {
           const fp = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
           const sAbs = norm(`${gameRoot || ""}/${fp}`);
-          if (sAbs === mAbs || sAbs.startsWith(mAbs + "/") || sAbs.startsWith(mAbs + "!")) {
-            count++;
-            break;
-          }
+          if (sAbs === mAbs || sAbs.startsWith(mAbs + "/") || sAbs.startsWith(mAbs + "!")) return true;
         }
-        if (count > 0) withStrings.push(mod); else zeroStrings.push(mod);
+        return false;
       }
-      sortedMods = [...withStrings, ...zeroStrings];
-    }
+      return (mod.total_count ?? 0) > 0;
+    };
+    const tierOf = (mod: ModInfo): number => {
+      if (mod.already_translated) return 1;
+      return modHasStrings(mod) ? 0 : 2;
+    };
+    const sortedMods = [...detectedMods].sort((a, b) => tierOf(a) - tierOf(b));
 
     // 3. Precalculate statistics for each mod
     return sortedMods.map((mod) => {
@@ -2385,6 +2474,15 @@ export default function App() {
   const safePage = Math.min(page, pageCount - 1);
   const pageStart = safePage * PAGE_SIZE;
   const pageRows = filteredStrings.slice(pageStart, pageStart + PAGE_SIZE);
+  // True when selected strings have duplicates elsewhere in the table.
+  // Shows the "Перевести все копии" button in the floating action bar.
+  const hasDuplicatesForSelection = useMemo(() => {
+    if (selectedIds.size === 0) return false;
+    const selectedOriginals = new Set(
+      strings.filter((s) => selectedIds.has(s.id)).map((s) => s.original)
+    );
+    return strings.some((s) => !selectedIds.has(s.id) && selectedOriginals.has(s.original));
+  }, [strings, selectedIds]);
 
   return (
     <main className="app">
@@ -2397,15 +2495,40 @@ export default function App() {
           </span>
           <button
             className="retranslate-btn"
-            onClick={() => {
-              translateAll(Array.from(selectedIds));
-              setSelectedIds(new Set());
+            onClick={(e) => {
+              if (e.shiftKey) {
+                // Shift+клик: открыть modal для ввода кастомного правила
+                setExtraInstructionText("");
+                setExtraInstructionModal({ ids: Array.from(selectedIds) });
+              } else {
+                translateAll(Array.from(selectedIds));
+                setSelectedIds(new Set());
+              }
             }}
             disabled={busy && !isPaused}
-            title="Перевести выбранные строки заново (только в кэш, без внедрения в игру)"
+            title="Перевести выбранные строки заново (только в кэш, без внедрения в игру) | Shift+клик — открыть окно со своим правилом для модели"
           >
             🔄 Переперевести
           </button>
+          {hasDuplicatesForSelection && (
+            <button
+              className="retranslate-btn translate-copies-btn"
+              onClick={() => {
+                const selectedOriginals = new Set(
+                  strings.filter((s) => selectedIds.has(s.id)).map((s) => s.original)
+                );
+                const allIds = strings
+                  .filter((s) => selectedOriginals.has(s.original))
+                  .map((s) => s.id);
+                translateAll(allIds);
+                setSelectedIds(new Set());
+              }}
+              disabled={busy && !isPaused}
+              title="Перевести ИИ и применить одинаковый результат ко всем строкам с таким же оригинальным текстом (только в кэш, без внедрения в игру)"
+            >
+              📋 Перевести все копии
+            </button>
+          )}
           <button
             className="reset-selection-btn"
             onClick={() => setSelectedIds(new Set())}
@@ -3485,6 +3608,7 @@ export default function App() {
                   isSelected={selectedIds.has(s.id)}
                   isJustTranslated={justTranslatedIds.has(s.id)}
                   isEditing={editingId === s.id}
+                  isBulkEdit={editingId === s.id && isBulkEdit}
                   editingVal={editingVal}
                   metadata={metadata}
                   target={target}
@@ -3549,6 +3673,58 @@ export default function App() {
         </div>
       )}
 
+      {extraInstructionModal && (
+        <div className="modal-overlay" onClick={() => setExtraInstructionModal(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h2 className="normal-title">Правило для перевода</h2>
+            <p>
+              Введите дополнительное указание для ИИ. Оно применится только к выбранным ({extraInstructionModal.ids.length}) строкам на этот раз.
+            </p>
+            <textarea
+              className="extra-instruction-textarea"
+              value={extraInstructionText}
+              onChange={(e) => setExtraInstructionText(e.target.value)}
+              placeholder="Например: везде Infinity переводи как бесконечность"
+              autoFocus
+              onKeyDown={(e) => {
+                // Enter = отправка, Shift+Enter = перенос строки.
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!extraInstructionText.trim()) return;
+                  translateAll(extraInstructionModal.ids, extraInstructionText);
+                  setExtraInstructionModal(null);
+                  setExtraInstructionText("");
+                  setSelectedIds(new Set());
+                } else if (e.key === 'Escape') {
+                  setExtraInstructionModal(null);
+                }
+              }}
+            />
+            <p className="extra-instruction-hint">
+              <kbd>Enter</kbd> — перевести · <kbd>Shift</kbd>+<kbd>Enter</kbd> — новая строка
+            </p>
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setExtraInstructionModal(null)}>
+                Отмена
+              </button>
+              <button
+                className="btn-primary"
+                disabled={!extraInstructionText.trim()}
+                onClick={() => {
+                  if (!extraInstructionText.trim()) return;
+                  translateAll(extraInstructionModal.ids, extraInstructionText);
+                  setExtraInstructionModal(null);
+                  setExtraInstructionText("");
+                  setSelectedIds(new Set());
+                }}
+              >
+                Перевести
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showDiscardConfirm && (
         <div className="modal-overlay" onClick={() => setShowDiscardConfirm(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
@@ -3565,6 +3741,7 @@ export default function App() {
           </div>
         </div>
       )}
+
 
       {pythonLogs.length > 0 && (
         <div
@@ -3657,6 +3834,12 @@ export default function App() {
             }
           }}
         />
+      )}
+      {/* Toast notification for bulk-edit confirmation */}
+      {toast && (
+        <div className="toast-notification" role="status">
+          {toast}
+        </div>
       )}
     </main>
   );

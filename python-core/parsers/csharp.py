@@ -272,7 +272,12 @@ class CSharpParser(BaseParser):
     @staticmethod
     def detect(root: str) -> bool:
         """True if any .cs files are present in the directory structure,
-        but NOT if Languages/ exists (RimWorld mod → i18n engine)."""
+        but NOT if this is a RimWorld mod (→ i18n engine). A RimWorld mod is
+        identified by About/About.xml, which catches code-only mods that have no
+        Languages/ folder yet — they must still route to i18n, not csharp."""
+        from .i18n import is_rimworld_mod
+        if is_rimworld_mod(root):
+            return False
         if os.path.isdir(os.path.join(root, "Languages")):
             return False
         for sub in os.listdir(root):

@@ -1892,6 +1892,263 @@ def check_unity_localization() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_i18n_rimworld_defs() -> None:
+    """RimWorld Defs/ -> generated DefInjected. Most mods ship no curated
+    English DefInjected; the translatable text lives in Defs/*.xml. We generate
+    the engine's `<defName.fieldPath>` keys so they can be translated."""
+    import shutil
+    root = tempfile.mkdtemp(prefix="interprex_rimworld_defs_")
+
+    # Versioned Defs (1.6) — used. A root-level Defs (no version) must be IGNORED
+    # because the 1.6 version wins.
+    defs_dir = os.path.join(root, "1.6", "Defs", "Things")
+    os.makedirs(defs_dir, exist_ok=True)
+    os.makedirs(os.path.join(root, "Defs", "Things"), exist_ok=True)
+
+    animals_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<Defs>\n'
+        '  <ThingDef Abstract="True" Name="BaseAnimal">\n'
+        '    <label>base template</label>\n'
+        '  </ThingDef>\n'
+        '  <ThingDef>\n'
+        '    <defName>Seal</defName>\n'
+        '    <label>seal</label>\n'
+        '    <description>a round sea animal</description>\n'
+        '    <thingClass>Pawn</thingClass>\n'           # not whitelisted -> skip
+        '    <statBases>\n'
+        '      <MoveSpeed>3</MoveSpeed>\n'              # numeric -> skip
+        '    </statBases>\n'
+        '    <tools>\n'
+        '      <li><label>bite</label><power>5</power></li>\n'
+        '      <li><label>flipper</label></li>\n'
+        '    </tools>\n'
+        '    <stats>\n'                                 # list-of-strings, NOT whitelisted -> skip
+        '      <li>alpha</li>\n'
+        '    </stats>\n'
+        '    <rulesStrings>\n'                          # GRAMMAR field -> NEVER emit (corrupts GrammarResolver)
+        '      <li>greeting->Hello</li>\n'
+        '    </rulesStrings>\n'
+        '    <rulesHidden>\n'                           # also grammar -> skip
+        '      <li>r_logentry->[INITIATOR_label] did it.</li>\n'
+        '    </rulesHidden>\n'
+        '    <verb>greet->Hi</verb>\n'                  # whitelisted field BUT value is a grammar rule -> _looks_translatable rejects
+        '  </ThingDef>\n'
+        '  <ThingDef>\n'
+        '    <defName>Curated</defName>\n'
+        '    <label>from defs</label>\n'                # suppressed: curated English wins
+        '  </ThingDef>\n'
+        '</Defs>\n'
+    )
+    with open(os.path.join(defs_dir, "Animals.xml"), "w", encoding="utf-8") as f:
+        f.write(animals_xml)
+
+    ignored_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<Defs>\n'
+        '  <ThingDef><defName>Ghost</defName><label>should be ignored</label></ThingDef>\n'
+        '</Defs>\n'
+    )
+    with open(os.path.join(root, "Defs", "Things", "Ignored.xml"), "w", encoding="utf-8") as f:
+        f.write(ignored_xml)
+
+    # Curated English DefInjected with one key (Curated.label) -> dedup target.
+    curated_dir = os.path.join(root, "1.6", "Languages", "English", "DefInjected", "ThingDef")
+    os.makedirs(curated_dir, exist_ok=True)
+    curated_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<LanguageData>\n'
+        '  <Curated.label>curated english</Curated.label>\n'
+        '</LanguageData>\n'
+    )
+    with open(os.path.join(curated_dir, "Curated.xml"), "w", encoding="utf-8") as f:
+        f.write(curated_xml)
+
+    assert detect_engine(root) == "i18n", "rimworld defs detect failed"
+    p = get_parser("i18n")
+
+    strings = p.extract(root)
+    gen = [s for s in strings if "RimWorld Defs |" in s.context]
+    gen_keys = {s.path[0] for s in gen}
+
+    expected = {
+        "Seal.label", "Seal.description",
+        "Seal.tools.0.label", "Seal.tools.1.label",
+    }
+    assert gen_keys == expected, f"generated keys mismatch: {sorted(gen_keys)}"
+
+    # thingClass / statBases numeric / abstract base / non-whitelist stats list /
+    # suppressed Curated.label must all be absent.
+    assert "Seal.thingClass" not in gen_keys
+    assert not any(k.startswith("Seal.statBases") for k in gen_keys)
+    assert "base template" not in {s.original for s in gen}
+    assert "Seal.stats.0" not in gen_keys
+    assert "Curated.label" not in gen_keys, "curated English should suppress generated"
+
+    # GRAMMAR must NEVER be emitted — translating it corrupts GrammarResolver and
+    # the whole UI falls back to English (the real shipped bug). Two layers:
+    #   1. rulesStrings/rulesHidden are not in the whitelist -> dropped.
+    #   2. verb is whitelisted, but its value "greet->Hi" is a grammar rule, so
+    #      _looks_translatable rejects it on the "->" separator.
+    assert not any("rulesStrings" in k for k in gen_keys), "rulesStrings leaked (grammar!)"
+    assert not any("rulesHidden" in k for k in gen_keys), "rulesHidden leaked (grammar!)"
+    assert "Seal.verb" not in gen_keys, "grammar-rule value (greet->Hi) leaked"
+    assert not any("->" in (s.original or "") for s in gen), "a '->' grammar rule was emitted"
+
+    # file + path[] scheme for every generated string.
+    syn_file = "1.6/Languages/English/DefInjected/ThingDef/Animals.xml"
+    for s in gen:
+        assert s.file == syn_file, f"unexpected file: {s.file}"
+        assert len(s.path) == 1 and s.path[0] in expected
+
+    # Root-level (unversioned) Defs produced nothing (version selection).
+    assert "should be ignored" not in {s.original for s in gen}
+
+    # id stability across re-extract.
+    ids1 = {s.id for s in gen}
+    ids2 = {s.id for s in p.extract(root) if "RimWorld Defs |" in s.context}
+    assert ids1 == ids2, "generated ids not stable"
+
+    # Inject (uppercase) -> generated DefInjected output file.
+    tr = {s.id: s.original.upper() for s in gen}
+    written = p.inject(root, tr, "Russian")
+    assert written == len(expected), f"written={written}, expected {len(expected)}"
+
+    out_path = os.path.join(
+        root, "1.6", "Languages", "Russian (Русский)",
+        "DefInjected", "ThingDef", "Animals.xml",
+    )
+    assert os.path.isfile(out_path), "generated DefInjected output missing"
+    out_root = ET.parse(out_path).getroot()
+    assert out_root.tag == "LanguageData"
+    out_kv = {el.tag: el.text for el in out_root if isinstance(el.tag, str)}
+    assert out_kv.get("Seal.label") == "SEAL"
+    assert out_kv.get("Seal.tools.0.label") == "BITE"
+    assert out_kv.get("Seal.tools.1.label") == "FLIPPER"
+    assert "Seal.rulesStrings.0" not in out_kv, "grammar must never be injected"
+    assert "Curated.label" not in out_kv
+
+    # utf-8-sig BOM written.
+    with open(out_path, "rb") as f:
+        assert f.read(3) == b"\xef\xbb\xbf", "output not utf-8-sig"
+
+    # Re-inject merge: a hand-added foreign key survives.
+    merged = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<LanguageData>\n'
+        '  <Seal.label>OLD</Seal.label>\n'
+        '  <ExtraKey>PRESERVED</ExtraKey>\n'
+        '</LanguageData>\n'
+    )
+    with open(out_path, "w", encoding="utf-8-sig") as f:
+        f.write(merged)
+    p.inject(root, tr, "Russian")
+    out_root2 = ET.parse(out_path).getroot()
+    out_kv2 = {el.tag: el.text for el in out_root2 if isinstance(el.tag, str)}
+    assert out_kv2.get("ExtraKey") == "PRESERVED", "foreign key not preserved on merge"
+    assert out_kv2.get("Seal.label") == "SEAL", "generated key not overwritten on merge"
+
+    # count_generated_definjected matches the generated key count.
+    from parsers.i18n import count_generated_definjected
+    assert count_generated_definjected(root) == len(expected), "count mismatch"
+
+    # Test partial author translation merge, ThingDef vs ThingDefs, and field case insensitivity.
+    root_part = tempfile.mkdtemp(prefix="interprex_rimworld_partial_")
+    try:
+        # 1. Defs/
+        p_defs_dir = os.path.join(root_part, "1.6", "Defs", "Things")
+        os.makedirs(p_defs_dir, exist_ok=True)
+        p_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<Defs>\n'
+            '  <ThingDef>\n'
+            '    <defName>Gizmo</defName>\n'
+            '    <label>gizmo device</label>\n'
+            '    <description>a fancy gizmo</description>\n'
+            '    <jobString>using gizmo</jobString>\n'
+            '  </ThingDef>\n'
+            '</Defs>\n'
+        )
+        with open(os.path.join(p_defs_dir, "Gizmos.xml"), "w", encoding="utf-8") as f:
+            f.write(p_xml)
+
+        # 2. Author translation in Languages/Russian/DefInjected/ThingDefs/ (with plural 's')
+        p_author_dir = os.path.join(root_part, "1.6", "Languages", "Russian", "DefInjected", "ThingDefs")
+        os.makedirs(p_author_dir, exist_ok=True)
+        p_author_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<LanguageData>\n'
+            '  <Gizmo.label>авторская штуковина</Gizmo.label>\n'
+            '  <Gizmo.jobstring>авторское использование</Gizmo.jobstring>\n'
+            '</LanguageData>\n'
+        )
+        with open(os.path.join(p_author_dir, "Gizmos.xml"), "w", encoding="utf-8") as f:
+            f.write(p_author_xml)
+
+        # count_generated_definjected must return 1 (only Gizmo.description is missing)
+        cnt = count_generated_definjected(root_part, "Russian")
+        assert cnt == 1, f"partial count mismatch: expected 1, got {cnt}"
+
+        # Extract should return all 3 strings, because it extracts raw defs
+        p_parser = get_parser("i18n")
+        p_strings = p_parser.extract(root_part)
+        p_gen = [s for s in p_strings if "RimWorld Defs |" in s.context]
+        assert len(p_gen) == 3, f"expected 3 extracted strings, got {len(p_gen)}"
+
+        p_tr = {s.id: s.original.upper() for s in p_gen}
+        p_written = p_parser.inject(root_part, p_tr, "Russian")
+        
+        # Output is generated inside "Russian (Русский)"
+        gen_out_path = os.path.join(root_part, "1.6", "Languages", "Russian (Русский)", "DefInjected", "ThingDef", "Gizmos.xml")
+        assert os.path.isfile(gen_out_path), "generated partial output file missing"
+
+        gen_tree = ET.parse(gen_out_path).getroot()
+        gen_kv = {el.tag: el.text for el in gen_tree if isinstance(el.tag, str)}
+        assert "Gizmo.description" in gen_kv, "Gizmo.description missing in generated xml"
+        assert gen_kv.get("Gizmo.description") == "A FANCY GIZMO"
+        assert "Gizmo.label" not in gen_kv, "Gizmo.label duplicated in generated xml"
+        assert "Gizmo.jobstring" not in gen_kv, "Gizmo.jobstring duplicated in generated xml"
+        assert "Gizmo.jobString" not in gen_kv, "Gizmo.jobString duplicated in generated xml"
+
+    finally:
+        shutil.rmtree(root_part, ignore_errors=True)
+
+    # --- Mods-mode: synthetic `file` MUST carry the mod-folder prefix so the
+    # string resolves to its mod (the table filter + inject key off `file`). A
+    # prior bug dropped the prefix -> generated strings belonged to NO mod, were
+    # hidden in the table but still counted by the progress bar (5955 vs 18818).
+    mroot = tempfile.mkdtemp(prefix="interprex_rimworld_modprefix_")
+    moddir = os.path.join(mroot, "SomeMod")
+    mdefs = os.path.join(moddir, "1.6", "Defs", "Things")
+    os.makedirs(mdefs, exist_ok=True)
+    os.makedirs(os.path.join(moddir, "About"), exist_ok=True)
+    with open(os.path.join(moddir, "About", "About.xml"), "w", encoding="utf-8") as f:
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n<ModMetaData><name>Some Mod</name></ModMetaData>\n')
+    with open(os.path.join(mdefs, "T.xml"), "w", encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0" encoding="utf-8"?>\n<Defs>\n'
+            '  <ThingDef><defName>Widget</defName><label>widget</label></ThingDef>\n'
+            '</Defs>\n'
+        )
+    mp = get_parser("i18n")
+    mres = [s for s in mp.extract(mroot, ["SomeMod"]) if "RimWorld Defs |" in s.context]
+    assert mres, "no generated strings in mods-mode extract"
+    for s in mres:
+        assert s.file.startswith("SomeMod/"), f"missing mod-folder prefix in file: {s.file}"
+    assert mres[0].file == "SomeMod/1.6/Languages/English/DefInjected/ThingDef/T.xml", \
+        f"unexpected synthetic file: {mres[0].file}"
+    # Inject lands the file inside the mod folder, under the target language.
+    mtr = {s.id: s.original.upper() for s in mres}
+    mp.inject(mroot, mtr, "Russian", ["SomeMod"])
+    mout = os.path.join(moddir, "1.6", "Languages", "Russian (Русский)",
+                        "DefInjected", "ThingDef", "T.xml")
+    assert os.path.isfile(mout), "mods-mode generated DefInjected not written inside mod folder"
+    shutil.rmtree(mroot, ignore_errors=True)
+
+    shutil.rmtree(root, ignore_errors=True)
+    print("check_i18n_rimworld_defs OK")
+
+
 def check_i18n() -> None:
     # Build a fake Stardew + RimWorld folder structure
     root = tempfile.mkdtemp(prefix="interprex_i18n_selftest_")
@@ -3495,6 +3752,7 @@ def check_scheduler() -> None:
         root = ""
         engine = ""
         free_only = False
+        extra_instruction = ""
 
         def __init__(self, items, api_key="K1", api_key_2="", threads=3,
                      provider="fake", delay_seconds=0.0):
@@ -4253,6 +4511,7 @@ def main() -> int:
     check_unity()
     check_unity_localization()
     check_i18n()
+    check_i18n_rimworld_defs()
     check_fusion()
     check_mmf2()
     check_qsp()

@@ -63,6 +63,8 @@ export interface TranslateOptions {
    *  write ("smooth" Noto vs "pixel" bitmap). Ren'Py menu choices only. */
   fontStyle?: string;
   groupSmallFiles?: string;
+  /** One-time user instruction for this run only (from Shift+Переперевести modal). Not persisted. */
+  extraInstruction?: string;
 }
 
 /**
@@ -98,6 +100,7 @@ export async function translateBatch(
       engine: strings[0]?.engine ?? "",
       font_style: opts.fontStyle ?? "smooth",
       group_small_files: opts.groupSmallFiles ?? "auto",
+      extra_instruction: opts.extraInstruction ?? "",
       items: strings.map((s) => ({
         id: s.id,
         text: s.original,

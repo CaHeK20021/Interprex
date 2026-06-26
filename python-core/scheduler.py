@@ -553,7 +553,7 @@ class TranslationScheduler:
         )
         exact = self.provider.count_tokens(
             build_prompt(batch, self.req.target_lang, self.req.glossary,
-                         self.req.engine), cfg
+                         self.req.engine, self.req.extra_instruction), cfg
         )
         if exact is None:
             return False
@@ -596,7 +596,7 @@ class TranslationScheduler:
             try:
                 prompt = build_prompt(
                     batch, self.req.target_lang, self.req.glossary,
-                    self.req.engine,
+                    self.req.engine, self.req.extra_instruction,
                 )
                 tr_res = self.provider.complete_prompt(prompt, batch, cfg)
                 res_queue.put((True, tr_res))
@@ -653,7 +653,7 @@ class TranslationScheduler:
             num_ctx=req.max_context_tokens,
         )
         prompt_chars = len(build_prompt(batch, req.target_lang, req.glossary,
-                                        req.engine))
+                                        req.engine, req.extra_instruction))
         batch_tr: dict[str, str] = {}
         last_err = None
         auth_fails = 0  # consecutive auth-class failures → kill the key fast
@@ -898,7 +898,7 @@ class TranslationScheduler:
             try:
                 retry_prompt = build_prompt(
                     retry_batch, self.req.target_lang, self.req.glossary,
-                    self.req.engine,
+                    self.req.engine, self.req.extra_instruction,
                 )
                 retry_tr = self.provider.complete_prompt(retry_prompt, retry_batch, cfg)
             except Exception as e_retry:  # noqa: BLE001

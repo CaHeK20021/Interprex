@@ -193,6 +193,10 @@ const en = {
     `${done} of ${total} strings were translated — fix the backend and run Translate again to finish the rest.`,
   translateErrors: (n: number) =>
     `Finished, but ${n} batch(es) failed and were left untranslated. Run Translate again to retry them.`,
+  translateSuccess: (unique: number, total: number) =>
+    total > unique
+      ? `Applied to ${total} cells (unique: ${unique})`
+      : `Translated cells: ${unique}`,
   backupStatusLabel: "Backup active:",
   restoreSuccess: "Original files restored successfully!",
   deleteBackupSuccess: "Backup deleted.",

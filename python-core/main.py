@@ -209,6 +209,9 @@ class TranslateReq(BaseModel):
     # matches what the player sees. Ren'Py menu choices only.
     font_style: str = "smooth"
     group_small_files: str = "auto"
+    # Optional one-time instruction appended to the system prompt for this run
+    # only (e.g. "translate Infinity as Бесконечность"). Not persisted.
+    extra_instruction: str = ""
 
 
 # Default window when the UI doesn't constrain it (cloud models, big local ones).
@@ -834,7 +837,27 @@ def detect_mods(req: DetectModsReq) -> dict:
     }
     
     mods_list = []
-    
+
+    def read_mod_display_name(mod_full_path: str, fallback: str) -> str:
+        """RimWorld (and other) workshop mods are folders named by numeric Steam
+        IDs; the human-readable name lives in About/About.xml <name>. Return it
+        when present, else the folder name."""
+        try:
+            for about_rel in ("About/About.xml", "about/about.xml"):
+                about_path = os.path.join(mod_full_path, *about_rel.split("/"))
+                if os.path.isfile(about_path):
+                    import xml.etree.ElementTree as ET
+                    # utf-8-sig: About.xml commonly ships with a BOM.
+                    with open(about_path, "r", encoding="utf-8-sig") as f:
+                        tree = ET.parse(f)
+                    node = tree.getroot().find("name")
+                    if node is not None and node.text and node.text.strip():
+                        return node.text.strip()
+                    break
+        except Exception as e:
+            logger.error(f"read_mod_display_name error for {mod_full_path}: {e}")
+        return fallback
+
     def count_mod_strings(mod_engine: str | None, mod_rel_path: str, target_lang: str | None = None) -> tuple[int, int, bool]:
         """Returns (translated_count, total_count, already_translated)."""
         if not mod_engine:
@@ -859,24 +882,48 @@ def detect_mods(req: DetectModsReq) -> dict:
                 return 0, 1, False
             # i18n / RimWorld XML: count translatable Keyed entries
             if mod_engine == "i18n":
-                from parsers.i18n import _find_rimworld_english_dirs, _rimworld_has_lang, flatten_json
-                # If target language already exists, mod is already translated
-                if target_lang and _rimworld_has_lang(str(p), target_lang):
-                    return 0, 0, True
+                from parsers.i18n import (
+                    _find_rimworld_english_dirs, _rimworld_has_lang, flatten_json,
+                    count_generated_definjected, _target_definjected_keys,
+                    _target_keyed_keys, _normalize_def_type, _dedup_field_key,
+                )
+                import os as _os
+                # A partially-translated mod (author shipped Languages/<target>/ but
+                # incomplete) must report only the MISSING strings, not be skipped
+                # whole. Count curated English keys NOT already in the target lang.
+                has_target = bool(target_lang) and _rimworld_has_lang(str(p), target_lang)
+                target_def_keys = _target_definjected_keys(str(p), target_lang) if has_target else set()
+                target_keyed_keys = _target_keyed_keys(str(p), target_lang) if has_target else set()
                 eng_dirs = _find_rimworld_english_dirs(str(p))
                 count = 0
                 for eng_dir in eng_dirs:
                     for xml_path in Path(eng_dir).rglob("*.xml"):
                         try:
                             import xml.etree.ElementTree as ET
+                            xrl = str(xml_path).lower()
+                            is_def = "definjected" in xrl
+                            dt_norm = _normalize_def_type(_os.path.basename(_os.path.dirname(str(xml_path))))
                             tree = ET.parse(str(xml_path))
                             for child in tree.getroot():
                                 if isinstance(child.tag, str) and child.text and child.text.strip():
+                                    # Skip keys the author already translated.
+                                    if is_def and (dt_norm, _dedup_field_key(child.tag)) in target_def_keys:
+                                        continue
+                                    if not is_def and child.tag in target_keyed_keys:
+                                        continue
                                     count += 1
                         except Exception:
                             pass
+                # Add strings generated from Defs/ (the bulk of mod text; most mods
+                # ship no curated English DefInjected). Deduped vs curated AND vs the
+                # target language's existing author translation.
+                count += count_generated_definjected(str(p), target_lang)
                 if count:
                     return 0, count, False
+                # No missing strings. If the target language already exists, the mod
+                # is fully translated; else it simply has nothing to translate.
+                if has_target:
+                    return 0, 0, True
                 # Stardew Valley i18n
                 stardew_json = p / "i18n" / "default.json"
                 if stardew_json.is_file():
@@ -919,7 +966,7 @@ def detect_mods(req: DetectModsReq) -> dict:
                                 rel_path = os.path.relpath(sub_full_path, root).replace("\\", "/")
                                 x, n, already = count_mod_strings(engine, rel_path, req.target_lang)
                                 mods_list.append({
-                                    "name": sub_name,
+                                    "name": read_mod_display_name(sub_full_path, sub_name),
                                     "path": rel_path,
                                     "engine": engine,
                                     "translated_count": x,
@@ -934,7 +981,7 @@ def detect_mods(req: DetectModsReq) -> dict:
                 rel_path = os.path.relpath(full_path, root).replace("\\", "/")
                 x, n, already = count_mod_strings(engine, rel_path, req.target_lang)
                 mods_list.append({
-                    "name": name,
+                    "name": read_mod_display_name(full_path, name),
                     "path": rel_path,
                     "engine": engine,
                     "translated_count": x,

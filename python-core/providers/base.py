@@ -112,13 +112,16 @@ SYSTEM_INSTRUCTION = _SYSTEM_CORE
 
 
 def build_prompt(items: list[TranslateItem], lang: str,
-                 glossary: dict[str, str], engine: str = "") -> str:
+                 glossary: dict[str, str], engine: str = "",
+                 extra_instruction: str = "") -> str:
     """One prompt for a whole batch. Keyed by id both ways so the mapping back
     is unambiguous regardless of order or reworded output.
 
     `engine` — when non-empty, the matching parser's engine_prompt_addon() is
     appended after the core instructions. Unknown or empty engine degrades
-    gracefully to the core-only prompt (no crash)."""
+    gracefully to the core-only prompt (no crash).
+    `extra_instruction` — optional one-time rule from the user for this run
+    only (e.g. "translate Infinity as Бесконечность")."""
     lines = [_SYSTEM_CORE.format(lang=lang), ""]
 
     # Engine-specific instructions: load the parser's addon and insert it after
@@ -133,6 +136,13 @@ def build_prompt(items: list[TranslateItem], lang: str,
                 lines.append("")
         except Exception:
             pass  # unknown engine or import error — degrade to core-only
+
+    # One-time user instruction: inserted prominently before the glossary so the
+    # model sees it as a high-priority constraint for this batch.
+    if extra_instruction and extra_instruction.strip():
+        lines.append("Additional instruction for this translation run (apply to every string):")
+        lines.append(extra_instruction.strip())
+        lines.append("")
 
     if glossary:
         lines.append("Glossary (use these translations consistently):")
