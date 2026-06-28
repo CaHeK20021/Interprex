@@ -839,6 +839,8 @@ class I18nParser(BaseParser):
             # file must still skip it, or we'd duplicate and crash.)
             author_def_keys: set = set()
             author_keyed_keys: set = set()
+            alt_def_translations: dict[tuple[str, str], str] = {}
+            alt_keyed_translations: dict[str, str] = {}
             try:
                 created_files: set = set()
                 meta_path = os.path.join(root, ".interprex_backups", "metadata.json")
@@ -852,7 +854,9 @@ class I18nParser(BaseParser):
                     except Exception:
                         pass
 
+                lang_folder = get_rimworld_folder(target_lang)
                 for target_dir in _find_rimworld_target_dirs(base_path, target_lang):
+                    is_primary = (os.path.basename(target_dir) == lang_folder)
                     for sub, is_def in (("DefInjected", True), ("Keyed", False)):
                         sub_dir = os.path.join(target_dir, sub)
                         if not os.path.isdir(sub_dir):
@@ -868,12 +872,18 @@ class I18nParser(BaseParser):
                                     continue
                                 try:
                                     for ch in ET.parse(fpath).getroot():
-                                        if not isinstance(ch.tag, str):
+                                        if not isinstance(ch.tag, str) or ch.text is None:
                                             continue
-                                        if is_def:
-                                            author_def_keys.add((dt_norm, _dedup_field_key(ch.tag)))
+                                        if is_primary:
+                                            if is_def:
+                                                author_def_keys.add((dt_norm, _dedup_field_key(ch.tag)))
+                                            else:
+                                                author_keyed_keys.add(ch.tag)
                                         else:
-                                            author_keyed_keys.add(ch.tag)
+                                            if is_def:
+                                                alt_def_translations[(dt_norm, _dedup_field_key(ch.tag))] = ch.text
+                                            else:
+                                                alt_keyed_translations[ch.tag] = ch.text
                                 except Exception:
                                     pass
             except Exception as e:
@@ -971,6 +981,15 @@ class I18nParser(BaseParser):
                                         sid = make_id(self.engine, source_rel, [child.tag], child.text)
                                         if sid in translations:
                                             file_translations[child.tag] = translations[sid]
+                                        else:
+                                            # Fallback to alternative translation if available
+                                            if is_definjected:
+                                                alt_key = (src_def_type, _dedup_field_key(child.tag))
+                                                if alt_key in alt_def_translations:
+                                                    file_translations[child.tag] = alt_def_translations[alt_key]
+                                            else:
+                                                if child.tag in alt_keyed_translations:
+                                                    file_translations[child.tag] = alt_keyed_translations[child.tag]
 
                                 if not file_translations and not os.path.isfile(target_filepath):
                                     # Nothing to write and target doesn't exist, skip
@@ -1039,15 +1058,25 @@ class I18nParser(BaseParser):
                     if (_normalize_def_type(def_type), _dedup_field_key(key)) in author_def_keys:
                         continue
                     sid = make_id(self.engine, synthetic_file, [key], original)
-                    if sid not in translations:
+
+                    trans_val = None
+                    if sid in translations:
+                        trans_val = translations[sid]
+                    else:
+                        alt_key = (_normalize_def_type(def_type), _dedup_field_key(key))
+                        if alt_key in alt_def_translations:
+                            trans_val = alt_def_translations[alt_key]
+
+                    if trans_val is None:
                         continue
+
                     # Same Languages/English -> Languages/<lang> rewrite as step 2.
                     idx = synthetic_file.find("Languages/English")
                     if idx != -1:
                         out_rel = synthetic_file[:idx] + "Languages/" + lang_folder + synthetic_file[idx + len("Languages/English"):]
                     else:
                         out_rel = synthetic_file.replace("Languages/English", "Languages/" + lang_folder)
-                    grouped.setdefault(out_rel, {})[key] = translations[sid]
+                    grouped.setdefault(out_rel, {})[key] = trans_val
 
                 for out_rel, kv in grouped.items():
                     target_filepath = os.path.join(root, *out_rel.split("/"))

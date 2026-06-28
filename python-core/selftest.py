@@ -2095,7 +2095,8 @@ def check_i18n_rimworld_defs() -> None:
         p_gen = [s for s in p_strings if "RimWorld Defs |" in s.context]
         assert len(p_gen) == 3, f"expected 3 extracted strings, got {len(p_gen)}"
 
-        p_tr = {s.id: s.original.upper() for s in p_gen}
+        # Pass only description translation, others should be copied from alternative folder (Russian)
+        p_tr = {s.id: s.original.upper() for s in p_gen if any("description" in part for part in s.path)}
         p_written = p_parser.inject(root_part, p_tr, "Russian")
         
         # Output is generated inside "Russian (Русский)"
@@ -2106,9 +2107,12 @@ def check_i18n_rimworld_defs() -> None:
         gen_kv = {el.tag: el.text for el in gen_tree if isinstance(el.tag, str)}
         assert "Gizmo.description" in gen_kv, "Gizmo.description missing in generated xml"
         assert gen_kv.get("Gizmo.description") == "A FANCY GIZMO"
-        assert "Gizmo.label" not in gen_kv, "Gizmo.label duplicated in generated xml"
-        assert "Gizmo.jobstring" not in gen_kv, "Gizmo.jobstring duplicated in generated xml"
-        assert "Gizmo.jobString" not in gen_kv, "Gizmo.jobString duplicated in generated xml"
+        
+        # Copied from alternative Russian folder
+        assert "Gizmo.label" in gen_kv, "Gizmo.label was not copied from alternative folder"
+        assert gen_kv.get("Gizmo.label") == "авторская штуковина"
+        assert "Gizmo.jobString" in gen_kv, "Gizmo.jobString was not copied from alternative folder"
+        assert gen_kv.get("Gizmo.jobString") == "авторское использование"
 
     finally:
         shutil.rmtree(root_part, ignore_errors=True)

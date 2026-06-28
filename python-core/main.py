@@ -1742,7 +1742,8 @@ def backup_restore(req: BackupRestoreReq) -> dict:
                     orig_bytes = f.read()
             elif os.path.exists(patch_file):
                 if not os.path.exists(target_file):
-                    raise FileNotFoundError(f"Modified file not found to revert: {rel_path}")
+                    logger.warning(f"Modified file not found to revert: {rel_path}. Skipping.")
+                    continue
                 with open(patch_file, "rb") as f:
                     patch_bytes = f.read()
                 with open(target_file, "rb") as f:
