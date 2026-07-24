@@ -1656,6 +1656,8 @@ export default function App() {
         await saveProject(currentProject);
         setPhase("idle");
         if (result.aborted) {
+          // Stop the full pipeline (writeBack / python / autofix) — partial
+          // rows are already auto-saved to the project file.
           ok = false;
           const done = Object.keys(result.translations).length;
           const details = result.errors.length
@@ -1663,8 +1665,16 @@ export default function App() {
             : "";
           setError((t("translateAborted")(done, todo.length) as string) + details);
         } else if (result.errors.length) {
+          // Errors mean failed batches / dead keys. MUST stop the pipeline:
+          // previously ok stayed true, so "Translate" proceeded to Ren'Py
+          // Python-string translation with a broken API key (User not found
+          // etc.) and burned more quota after a partial main pass.
+          ok = false;
+          const done = Object.keys(result.translations).length;
           const details = result.errors.map((err) => `• ${err}`).join("\n");
-          setError(`${t("translateErrors")(result.errors.length) as string}\n\n${details}`);
+          setError(
+            `${t("translateErrors")(result.errors.length, done, todo.length) as string}\n\n${details}`,
+          );
         } else {
           const uniqueCount = Object.keys(result.translations).length;
           if (uniqueCount > 0) {

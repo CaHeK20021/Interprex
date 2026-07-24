@@ -91,6 +91,11 @@ def _classify_error(msg: str) -> str:
         "401", "403", "api key not valid", "invalid api key", "invalid_api_key",
         "api_key_invalid", "permission", "unauthor", "expired", "billing",
         "no gemini api key", "no openrouter", "credentials",
+        # OpenRouter returns plain "User not found" (often HTTP 404) for a
+        # deleted/invalid account or key — permanent for this run, fail the
+        # key fast instead of burning BATCH_TRIES (=100) "other" retries.
+        "user not found", "invalid key", "key not found", "no credits",
+        "insufficient credits", "insufficient funds",
     )
     if any(k in m for k in auth_markers):
         return "auth"

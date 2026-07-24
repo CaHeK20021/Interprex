@@ -3713,6 +3713,14 @@ def check_scheduler() -> None:
     import scheduler
     from providers.base import TranslateResult, Usage
 
+    # Error-class buckets: permanent key/account failures must be "auth" so the
+    # worker fails the key in 2 tries instead of burning BATCH_TRIES (=100)
+    # "other" retries. OpenRouter's plain "User not found" was the real case.
+    assert scheduler._classify_error("User not found") == "auth"
+    assert scheduler._classify_error("Error code: 401 - Unauthorized") == "auth"
+    assert scheduler._classify_error("429 Too Many Requests") == "rate"
+    assert scheduler._classify_error("parse hiccup in batch") == "other"
+
     saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
              scheduler.get_provider)
     scheduler._RETRY_BACKOFF_FIRST = 0

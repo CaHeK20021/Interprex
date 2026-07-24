@@ -191,8 +191,10 @@ const en = {
   translateAborted: (done: number, total: number) =>
     `Translation stopped: the model stopped responding after retries. ` +
     `${done} of ${total} strings were translated — fix the backend and run Translate again to finish the rest.`,
-  translateErrors: (n: number) =>
-    `Finished, but ${n} batch(es) failed and were left untranslated. Run Translate again to retry them.`,
+  translateErrors: (n: number, done: number, total: number) =>
+    `Translation stopped: ${n} batch(es) failed (API error / bad key / provider). ` +
+    `${done} of ${total} strings translated this run were saved — the rest stay untranslated. ` +
+    `Fix the provider/key and press Translate again. Write-back and Python-string steps did NOT run.`,
   translateSuccess: (unique: number, total: number) =>
     total > unique
       ? `Applied to ${total} cells (unique: ${unique})`
