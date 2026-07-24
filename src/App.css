@@ -553,6 +553,137 @@ button.btn-danger:hover:not(:disabled) {
   color: var(--text);
 }
 
+/* Translate session log — small button next to threads + modal with live errors */
+.session-log-btn {
+  align-self: flex-end;
+  position: relative;
+  min-width: 52px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.session-log-btn.has-errors {
+  border-color: #f87272;
+  color: #fca5a5;
+}
+.session-log-btn.has-ok {
+  border-color: #4ade80;
+  color: #86efac;
+}
+.session-log-badge {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #364052;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.session-log-btn.has-errors .session-log-badge {
+  background: #7f1d1d;
+  color: #fecaca;
+}
+.session-log-btn.has-ok .session-log-badge {
+  background: #14532d;
+  color: #bbf7d0;
+}
+
+.session-log-modal {
+  max-width: 560px;
+  width: min(94vw, 560px);
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+}
+.session-log-modal .modal-actions {
+  margin-top: 12px;
+  flex-shrink: 0;
+}
+.session-log-meta {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  background: #0f1218;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+.session-log-success {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, #22c55e 12%, var(--panel));
+  border: 1px solid color-mix(in srgb, #22c55e 35%, var(--line));
+  color: #86efac;
+  font-size: 14px;
+  font-weight: 600;
+}
+.session-log-req {
+  font-weight: 500;
+  opacity: 0.85;
+  font-size: 12px;
+}
+.session-log-errors-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fca5a5;
+  margin-bottom: 8px;
+}
+.session-log-empty {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.session-log-errors {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 80px;
+  max-height: 42vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f1218;
+}
+.session-log-errors li {
+  display: flex;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.4;
+  align-items: flex-start;
+}
+.session-log-errors li:last-child {
+  border-bottom: none;
+}
+.session-log-ts {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  padding-top: 1px;
+}
+.session-log-err-text {
+  color: #fecaca;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
 .extra-instruction-textarea {
   width: 100%;
   height: 100px;

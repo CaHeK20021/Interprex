@@ -720,6 +720,19 @@ class TranslationScheduler:
                     json.dumps(batch_contents, ensure_ascii=False)[:2000],
                 )
                 last_err = e
+                # Live error for the UI session log — every failed attempt, not
+                # only terminal ones (so 429 spam / auth / parse fail is visible
+                # mid-run without opening interprex.log).
+                bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
+                self._emit(
+                    worker_idx,
+                    "batch_error",
+                    status=f"Batch error (try {try_i + 1}): {err_str[:220]}",
+                    last_error=err_str[:800],
+                    batch_num=bnum,
+                    batch_size=len(batch),
+                    try_i=try_i,
+                )
                 # A failed request that still reached the server spent the quota.
                 if _reached_server(err_str):
                     with self.cond:

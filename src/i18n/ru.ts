@@ -89,6 +89,20 @@ const ru: Strings = {
   workerLabel: (n: number) => `Поток ${n}`,
   workersToggleExpand: "Показать все потоки",
   workersToggleCollapse: "Свернуть потоки",
+  sessionLogBtn: "Лог",
+  sessionLogBtnHint:
+    "Этот сеанс перевода: успешные батчи и каждая ошибка API. " +
+    "Сбрасывается при новом «Перевести» для этой папки.",
+  sessionLogTitle: "Сеанс перевода",
+  sessionLogEmpty: "Пока нет запуска. Нажми «Перевести» — события появятся здесь вживую.",
+  sessionLogSuccess: (batches: number, strings: number) =>
+    `Успешно: ${batches} батч(ей), ${strings} строк(и) в этом запуске`,
+  sessionLogErrorsTitle: (n: number) => `Ошибки (${n})`,
+  sessionLogNoErrors: "Ошибок пока нет.",
+  sessionLogMeta: (provider: string, model: string, root: string) =>
+    `${provider}${model ? " · " + model : ""}${root ? "\n" + root : ""}`,
+  sessionLogClose: "Закрыть",
+  sessionLogRequests: (n: number) => `Запросов отправлено: ${n}`,
   openrouterDailyUsage: (used: number, cap: number) =>
     `Бесплатных запросов сегодня: ${used} / ${cap}`,
   openrouterDailyUsageHint:

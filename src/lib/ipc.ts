@@ -291,6 +291,7 @@ export interface TranslateProgress {
     | "waiting_retry"
     | "waiting_delay" // pacing: holding the request to the min duration
     | "resting" // idle by priority ramp-down (the pool is too shallow)
+    | "batch_error" // one attempt failed (retry may follow); live session log
     | "error" // this worker's key failed
     | "done"; // this worker finished cleanly
   batch_num?: number;
@@ -305,6 +306,8 @@ export interface TranslateProgress {
   // Requests that reached the provider this run (success + error responses), for
   // the OpenRouter daily-quota readout. Absolute count, not a delta.
   requests_sent?: number;
+  /** Live error text for the session log (batch attempt failures). */
+  last_error?: string;
 }
 
 export interface TranslateResult {
@@ -369,6 +372,7 @@ export async function translateViaSidecar(
         key_idx: evt.key_idx,
         wait_left: evt.wait_left,
         requests_sent: evt.requests_sent,
+        last_error: evt.last_error,
       });
     } else if (evt.type === "done") {
       result = {

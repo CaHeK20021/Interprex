@@ -21,7 +21,9 @@ from pathlib import Path
 
 is_frozen = getattr(sys, "frozen", False)
 
-handlers = [logging.FileHandler("interprex.log", encoding="utf-8")]
+# mode="w": truncate on every sidecar start so interprex.log is only THIS run,
+# not years of append growth (was 16MB+ of stale history under AppData).
+handlers = [logging.FileHandler("interprex.log", mode="w", encoding="utf-8")]
 if not is_frozen:
     handlers.append(logging.StreamHandler())
 

@@ -552,6 +552,22 @@ export default function App() {
   const [workerPhases, setWorkerPhases] = useState<Record<number, string>>({});
   // Is the worker-status panel expanded? Only meaningful when threads*keys > 2.
   const [workersPanelOpen, setWorkersPanelOpen] = useState(false);
+  // Live translate-session log (this folder, this run). Survives after the run
+  // so the user can open it and see why nothing moved; resets on next Translate.
+  type SessionLogErr = { id: number; ts: number; text: string };
+  type SessionLog = {
+    root: string;
+    provider: string;
+    model: string;
+    startedAt: number;
+    successBatches: number;
+    successStrings: number;
+    requestsSent: number;
+    errors: SessionLogErr[];
+  };
+  const [sessionLog, setSessionLog] = useState<SessionLog | null>(null);
+  const [sessionLogOpen, setSessionLogOpen] = useState(false);
+  const sessionErrIdRef = useRef(0);
   // OpenRouter daily free-request budget badge: {used, cap} or null if N/A.
   const [orUsage, setOrUsage] = useState<{ used: number; cap: number } | null>(null);
   // Today's count BEFORE this run started: the run reports requests_sent as an
@@ -1549,6 +1565,19 @@ export default function App() {
       // onto it (and resets cleanly if midnight UTC passed since the last run).
       orUsageBaseRef.current = readOrUsageCount();
 
+      // Fresh session log for this Translate press (folder + provider snapshot).
+      sessionErrIdRef.current = 0;
+      setSessionLog({
+        root: activeRoot ?? "",
+        provider,
+        model,
+        startedAt: Date.now(),
+        successBatches: 0,
+        successStrings: 0,
+        requestsSent: 0,
+        errors: [],
+      });
+
       const controller = new AbortController();
       setAbortController(controller);
 
@@ -1594,6 +1623,36 @@ export default function App() {
               const used = writeOrUsageCount(orUsageBaseRef.current + p.requests_sent);
               setOrUsage((prev) => (prev ? { ...prev, used } : prev));
             }
+            // Session log: successes + live errors (batch_error / key death).
+            setSessionLog((prev) => {
+              if (!prev) return prev;
+              let next = prev;
+              if (p.requests_sent !== undefined && p.requests_sent !== prev.requestsSent) {
+                next = { ...next, requestsSent: p.requests_sent };
+              }
+              const nTr = Object.keys(p.translations).length;
+              if (nTr > 0 && p.phase === "completed_batch") {
+                next = {
+                  ...next,
+                  successBatches: next.successBatches + 1,
+                  successStrings: next.successStrings + nTr,
+                };
+              }
+              if (p.last_error || p.phase === "batch_error" || p.phase === "error") {
+                const raw = (p.last_error || p.status || "error").trim();
+                if (raw) {
+                  const w = wi !== undefined ? `W${wi + 1}` : "?";
+                  const tryN = p.try_i !== undefined ? ` try ${p.try_i + 1}` : "";
+                  const b = p.batch_num !== undefined ? ` batch ${p.batch_num}` : "";
+                  const text = `[${w}${b}${tryN}] ${raw}`;
+                  // Cap list so a 100-retry storm doesn't freeze the UI.
+                  const errors = [...next.errors, { id: ++sessionErrIdRef.current, ts: Date.now(), text }];
+                  if (errors.length > 500) errors.splice(0, errors.length - 500);
+                  next = { ...next, errors };
+                }
+              }
+              return next === prev ? prev : next;
+            });
             // Fill rows live: merge each batch's translations into the project as
             // they land, so the table updates as the model works instead of all at
             // the end.
@@ -1655,6 +1714,18 @@ export default function App() {
         setPhase("saving");
         await saveProject(currentProject);
         setPhase("idle");
+        // Merge terminal errors into the session log (dedupe by text).
+        if (result.errors.length) {
+          setSessionLog((prev) => {
+            if (!prev) return prev;
+            const have = new Set(prev.errors.map((e) => e.text));
+            const add = result.errors
+              .filter((e) => e && !have.has(e))
+              .map((text) => ({ id: ++sessionErrIdRef.current, ts: Date.now(), text }));
+            if (!add.length) return prev;
+            return { ...prev, errors: [...prev.errors, ...add].slice(-500) };
+          });
+        }
         if (result.aborted) {
           // Stop the full pipeline (writeBack / python / autofix) — partial
           // rows are already auto-saved to the project file.
@@ -1687,6 +1758,28 @@ export default function App() {
       }
     } catch (e) {
       ok = false;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!(e instanceof Error && e.name === "AbortError") && !(e instanceof DOMException && e.name === "AbortError")) {
+        setSessionLog((prev) => {
+          const base = prev ?? {
+            root: activeRoot ?? "",
+            provider,
+            model,
+            startedAt: Date.now(),
+            successBatches: 0,
+            successStrings: 0,
+            requestsSent: 0,
+            errors: [] as SessionLogErr[],
+          };
+          return {
+            ...base,
+            errors: [
+              ...base.errors,
+              { id: ++sessionErrIdRef.current, ts: Date.now(), text: msg },
+            ].slice(-500),
+          };
+        });
+      }
       if (e instanceof Error && e.name === "AbortError" || (e instanceof DOMException && e.name === "AbortError")) {
         setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
         setProgress(null);
@@ -2265,6 +2358,9 @@ export default function App() {
         p.elapsed ?? 0,
         p.try_i !== undefined ? p.try_i + 1 : 1
       ) as string;
+    } else if (p.phase === "batch_error") {
+      // Live attempt failure — keep the card readable (full text is in session log).
+      return (p.status || t("statusWorkerError")) as string;
     } else if (p.phase === "waiting_retry") {
       return t("statusWaitingRetry")(
         p.batch_num ?? 1,
@@ -2978,7 +3074,7 @@ export default function App() {
                 const tone =
                   ph === "completed_batch"
                     ? "ok"
-                    : ph === "error"
+                    : ph === "error" || ph === "batch_error"
                       ? "err"
                       : ph === "translating_batch" || ph === "initializing"
                         ? "busy"
@@ -3176,6 +3272,23 @@ export default function App() {
             </label>
           </>
         )}
+
+        {/* Session log: sits just right of threads/RPM (or of model when local). */}
+        <button
+          type="button"
+          className={`session-log-btn btn-secondary ${sessionLog?.errors.length ? "has-errors" : ""} ${sessionLog && sessionLog.successBatches > 0 && !sessionLog.errors.length ? "has-ok" : ""}`}
+          title={t("sessionLogBtnHint") as string}
+          onClick={() => setSessionLogOpen(true)}
+        >
+          {t("sessionLogBtn") as string}
+          {sessionLog && (sessionLog.errors.length > 0 || sessionLog.successBatches > 0) && (
+            <span className="session-log-badge">
+              {sessionLog.errors.length > 0
+                ? sessionLog.errors.length
+                : sessionLog.successBatches}
+            </span>
+          )}
+        </button>
 
         {/* OpenRouter daily free-request budget. Count is local (the API doesn't
             report spent-today); cap comes from the key's tier. */}
@@ -3810,6 +3923,63 @@ export default function App() {
         </div>
       )}
 
+      {sessionLogOpen && (
+        <div className="modal-overlay" onClick={() => setSessionLogOpen(false)}>
+          <div
+            className="modal-content session-log-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="normal-title">{t("sessionLogTitle") as string}</h2>
+            {!sessionLog ? (
+              <p className="session-log-empty">{t("sessionLogEmpty") as string}</p>
+            ) : (
+              <>
+                <pre className="session-log-meta">
+                  {t("sessionLogMeta")(
+                    sessionLog.provider,
+                    sessionLog.model,
+                    sessionLog.root,
+                  ) as string}
+                </pre>
+                <div className="session-log-success">
+                  {t("sessionLogSuccess")(
+                    sessionLog.successBatches,
+                    sessionLog.successStrings,
+                  ) as string}
+                  {sessionLog.requestsSent > 0 && (
+                    <span className="session-log-req">
+                      {" · "}
+                      {t("sessionLogRequests")(sessionLog.requestsSent) as string}
+                    </span>
+                  )}
+                </div>
+                <div className="session-log-errors-head">
+                  {t("sessionLogErrorsTitle")(sessionLog.errors.length) as string}
+                </div>
+                {sessionLog.errors.length === 0 ? (
+                  <p className="session-log-empty">{t("sessionLogNoErrors") as string}</p>
+                ) : (
+                  <ul className="session-log-errors">
+                    {[...sessionLog.errors].reverse().map((e) => (
+                      <li key={e.id}>
+                        <span className="session-log-ts">
+                          {new Date(e.ts).toLocaleTimeString()}
+                        </span>
+                        <span className="session-log-err-text">{e.text}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setSessionLogOpen(false)}>
+                {t("sessionLogClose") as string}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {pythonLogs.length > 0 && (
         <div

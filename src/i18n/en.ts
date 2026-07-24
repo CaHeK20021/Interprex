@@ -91,6 +91,20 @@ const en = {
   workerLabel: (n: number) => `Thread ${n}`,
   workersToggleExpand: "Show all threads",
   workersToggleCollapse: "Collapse threads",
+  sessionLogBtn: "Log",
+  sessionLogBtnHint:
+    "This translate session: successful batches and every API error. " +
+    "Resets when you start a new Translate on this folder.",
+  sessionLogTitle: "Translate session",
+  sessionLogEmpty: "No translate run yet this session. Press Translate — events will show up here live.",
+  sessionLogSuccess: (batches: number, strings: number) =>
+    `OK: ${batches} batch(es), ${strings} string(s) this run`,
+  sessionLogErrorsTitle: (n: number) => `Errors (${n})`,
+  sessionLogNoErrors: "No errors yet.",
+  sessionLogMeta: (provider: string, model: string, root: string) =>
+    `${provider}${model ? " · " + model : ""}${root ? "\n" + root : ""}`,
+  sessionLogClose: "Close",
+  sessionLogRequests: (n: number) => `Requests sent: ${n}`,
   openrouterDailyUsage: (used: number, cap: number) =>
     `Free requests today: ${used} / ${cap}`,
   openrouterDailyUsageHint:
