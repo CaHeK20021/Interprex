@@ -91,13 +91,16 @@ const ru: Strings = {
   workersToggleCollapse: "Свернуть потоки",
   sessionLogBtn: "Лог",
   sessionLogBtnHint:
-    "Этот сеанс перевода: успешные батчи и каждая ошибка API. " +
-    "Сбрасывается при новом «Перевести» для этой папки.",
+    "Этот запуск: успешные батчи + ошибки, сгруппированные со счётчиком (×N). " +
+    "Сбрасывается при новом «Перевести».",
   sessionLogTitle: "Сеанс перевода",
-  sessionLogEmpty: "Пока нет запуска. Нажми «Перевести» — события появятся здесь вживую.",
+  sessionLogEmpty: "Пока нет запуска. Нажми «Перевести» — статистика появится здесь вживую.",
   sessionLogSuccess: (batches: number, strings: number) =>
-    `Успешно: ${batches} батч(ей), ${strings} строк(и) в этом запуске`,
-  sessionLogErrorsTitle: (n: number) => `Ошибки (${n})`,
+    `Успешно: ${batches} батч(ей) × ${strings} строк`,
+  sessionLogErrorsTitle: (attempts: number, kinds: number) =>
+    attempts === 0
+      ? "Ошибки"
+      : `Неудачных попыток: ${attempts}${kinds > 1 ? ` · ${kinds} вида` : ""}`,
   sessionLogNoErrors: "Ошибок пока нет.",
   sessionLogMeta: (provider: string, model: string, root: string) =>
     `${provider}${model ? " · " + model : ""}${root ? "\n" + root : ""}`,

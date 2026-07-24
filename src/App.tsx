@@ -82,6 +82,138 @@ function rpmToDelay(rpm: number, threads: number): number {
   return (threads * 60) / rpm;
 }
 
+/** One row in the translate session log: identical failures are COUNTED, not listed. */
+type SessionErrorGroup = {
+  key: string;
+  label: string;
+  count: number;
+  lastTs: number;
+};
+
+type SessionLog = {
+  root: string;
+  provider: string;
+  model: string;
+  startedAt: number;
+  successBatches: number;
+  successStrings: number;
+  requestsSent: number;
+  /** Failed HTTP/API attempts (including retries), aggregated by kind. */
+  errorGroups: SessionErrorGroup[];
+  /** Sum of errorGroups[].count — total failed attempts this run. */
+  errorAttempts: number;
+};
+
+function emptySessionLog(
+  root: string,
+  provider: string,
+  model: string,
+): SessionLog {
+  return {
+    root,
+    provider,
+    model,
+    startedAt: Date.now(),
+    successBatches: 0,
+    successStrings: 0,
+    requestsSent: 0,
+    errorGroups: [],
+    errorAttempts: 0,
+  };
+}
+
+/**
+ * Collapse raw provider noise into a stable bucket so 20× the same 429 becomes
+ * one line with ×20, not W1 try 1…20 spam.
+ */
+function classifySessionError(raw: string): { key: string; label: string } {
+  const s = (raw || "").trim();
+  const m = s.toLowerCase();
+  if (
+    m.includes("429") ||
+    m.includes("rate limit") ||
+    m.includes("too many") ||
+    m.includes("overloaded") ||
+    m.includes("provider returned error") ||
+    m.includes("no available provider") ||
+    m.includes("resource exhausted") ||
+    m.includes("capacity") ||
+    m.includes("server is busy")
+  ) {
+    return { key: "rate", label: "429 / overload — provider rate limit" };
+  }
+  if (
+    m.includes("401") ||
+    m.includes("403") ||
+    m.includes("user not found") ||
+    m.includes("invalid api key") ||
+    m.includes("invalid key") ||
+    m.includes("unauthorized") ||
+    m.includes("api key not valid") ||
+    m.includes("key looks invalid")
+  ) {
+    return { key: "auth", label: "401/403 — bad or dead API key" };
+  }
+  if (
+    m.includes("gemini_safety") ||
+    m.includes("prohibited_content") ||
+    m.includes("safety policy") ||
+    m.includes("safety block") ||
+    m.includes("blocked by gemini")
+  ) {
+    return { key: "safety", label: "Safety filter — batch blocked (18+ / policy)" };
+  }
+  if (
+    m.includes("'choices'") ||
+    m.includes('"choices"') ||
+    (m.includes("choices") && m.includes("keyerror")) ||
+    m.includes("json decode") ||
+    m.includes("parsed successfully, but returned 0") ||
+    m.includes("no matching translation")
+  ) {
+    return { key: "parse", label: "Empty/broken model reply (no usable translations)" };
+  }
+  if (
+    m.includes("connect") ||
+    m.includes("timeout") ||
+    m.includes("network") ||
+    m.includes("dns") ||
+    m.includes("не удалось подключиться")
+  ) {
+    return { key: "network", label: "Network / timeout — request never completed" };
+  }
+  if (m.includes("402") || m.includes("insufficient") || m.includes("no credits") || m.includes("billing")) {
+    return { key: "billing", label: "402 / no credits — payment or balance" };
+  }
+  // Strip worker/batch prefixes if present; keep a short unique tail as the key.
+  const cleaned = s
+    .replace(/^\[Worker\s*\d+\]\s*/i, "")
+    .replace(/^\[W\d+[^\]]*\]\s*/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  return { key: `other:${cleaned.toLowerCase()}`, label: cleaned || "Unknown error" };
+}
+
+function bumpSessionError(log: SessionLog, raw: string): SessionLog {
+  const { key, label } = classifySessionError(raw);
+  const now = Date.now();
+  const groups = [...log.errorGroups];
+  const i = groups.findIndex((g) => g.key === key);
+  if (i >= 0) {
+    groups[i] = { ...groups[i], count: groups[i].count + 1, lastTs: now, label };
+  } else {
+    groups.push({ key, label, count: 1, lastTs: now });
+  }
+  // Hottest / most recent first.
+  groups.sort((a, b) => b.count - a.count || b.lastTs - a.lastTs);
+  return {
+    ...log,
+    errorGroups: groups,
+    errorAttempts: log.errorAttempts + 1,
+  };
+}
+
 function writeOrUsageCount(total: number): number {
   const safe = Math.max(0, Math.floor(total));
   saveSetting("openrouterUsageDate", utcDay());
@@ -554,20 +686,9 @@ export default function App() {
   const [workersPanelOpen, setWorkersPanelOpen] = useState(false);
   // Live translate-session log (this folder, this run). Survives after the run
   // so the user can open it and see why nothing moved; resets on next Translate.
-  type SessionLogErr = { id: number; ts: number; text: string };
-  type SessionLog = {
-    root: string;
-    provider: string;
-    model: string;
-    startedAt: number;
-    successBatches: number;
-    successStrings: number;
-    requestsSent: number;
-    errors: SessionLogErr[];
-  };
+  // Errors are GROUPED (×N), not one line per retry.
   const [sessionLog, setSessionLog] = useState<SessionLog | null>(null);
   const [sessionLogOpen, setSessionLogOpen] = useState(false);
-  const sessionErrIdRef = useRef(0);
   // OpenRouter daily free-request budget badge: {used, cap} or null if N/A.
   const [orUsage, setOrUsage] = useState<{ used: number; cap: number } | null>(null);
   // Today's count BEFORE this run started: the run reports requests_sent as an
@@ -1566,17 +1687,7 @@ export default function App() {
       orUsageBaseRef.current = readOrUsageCount();
 
       // Fresh session log for this Translate press (folder + provider snapshot).
-      sessionErrIdRef.current = 0;
-      setSessionLog({
-        root: activeRoot ?? "",
-        provider,
-        model,
-        startedAt: Date.now(),
-        successBatches: 0,
-        successStrings: 0,
-        requestsSent: 0,
-        errors: [],
-      });
+      setSessionLog(emptySessionLog(activeRoot ?? "", provider, model));
 
       const controller = new AbortController();
       setAbortController(controller);
@@ -1623,7 +1734,7 @@ export default function App() {
               const used = writeOrUsageCount(orUsageBaseRef.current + p.requests_sent);
               setOrUsage((prev) => (prev ? { ...prev, used } : prev));
             }
-            // Session log: successes + live errors (batch_error / key death).
+            // Session log: successes + live errors, grouped by kind (×N).
             setSessionLog((prev) => {
               if (!prev) return prev;
               let next = prev;
@@ -1640,16 +1751,7 @@ export default function App() {
               }
               if (p.last_error || p.phase === "batch_error" || p.phase === "error") {
                 const raw = (p.last_error || p.status || "error").trim();
-                if (raw) {
-                  const w = wi !== undefined ? `W${wi + 1}` : "?";
-                  const tryN = p.try_i !== undefined ? ` try ${p.try_i + 1}` : "";
-                  const b = p.batch_num !== undefined ? ` batch ${p.batch_num}` : "";
-                  const text = `[${w}${b}${tryN}] ${raw}`;
-                  // Cap list so a 100-retry storm doesn't freeze the UI.
-                  const errors = [...next.errors, { id: ++sessionErrIdRef.current, ts: Date.now(), text }];
-                  if (errors.length > 500) errors.splice(0, errors.length - 500);
-                  next = { ...next, errors };
-                }
+                if (raw) next = bumpSessionError(next, raw);
               }
               return next === prev ? prev : next;
             });
@@ -1714,16 +1816,27 @@ export default function App() {
         setPhase("saving");
         await saveProject(currentProject);
         setPhase("idle");
-        // Merge terminal errors into the session log (dedupe by text).
+        // Terminal errors may already be in groups from live batch_error emits;
+        // still fold any leftover (e.g. key death) without double-spam of retries.
         if (result.errors.length) {
           setSessionLog((prev) => {
             if (!prev) return prev;
-            const have = new Set(prev.errors.map((e) => e.text));
-            const add = result.errors
-              .filter((e) => e && !have.has(e))
-              .map((text) => ({ id: ++sessionErrIdRef.current, ts: Date.now(), text }));
-            if (!add.length) return prev;
-            return { ...prev, errors: [...prev.errors, ...add].slice(-500) };
+            let next = prev;
+            for (const err of result.errors) {
+              if (!err) continue;
+              // Only bump if this exact terminal message's class is still at 0
+              // for "auth" after live emits — actually live already counted each
+              // attempt. Terminal list is often 1 summary per dead key: still
+              // useful as +1 if we never got live events (abort path). Prefer
+              // not to double-count identical buckets that already have hits
+              // for the same classify key when the message is a subset.
+              const { key } = classifySessionError(err);
+              const already = next.errorGroups.some((g) => g.key === key && g.count > 0);
+              // If we already tallied this class live, skip the terminal dup.
+              if (already) continue;
+              next = bumpSessionError(next, err);
+            }
+            return next === prev ? prev : next;
           });
         }
         if (result.aborted) {
@@ -1760,25 +1873,9 @@ export default function App() {
       ok = false;
       const msg = e instanceof Error ? e.message : String(e);
       if (!(e instanceof Error && e.name === "AbortError") && !(e instanceof DOMException && e.name === "AbortError")) {
-        setSessionLog((prev) => {
-          const base = prev ?? {
-            root: activeRoot ?? "",
-            provider,
-            model,
-            startedAt: Date.now(),
-            successBatches: 0,
-            successStrings: 0,
-            requestsSent: 0,
-            errors: [] as SessionLogErr[],
-          };
-          return {
-            ...base,
-            errors: [
-              ...base.errors,
-              { id: ++sessionErrIdRef.current, ts: Date.now(), text: msg },
-            ].slice(-500),
-          };
-        });
+        setSessionLog((prev) =>
+          bumpSessionError(prev ?? emptySessionLog(activeRoot ?? "", provider, model), msg),
+        );
       }
       if (e instanceof Error && e.name === "AbortError" || (e instanceof DOMException && e.name === "AbortError")) {
         setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
@@ -3276,18 +3373,11 @@ export default function App() {
         {/* Session log: sits just right of threads/RPM (or of model when local). */}
         <button
           type="button"
-          className={`session-log-btn btn-secondary ${sessionLog?.errors.length ? "has-errors" : ""} ${sessionLog && sessionLog.successBatches > 0 && !sessionLog.errors.length ? "has-ok" : ""}`}
+          className="session-log-btn btn-secondary"
           title={t("sessionLogBtnHint") as string}
           onClick={() => setSessionLogOpen(true)}
         >
           {t("sessionLogBtn") as string}
-          {sessionLog && (sessionLog.errors.length > 0 || sessionLog.successBatches > 0) && (
-            <span className="session-log-badge">
-              {sessionLog.errors.length > 0
-                ? sessionLog.errors.length
-                : sessionLog.successBatches}
-            </span>
-          )}
         </button>
 
         {/* OpenRouter daily free-request budget. Count is local (the API doesn't
@@ -3954,18 +4044,19 @@ export default function App() {
                   )}
                 </div>
                 <div className="session-log-errors-head">
-                  {t("sessionLogErrorsTitle")(sessionLog.errors.length) as string}
+                  {t("sessionLogErrorsTitle")(
+                    sessionLog.errorAttempts,
+                    sessionLog.errorGroups.length,
+                  ) as string}
                 </div>
-                {sessionLog.errors.length === 0 ? (
+                {sessionLog.errorGroups.length === 0 ? (
                   <p className="session-log-empty">{t("sessionLogNoErrors") as string}</p>
                 ) : (
                   <ul className="session-log-errors">
-                    {[...sessionLog.errors].reverse().map((e) => (
-                      <li key={e.id}>
-                        <span className="session-log-ts">
-                          {new Date(e.ts).toLocaleTimeString()}
-                        </span>
-                        <span className="session-log-err-text">{e.text}</span>
+                    {sessionLog.errorGroups.map((g) => (
+                      <li key={g.key}>
+                        <span className="session-log-count">×{g.count}</span>
+                        <span className="session-log-err-text">{g.label}</span>
                       </li>
                     ))}
                   </ul>

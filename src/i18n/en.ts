@@ -93,13 +93,16 @@ const en = {
   workersToggleCollapse: "Collapse threads",
   sessionLogBtn: "Log",
   sessionLogBtnHint:
-    "This translate session: successful batches and every API error. " +
-    "Resets when you start a new Translate on this folder.",
+    "This translate run: successful batches + errors grouped with counts (×N). " +
+    "Resets when you start a new Translate.",
   sessionLogTitle: "Translate session",
-  sessionLogEmpty: "No translate run yet this session. Press Translate — events will show up here live.",
+  sessionLogEmpty: "No translate run yet this session. Press Translate — stats will show up here live.",
   sessionLogSuccess: (batches: number, strings: number) =>
-    `OK: ${batches} batch(es), ${strings} string(s) this run`,
-  sessionLogErrorsTitle: (n: number) => `Errors (${n})`,
+    `OK: ${batches} batch(es) × ${strings} string(s)`,
+  sessionLogErrorsTitle: (attempts: number, kinds: number) =>
+    attempts === 0
+      ? "Errors"
+      : `Failed attempts: ${attempts}${kinds > 1 ? ` · ${kinds} kinds` : ""}`,
   sessionLogNoErrors: "No errors yet.",
   sessionLogMeta: (provider: string, model: string, root: string) =>
     `${provider}${model ? " · " + model : ""}${root ? "\n" + root : ""}`,
