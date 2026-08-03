@@ -76,8 +76,9 @@ const ru: Strings = {
   onlyFreeModels: "Только бесплатные",
   threads: "Потоки",
   threadsHint:
-    "Параллельных запросов на один ключ API. При 2 ключах столько на каждый. " +
-    "Больше — быстрее, но следите за лимитом запросов в минуту у провайдера.",
+    "Параллельных запросов на один ключ API (1–40). При 2 ключах столько на каждый " +
+    "(всего потоков = потоки × ключи). Больше — быстрее, но следите за лимитом " +
+    "запросов в минуту и выставьте RPM, чтобы pacing не вылезал за квоту.",
   rpmLimit: "Лимит, зап/мин",
   rpmNoLimit: "нет",
   rpmLimitHint:
@@ -140,6 +141,7 @@ const ru: Strings = {
   phase_extracting: "извлекаю строки",
   phase_translating: "перевожу",
   phase_paused: "пауза",
+  phase_pausing: "останавливаюсь (дописываю пакеты)",
   phase_saving: "сохраняю",
   phase_backing_up: "создаю бэкап",
   phase_injecting: "записываю в игру",
@@ -161,13 +163,19 @@ const ru: Strings = {
     `Перевод пакета ${num} (${size} строк) — прошло ${elapsed} сек.` +
     (retry && retry > 1 ? ` (попытка ${retry}/100)` : "") +
     (elapsed > 15 ? " (ожидание ответа модели)" : ""),
-  statusPaused: (num: number, size: number) =>
-    `Перевод на паузе (пакет ${num}, ${size} строк)`,
+  // Always free at the claim gate — owned batches finish before parking here.
+  statusPaused: (_num: number, _size: number) => "Пауза — жду продолжения",
+  statusFinishingBatch: (num: number, size: number, elapsed: number) =>
+    `Дописываю пакет ${num} (${size} строк) перед паузой — ${elapsed} сек.`,
   statusWaitingRetry: (num: number, size: number, retry: number, waitLeft: number) =>
     `Перевод пакета ${num} (${size} строк) — Ожидание перед повтором ${waitLeft} сек.` +
     (retry && retry > 0 ? ` (попытка ${retry}/100)` : ""),
   statusCompletedBatch: (num: number) => `Пакет ${num} успешно переведен!`,
-  statusWaitingDelay: (waitLeft: number) => `Задержка — осталось ${waitLeft} сек.`,
+  // After a successful batch: keep that fact + show RPM pacing countdown.
+  statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
+    batchNum
+      ? `Пакет ${batchNum} переведен — ожидание ${waitLeft} сек`
+      : `Ожидание ${waitLeft} сек`,
   statusResting: "Отдыхает (ждёт работу)",
   statusWorkerError: "Ключ не сработал",
   pyStatusWaiting: "Ожидание...",

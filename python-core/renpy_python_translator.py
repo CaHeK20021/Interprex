@@ -673,7 +673,9 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
     process_fn(batch, key, worker_idx) -> dict; it MUST raise on an API error so
     the pool can classify it. label is the log verb ("Classified"/"Translated").
     """
-    threads = max(1, int(threads or 1))
+    # Same cap as scheduler.MAX_THREADS_PER_KEY (avoid importing scheduler here
+    # for a constant — keep in sync if either changes).
+    threads = max(1, min(40, int(threads or 1)))
     keys = list(keys) or [""]
     total = len(batches)
 

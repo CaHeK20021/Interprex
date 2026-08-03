@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("UAssetExtractor")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+bdb4f4964205d762a813fec803bee9e08533227d")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+97e22c68bc54d92cfee0721684e7a1b26756d19e")]
 [assembly: System.Reflection.AssemblyProductAttribute("UAssetExtractor")]
 [assembly: System.Reflection.AssemblyTitleAttribute("UAssetExtractor")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

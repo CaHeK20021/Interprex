@@ -33,6 +33,7 @@ from .openai_compat import (
     LMStudioProvider,
     KaggleProvider,
     CustomProvider,
+    NvidiaProvider,
     OpenRouterProvider,
 )
 from .gemini import GeminiProvider
@@ -43,6 +44,7 @@ REGISTRY: list[type[BaseProvider]] = [
     KaggleProvider,
     GeminiProvider,
     OpenRouterProvider,
+    NvidiaProvider,
     CustomProvider,
 ]
 

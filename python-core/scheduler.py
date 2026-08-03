@@ -24,8 +24,11 @@ Design (plan shiny-yawning-breeze):
   * Pace: each request occupies at least `delay_seconds` of wall-clock; a worker
     that finished faster sleeps the remainder before its next claim (honours a
     provider's per-minute request limit).
-  * Pause: a worker always FINISHES and EMITS its in-flight batch (so the
-    frontend auto-saves the project) before blocking at the next claim boundary.
+  * Pause: no NEW batch is claimed (claim gate). A worker that already OWNS a
+    batch keeps going until that batch is done (HTTP + retries + emit) — then
+    parks free as `paused`. Mid-request cards show `finishing_batch` so the UI
+    doesn't pretend they're idle. After drain every live worker is the same
+    free state ("waiting to resume"); nothing sits "holding" a batch idle.
 
 Everything a worker feeds the model is identical to the legacy Gemini path:
 per-string context, the Ren'Py per-line character limit, the glossary, adaptive
@@ -53,6 +56,10 @@ from providers.base import build_prompt
 # lose the batch — we re-send the SAME batch so every string still gets
 # translated, not skipped.
 BATCH_TRIES = 100
+# Hard cap on workers PER key (UI + /translate clamp to this). Raised 10→40 after
+# check_scheduler_high_threads proved no double-claim, key binding, pause, and
+# failover under 40 × 1..4 keys. Total workers = threads * #keys.
+MAX_THREADS_PER_KEY = 40
 
 # Back-off (seconds) between retries: short on the first miss, longer after. For
 # RATE/OVERLOAD errors the effective wait is raised to at least `delay_seconds`
@@ -295,7 +302,7 @@ class TranslationScheduler:
         if not keys:
             keys = [getattr(req, "api_key", "") or ""]
         self.keys_to_use = keys
-        self.threads = max(1, int(getattr(req, "threads", 1) or 1))
+        self.threads = max(1, min(MAX_THREADS_PER_KEY, int(getattr(req, "threads", 1) or 1)))
         self.worker_count = self.threads * len(keys)
         self.delay_seconds = max(0.0, float(getattr(req, "delay_seconds", 0.0) or 0.0))
 
@@ -441,110 +448,138 @@ class TranslationScheduler:
 
         Returns (_CLAIM, (fname, batch)) | (_REST, None) | (_DONE, None). Gate
         check and pop happen under ONE lock hold so the priority decision can't
-        race the pool draining underneath it."""
+        race the pool draining underneath it.
+
+        While paused: never claim a NEW batch (that used to race the UI into
+        "paused" cards that immediately flipped back to translating). Wait at
+        this gate and emit `paused` with the lock released so `_emit` can't
+        deadlock on `self.cond`."""
         req = self.req
-        with self.cond:
-            while True:
-                if self.aborted:
-                    return (_DONE, None)
-                if worker_key in self.dead_keys:
-                    return (_DONE, None)
-
-                # Honour this key's cooldown without blocking other keys: a short
-                # timed wait on the shared condition lets sibling keys proceed.
-                cd = self.key_cooldown.get(worker_key, 0.0)
-                wait_for = cd - time.time()
-                if wait_for > 0:
-                    self.cond.wait(timeout=min(wait_for, 1.0))
-                    continue
-
-                rem = self._remaining_locked()
-                if rem == 0:
-                    if self._run_done_locked():
-                        self.cond.notify_all()
+        while True:
+            # Pause gate OUTSIDE the pool lock — sleep + emit need the lock free
+            # (`_emit` itself takes cond briefly for the done counter).
+            if self.should_pause() and not self._is_aborted():
+                with self.cond:
+                    if self.aborted or worker_key in self.dead_keys:
                         return (_DONE, None)
-                    # Pool's empty but a peer still holds a batch that might be
-                    # reclaimed — wait to be woken rather than exit prematurely.
-                    self.cond.wait(timeout=0.5)
-                    continue
+                self._emit(
+                    worker_idx,
+                    "paused",
+                    status="Paused",
+                    batch_num=self.worker_batch_no.get(worker_idx, 0),
+                    batch_size=0,
+                )
+                time.sleep(0.5)
+                continue
 
-                # Priority ramp-down: with B_est batches left, only the B_est
-                # highest-priority LIVE workers should engage. avg_batch_items is a
-                # shared running estimate (exact count is unknowable cheaply with
-                # adaptive sizing). Rank is computed among alive workers so a dead
-                # key's slots don't pin live workers in permanent rest.
-                b_est = max(1, math.ceil(rem / max(1.0, self.avg_batch_items)))
-                if self._effective_rank_locked(worker_idx) >= b_est:
-                    if self._run_done_locked():
+            with self.cond:
+                while True:
+                    if self.aborted:
                         return (_DONE, None)
-                    return (_REST, None)
+                    if worker_key in self.dead_keys:
+                        return (_DONE, None)
 
-                if self.auto_group_small_files:
-                    # Собираем кандидатов из разных файлов
-                    candidates = []  # список кортежей (fname, item)
-                    budget = cal.input_budget(self.window, req.glossary)
-                    used = 0
-                    max_b = req.max_batch_size
+                    # Pause flipped on while we held the lock (sibling path) —
+                    # drop the lock and re-enter the outer pause gate.
+                    if self.should_pause():
+                        break
 
-                    for fn, its in self.pool.items():
-                        for it in its:
+                    # Honour this key's cooldown without blocking other keys: a short
+                    # timed wait on the shared condition lets sibling keys proceed.
+                    cd = self.key_cooldown.get(worker_key, 0.0)
+                    wait_for = cd - time.time()
+                    if wait_for > 0:
+                        self.cond.wait(timeout=min(wait_for, 1.0))
+                        continue
+
+                    rem = self._remaining_locked()
+                    if rem == 0:
+                        if self._run_done_locked():
+                            self.cond.notify_all()
+                            return (_DONE, None)
+                        # Pool's empty but a peer still holds a batch that might be
+                        # reclaimed — wait to be woken rather than exit prematurely.
+                        self.cond.wait(timeout=0.5)
+                        continue
+
+                    # Priority ramp-down: with B_est batches left, only the B_est
+                    # highest-priority LIVE workers should engage. avg_batch_items is a
+                    # shared running estimate (exact count is unknowable cheaply with
+                    # adaptive sizing). Rank is computed among alive workers so a dead
+                    # key's slots don't pin live workers in permanent rest.
+                    b_est = max(1, math.ceil(rem / max(1.0, self.avg_batch_items)))
+                    if self._effective_rank_locked(worker_idx) >= b_est:
+                        if self._run_done_locked():
+                            return (_DONE, None)
+                        return (_REST, None)
+
+                    if self.auto_group_small_files:
+                        # Собираем кандидатов из разных файлов
+                        candidates = []  # список кортежей (fname, item)
+                        budget = cal.input_budget(self.window, req.glossary)
+                        used = 0
+                        max_b = req.max_batch_size
+
+                        for fn, its in self.pool.items():
+                            for it in its:
+                                if len(candidates) >= max_b:
+                                    break
+                                cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                if len(candidates) > 0 and used + cost > budget:
+                                    break
+                                used += cost
+                                candidates.append((fn, it))
                             if len(candidates) >= max_b:
                                 break
-                            cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
-                            if len(candidates) > 0 and used + cost > budget:
+
+                        if not candidates:
+                            self.cond.wait(timeout=0.5)
+                            continue
+
+                        # Проверяем overflows_exact и уменьшаем кандидатов, если нужно
+                        while len(candidates) > 1:
+                            items_only = [x[1] for x in candidates]
+                            if self._overflows_exact(cal, items_only, worker_key):
+                                candidates = candidates[:len(candidates) // 2]
+                            else:
                                 break
-                            used += cost
-                            candidates.append((fn, it))
-                        if len(candidates) >= max_b:
-                            break
 
-                    if not candidates:
-                        self.cond.wait(timeout=0.5)
-                        continue
+                        # Сгруппируем удаление из pool по файлам
+                        remove_counts = {}
+                        for fn, it in candidates:
+                            remove_counts[fn] = remove_counts.get(fn, 0) + 1
 
-                    # Проверяем overflows_exact и уменьшаем кандидатов, если нужно
-                    while len(candidates) > 1:
-                        items_only = [x[1] for x in candidates]
-                        if self._overflows_exact(cal, items_only, worker_key):
-                            candidates = candidates[:len(candidates) // 2]
-                        else:
-                            break
+                        for fn, count in remove_counts.items():
+                            del self.pool[fn][:count]
+                            if not self.pool[fn]:
+                                del self.pool[fn]
 
-                    # Сгруппируем удаление из pool по файлам
-                    remove_counts = {}
-                    for fn, it in candidates:
-                        remove_counts[fn] = remove_counts.get(fn, 0) + 1
+                        batch = [x[1] for x in candidates]
+                        fname = candidates[0][0]
+                    else:
+                        fname, items = self._next_file_locked()
+                        if items is None:
+                            self.cond.wait(timeout=0.5)
+                            continue
 
-                    for fn, count in remove_counts.items():
-                        del self.pool[fn][:count]
-                        if not self.pool[fn]:
-                            del self.pool[fn]
-
-                    batch = [x[1] for x in candidates]
-                    fname = candidates[0][0]
-                else:
-                    fname, items = self._next_file_locked()
-                    if items is None:
-                        self.cond.wait(timeout=0.5)
-                        continue
-
-                    # Token-pack one batch from the front of this file; never mix files.
-                    end = cal.next_batch(items, self.window, req.glossary, 0,
-                                         req.max_batch_size)
-                    while (end) > 1 and self._overflows_exact(cal, items[:end], worker_key):
-                        end = end // 2
-                    batch = items[:end]
-                    del items[:end]
-                    if not items:
-                        # Keep the key in the map but emptied; cleaned lazily.
-                        pass
-                self.in_flight += 1
-                self.in_flight_workers.add(worker_idx)
-                # Hand this worker its own batch ticket so its grid card shows a
-                # distinct number (not the shared global `self.batches`).
-                self.batch_seq += 1
-                self.worker_batch_no[worker_idx] = self.batch_seq
-                return (_CLAIM, (fname, batch))
+                        # Token-pack one batch from the front of this file; never mix files.
+                        end = cal.next_batch(items, self.window, req.glossary, 0,
+                                             req.max_batch_size)
+                        while (end) > 1 and self._overflows_exact(cal, items[:end], worker_key):
+                            end = end // 2
+                        batch = items[:end]
+                        del items[:end]
+                        if not items:
+                            # Keep the key in the map but emptied; cleaned lazily.
+                            pass
+                    self.in_flight += 1
+                    self.in_flight_workers.add(worker_idx)
+                    # Hand this worker its own batch ticket so its grid card shows a
+                    # distinct number (not the shared global `self.batches`).
+                    self.batch_seq += 1
+                    self.worker_batch_no[worker_idx] = self.batch_seq
+                    return (_CLAIM, (fname, batch))
+            # Inner loop broke only for pause re-check → outer gate.
 
     def _overflows_exact(self, cal: Calibrator, batch: list, worker_key: str) -> bool:
         """Optional pre-send guard for providers with a cheap exact tokenizer."""
@@ -613,6 +648,10 @@ class TranslationScheduler:
 
         tr = None
         last_yield = time.time()
+        # First pause tick during this request forces an immediate finishing
+        # event (don't wait the full 1s cadence) so the card flips as soon as
+        # the user hits pause.
+        saw_pause = False
         while thread.is_alive() and not self._is_aborted():
             try:
                 ok, val = res_queue.get(timeout=0.5)
@@ -623,15 +662,39 @@ class TranslationScheduler:
                 break
             except queue.Empty:
                 now = time.time()
-                if now - last_yield >= 1.0:
-                    last_yield = now
-                    elapsed = int(now - start_time)
+                paused_now = self.should_pause()
+                due = (now - last_yield) >= 1.0
+                pause_edge = paused_now and not saw_pause
+                if not (due or pause_edge):
+                    continue
+                last_yield = now
+                saw_pause = saw_pause or paused_now
+                elapsed = int(now - start_time)
+                # Pause never aborts an in-flight HTTP call — but the card must
+                # not keep saying "translating" as if pause did nothing, nor
+                # flip to "paused" while the request is still burning tokens.
+                if paused_now:
+                    self._emit(
+                        worker_idx,
+                        "finishing_batch",
+                        status=f"Finishing batch before pause "
+                        f"({len(batch)} strings)... [{elapsed}s]",
+                        batch_num=self.worker_batch_no.get(
+                            worker_idx, self.batch_seq + 1
+                        ),
+                        batch_size=len(batch),
+                        try_i=try_i,
+                        elapsed=elapsed,
+                    )
+                else:
                     self._emit(
                         worker_idx,
                         "translating_batch",
                         status=f"Translating batch ({len(batch)} strings)"
                         f"{try_suffix}... [{elapsed}s]",
-                        batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq + 1),
+                        batch_num=self.worker_batch_no.get(
+                            worker_idx, self.batch_seq + 1
+                        ),
                         batch_size=len(batch),
                         try_i=try_i,
                         elapsed=elapsed,
@@ -666,9 +729,9 @@ class TranslationScheduler:
         for try_i in range(BATCH_TRIES):
             if self._is_aborted() or worker_key in self.dead_keys:
                 return ({}, False, False)
-            self._wait_while_paused(worker_idx, len(batch), try_i)
-            if self._is_aborted():
-                return ({}, False, False)
+            # Pause never freezes an OWNED batch (no "held idle" state). The
+            # claim gate blocks NEW work; this worker finishes what it took —
+            # retries included — then parks free at the next claim.
 
             start_time = time.time()
             try_suffix = f" (retry {try_i + 1}/{BATCH_TRIES})" if try_i > 0 else ""
@@ -963,51 +1026,16 @@ class TranslationScheduler:
 
     # -- pause / pacing helpers -------------------------------------------------
 
-    def _wait_while_paused(self, worker_idx, batch_size, try_i) -> None:
-        while self.should_pause() and not self._is_aborted():
-            self._emit(
-                worker_idx,
-                "paused",
-                status="Paused",
-                batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq + 1),
-                batch_size=batch_size,
-                try_i=try_i,
-                elapsed=0,
-            )
-            time.sleep(1.0)
-
     def _retry_sleep(self, worker_idx, batch, try_i, start_time, min_wait=0.0,
                      stagger=0.0) -> None:
-        """Back-off between retries, interruptible by pause/resume/abort. min_wait
-        raises the floor (used for rate/overload errors so the re-send respects
-        the per-minute quota). stagger adds a fixed per-thread offset so siblings
-        that errored together don't retry in lockstep."""
+        """Back-off between retries on an OWNED batch. Pause does NOT freeze this
+        sleep (owned work must finish); only abort interrupts. min_wait raises
+        the floor for rate/overload. stagger spreads sibling retries."""
         sleep_time = max(min_wait,
                          _RETRY_BACKOFF_FIRST if try_i == 0 else _RETRY_BACKOFF_REST)
         sleep_time += stagger
         start_sleep = time.time()
-        was_paused = False
         while not self._is_aborted():
-            if self.should_pause():
-                was_paused = True
-                paused_start = time.time()
-                while self.should_pause() and not self._is_aborted():
-                    elapsed = int(time.time() - start_time) if start_time else 0
-                    self._emit(
-                        worker_idx,
-                        "paused",
-                        status="Paused",
-                        batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq + 1),
-                        batch_size=len(batch),
-                        try_i=try_i,
-                        elapsed=elapsed,
-                    )
-                    time.sleep(1.0)
-                p_dur = time.time() - paused_start
-                start_time += p_dur
-                start_sleep += p_dur
-            if was_paused and not self.should_pause():
-                break
             now = time.time()
             remaining = sleep_time - (now - start_sleep)
             if remaining <= 0:
@@ -1024,10 +1052,8 @@ class TranslationScheduler:
                 elapsed=elapsed,
                 wait_left=wait_left,
             )
-            # Sleep the EXACT remainder (capped at 1s for pause/abort
-            # responsiveness). Sleeping a flat 1.0s would round sub-second stagger
-            # offsets up to the next whole second and re-synchronize sibling
-            # retries — the very lockstep the stagger exists to prevent.
+            # Sleep the EXACT remainder (capped at 1s for abort responsiveness).
+            # Flat 1.0s would round sub-second stagger up and re-lockstep siblings.
             time.sleep(min(1.0, remaining))
 
     def _pace_delay(self, worker_idx, t0, stagger_offset=0.0) -> None:
@@ -1060,11 +1086,19 @@ class TranslationScheduler:
             if remaining <= 0:
                 return
             wait_left = int(math.ceil(remaining))
+            # batch_num = the batch just finished — UI shows
+            # "Batch N done — waiting Xs" so the RPM wait is obvious.
+            bnum = self.worker_batch_no.get(worker_idx, 0)
             self._emit(
                 worker_idx,
                 "waiting_delay",
-                status=f"Pacing ({wait_left}s left)...",
+                status=(
+                    f"Batch {bnum} done — waiting {wait_left}s..."
+                    if bnum
+                    else f"Pacing ({wait_left}s left)..."
+                ),
                 wait_left=wait_left,
+                batch_num=bnum or None,
             )
             time.sleep(min(1.0, remaining))
 

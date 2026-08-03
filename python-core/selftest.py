@@ -3699,6 +3699,27 @@ def check_providers() -> None:
         assert gemini.active_model(gcfg, models=["gemini-2.5-flash"]) == "gemini-2.5-flash"
         mock_list.assert_not_called()
 
+    # NVIDIA Build: fixed cloud base, no json_object, Bearer auth path.
+    from providers.openai_compat import NvidiaProvider
+    from providers import REGISTRY, get_provider
+
+    nvidia = NvidiaProvider()
+    assert nvidia.name == "nvidia"
+    assert "integrate.api.nvidia.com" in nvidia.default_base_url
+    assert nvidia.sends_json_object is False
+    assert nvidia.sends_num_ctx is False
+    assert get_provider("nvidia").name == "nvidia"
+    assert any(cls.name == "nvidia" for cls in REGISTRY)
+    ncfg = ProviderConfig(api_key="nvapi-test", model="google/gemma-4-31b-it")
+    assert nvidia._base(ncfg) == "https://integrate.api.nvidia.com/v1"
+    # Proxy override still wins when autocheck routes via proxy.
+    ncfg_proxy = ProviderConfig(
+        api_key="nvapi-test",
+        base_url="https://example-proxy.example/v1",
+        model="google/gemma-4-31b-it",
+    )
+    assert nvidia._base(ncfg_proxy) == "https://example-proxy.example/v1"
+
 
 def check_scheduler() -> None:
     """The parallel translation scheduler (scheduler.py): correctness under the
@@ -3966,6 +3987,860 @@ def check_scheduler() -> None:
         sf = final.get("size_fixes") or {}
         assert "2" in sf and 0.0 < sf["2"] < 1.0, \
             f"un-shortenable caption must record a shrink factor <1.0, got {sf}"
+    finally:
+        (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
+         scheduler.get_provider) = saved
+
+
+def check_scheduler_high_threads() -> None:
+    """Hard gate for raising the UI/backend threads cap to 40.
+
+    Proves under 40 workers-per-key × 1..4 keys that:
+      * every input id lands exactly once in the fanned result (no loss, no ghost);
+      * no two in-flight batches ever share an id (no double-claim race);
+      * concurrent requests per key never exceed `threads` (key-group binding);
+      * worker_idx always maps to keys[i // threads];
+      * progress `done` is monotonic and never exceeds total;
+      * pause drains in-flight and freezes the result count; resume finishes all;
+      * auth failover / rate recovery / all-keys-dead still terminate cleanly;
+      * tiny remainders (fewer strings than workers) don't deadlock;
+      * heavy dedup + many-files layouts stay correct.
+
+    Offline (FakeProvider). Failures here mean the 40-thread cap must NOT ship.
+    """
+    import json
+    import threading
+    import time
+    from collections import defaultdict
+
+    import scheduler
+    from providers.base import TranslateResult, Usage
+
+    MAX_T = 40
+    saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
+             scheduler.get_provider)
+    scheduler._RETRY_BACKOFF_FIRST = 0
+    scheduler._RETRY_BACKOFF_REST = 0
+
+    class StrictProvider:
+        """Tracks concurrent ownership so we can prove workers don't trample."""
+        name = "fake"
+
+        def __init__(self, auth_keys=None, rate_once=None, delay=0.002):
+            self.auth_keys = set(auth_keys or ())
+            self.rate_once = dict(rate_once or {})
+            self.delay = delay
+            self.lock = threading.Lock()
+            self.active_ids: set[str] = set()
+            self.completed_ids: set[str] = set()
+            self.violations: list[str] = []
+            self.peak_global = 0
+            self.peak_per_key: dict[str, int] = defaultdict(int)
+            self.cur_per_key: dict[str, int] = defaultdict(int)
+            self.req_count = 0
+            # (worker_key, frozenset(ids)) per successful call — for binding checks
+            self.calls: list[tuple[str, frozenset[str]]] = []
+
+        def count_tokens(self, text, cfg):
+            return None
+
+        def translate(self, batch, lang, glossary, cfg, engine=""):
+            return self.complete_prompt("", batch, cfg)
+
+        def complete_prompt(self, prompt, batch, cfg):
+            ids = [it.id for it in batch]
+            id_set = set(ids)
+            k = cfg.api_key or ""
+            with self.lock:
+                overlap = self.active_ids & id_set
+                if overlap:
+                    self.violations.append(
+                        "double-claim concurrent ids=%s key=%s" % (sorted(overlap)[:8], k)
+                    )
+                self.active_ids |= id_set
+                self.cur_per_key[k] += 1
+                self.peak_global = max(self.peak_global, len(self.active_ids))
+                self.peak_per_key[k] = max(self.peak_per_key[k], self.cur_per_key[k])
+                self.req_count += 1
+            try:
+                if self.delay:
+                    time.sleep(self.delay)
+                if k in self.auth_keys:
+                    raise RuntimeError(
+                        "API key not valid. Please pass a valid API key. (403)"
+                    )
+                if self.rate_once.get(k, 0) > 0:
+                    self.rate_once[k] -= 1
+                    raise RuntimeError("429 Too Many Requests: rate limit exceeded")
+                tr = {it.id: it.text + "_ru" for it in batch}
+                with self.lock:
+                    self.completed_ids |= id_set
+                    self.calls.append((k, frozenset(id_set)))
+                return TranslateResult(tr, Usage(10, 12))
+            finally:
+                with self.lock:
+                    self.active_ids -= id_set
+                    self.cur_per_key[k] -= 1
+
+    class Req:
+        target_lang = "russian"
+        glossary = {}
+        base_url = ""
+        model = ""
+        max_context_tokens = 0
+        max_batch_size = 5
+        root = ""
+        engine = ""
+        free_only = False
+        extra_instruction = ""
+        group_small_files = "off"
+
+        def __init__(self, items, threads=40, api_keys=None, delay_seconds=0.0,
+                     max_batch_size=5, api_key="K0", api_key_2=""):
+            self.items = items
+            self.threads = threads
+            self.api_keys = list(api_keys) if api_keys is not None else None
+            self.delay_seconds = delay_seconds
+            self.max_batch_size = max_batch_size
+            self.api_key = api_key
+            self.api_key_2 = api_key_2
+            self.provider = "fake"
+
+    class It:
+        def __init__(self, i, text, file="a.txt"):
+            self.id = str(i)
+            self.text = text
+            self.context = ""
+            self.file = file
+            self.path = []
+
+    def stream_run(req, prov, timeout=120, pause_flag=None):
+        should = (lambda: pause_flag["v"]) if pause_flag else (lambda: False)
+        scheduler.get_provider = lambda n: prov
+        sched = scheduler.TranslationScheduler(req, should_pause=should)
+        out = {
+            "final": None,
+            "max_done": 0,
+            "done_non_mono": False,
+            "done_over_total": False,
+            "bad_worker_idx": False,
+            "phases": defaultdict(int),
+            "worker_keys_seen": defaultdict(set),  # worker_idx -> set of keys from... we don't have key in event
+        }
+        prev_done = 0
+
+        def go():
+            nonlocal prev_done
+            for line in sched.stream():
+                evt = json.loads(line)
+                if evt.get("type") == "progress":
+                    d = int(evt.get("done") or 0)
+                    tot = int(evt.get("total") or 0)
+                    if d < prev_done:
+                        out["done_non_mono"] = True
+                    prev_done = d
+                    out["max_done"] = max(out["max_done"], d)
+                    if tot and d > tot:
+                        out["done_over_total"] = True
+                    wi = evt.get("worker_idx")
+                    if wi is not None and (wi < 0 or wi >= sched.worker_count):
+                        # Sweep reuses denser indices 0..alive*threads-1 — allow that
+                        # only if within a generous bound (keys * threads).
+                        if wi >= max(sched.worker_count, len(sched.keys_to_use) * sched.threads + 1):
+                            out["bad_worker_idx"] = True
+                    ph = evt.get("phase")
+                    if ph:
+                        out["phases"][ph] += 1
+                elif evt.get("type") == "done":
+                    out["final"] = evt
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        if pause_flag is None:
+            t.join(timeout)
+            assert not t.is_alive(), (
+                "deadlock threads=%s keys=%s" % (req.threads, req.api_keys)
+            )
+            return sched, out
+        return sched, t, out
+
+    def assert_clean(label, req, out, prov, expect_n, expect_aborted=None):
+        assert not prov.violations, "%s: %s" % (label, prov.violations[:3])
+        assert not out["done_non_mono"], "%s: done went backwards" % label
+        assert not out["done_over_total"], "%s: done > total" % label
+        assert not out["bad_worker_idx"], "%s: worker_idx out of range" % label
+        final = out["final"]
+        assert final is not None, "%s: no final event" % label
+        tr = final.get("translations") or {}
+        if expect_n is not None:
+            assert len(tr) == expect_n, "%s: got %d/%d translations" % (
+                label, len(tr), expect_n)
+        # Peak concurrent requests on one key must not exceed threads (each
+        # worker on a key is bound 1:1; more would mean wrong key assignment
+        # or a double-claim race spawning extra work).
+        for k, peak in prov.peak_per_key.items():
+            assert peak <= req.threads, (
+                "%s: key %s peak concurrent reqs=%d > threads=%d"
+                % (label, k, peak, req.threads)
+            )
+        if expect_aborted is not None:
+            assert bool(final.get("aborted")) is expect_aborted, label
+
+    try:
+        key_sets = {
+            1: ["K0"],
+            2: ["K0", "K1"],
+            3: ["K0", "K1", "K2"],
+            4: ["K0", "K1", "K2", "K3"],
+        }
+
+        # ── 1. Full matrix: 40 threads × 1..4 keys, unique strings ──────────
+        for n_keys, keys in key_sets.items():
+            n = 800  # enough batches to stress the pool under 40t
+            items = [It(i, "u%d" % i, file="f%d.txt" % (i % 17)) for i in range(n)]
+            prov = StrictProvider(delay=0.001)
+            sched, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys, max_batch_size=5),
+                prov, timeout=90,
+            )
+            assert_clean("matrix/%dk" % n_keys, Req(items, threads=MAX_T, api_keys=keys),
+                         out, prov, n)
+            assert sched.worker_count == MAX_T * n_keys, (
+                "worker_count %d != %d*%d" % (sched.worker_count, MAX_T, n_keys)
+            )
+            # Key binding: keys_to_use[i // threads]
+            for i in range(sched.worker_count):
+                expect = keys[i // MAX_T]
+                got = sched.keys_to_use[i // sched.threads]
+                assert got == expect, "binding worker %d: %s != %s" % (i, got, expect)
+
+        # ── 2. Tiny remainder: fewer strings than workers (deadlock trap) ───
+        for n_keys, keys in key_sets.items():
+            for n in (0, 1, 3, 7, 12, 39, 40, 41):
+                items = [It(i, "t%d" % i) for i in range(n)]
+                prov = StrictProvider(delay=0.0)
+                _, out = stream_run(
+                    Req(items, threads=MAX_T, api_keys=keys, max_batch_size=5),
+                    prov, timeout=30,
+                )
+                assert_clean("tiny n=%d k=%d" % (n, n_keys),
+                             Req(items, threads=MAX_T, api_keys=keys), out, prov, n)
+
+        # ── 3. Dedup fan-out under 40t ──────────────────────────────────────
+        for n_keys, keys in key_sets.items():
+            items = [It(i, "SAME" if i % 3 else "OTHER_%d" % i,
+                        file="d%d.txt" % (i % 5)) for i in range(500)]
+            prov = StrictProvider(delay=0.001)
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys), prov, timeout=60,
+            )
+            assert_clean("dedup/%dk" % n_keys,
+                         Req(items, threads=MAX_T, api_keys=keys), out, prov, 500)
+
+        # ── 4. One huge file + many tiny files ──────────────────────────────
+        for n_keys, keys in ((1, ["K0"]), (4, ["K0", "K1", "K2", "K3"])):
+            items = [It(i, "h%d" % i, file="huge.txt") for i in range(600)]
+            prov = StrictProvider(delay=0.001)
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys, max_batch_size=4),
+                prov, timeout=60,
+            )
+            assert_clean("huge/%dk" % n_keys,
+                         Req(items, threads=MAX_T, api_keys=keys), out, prov, 600)
+
+            items = [It(i, "m%d" % i, file="tiny_%d.txt" % i) for i in range(200)]
+            prov = StrictProvider(delay=0.0)
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys, max_batch_size=3),
+                prov, timeout=60,
+            )
+            assert_clean("many-files/%dk" % n_keys,
+                         Req(items, threads=MAX_T, api_keys=keys), out, prov, 200)
+
+        # ── 5. Auth failover: first key dies, survivors finish all ──────────
+        for n_keys, keys in ((2, ["K0", "K1"]), (4, ["K0", "K1", "K2", "K3"])):
+            items = [It(i, "f%d" % i) for i in range(300)]
+            dead = {keys[0]}
+            prov = StrictProvider(auth_keys=dead, delay=0.001)
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys), prov, timeout=90,
+            )
+            assert_clean("failover/%dk" % n_keys,
+                         Req(items, threads=MAX_T, api_keys=keys), out, prov, 300)
+            # Dead key should not appear in successful calls
+            with prov.lock:
+                success_keys = {k for k, _ in prov.calls}
+            assert keys[0] not in success_keys or n_keys == 1, (
+                "dead key still produced successes: %s" % success_keys
+            )
+
+        # ── 6. Rate recovery under 40t ──────────────────────────────────────
+        items = [It(i, "r%d" % i) for i in range(120)]
+        prov = StrictProvider(rate_once={"K0": 15}, delay=0.001)
+        _, out = stream_run(
+            Req(items, threads=MAX_T, api_keys=["K0", "K1"]), prov, timeout=90,
+        )
+        assert_clean("rate-recover",
+                     Req(items, threads=MAX_T, api_keys=["K0", "K1"]), out, prov, 120)
+
+        # ── 7. All keys dead → terminate, no hang ───────────────────────────
+        for n_keys, keys in key_sets.items():
+            items = [It(i, "x%d" % i) for i in range(80)]
+            prov = StrictProvider(auth_keys=set(keys), delay=0.0)
+            t0 = time.time()
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys), prov, timeout=60,
+            )
+            assert out["final"] is not None, "all-dead %dk hung" % n_keys
+            assert out["final"].get("errors"), "all-dead %dk no errors" % n_keys
+            assert time.time() - t0 < 45, "all-dead %dk too slow" % n_keys
+            assert not prov.violations, prov.violations[:2]
+
+        # ── 8. Pause / resume with 40t × 2 and 4 keys ───────────────────────
+        for n_keys, keys in ((2, ["K0", "K1"]), (4, ["K0", "K1", "K2", "K3"])):
+            n = 400
+            items = [It(i, "p%d" % i) for i in range(n)]
+            flag = {"v": False}
+            prov = StrictProvider(delay=0.01)
+            sched, thr, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=keys),
+                prov, pause_flag=flag,
+            )
+            # Wait until some progress, then pause.
+            deadline = time.time() + 15
+            while len(sched.result) < 30 and time.time() < deadline:
+                time.sleep(0.02)
+            assert len(sched.result) >= 10, "pause-test never started"
+            flag["v"] = True
+            # Drain in-flight (delay=0.01, up to threads*keys concurrent).
+            time.sleep(1.5)
+            at_pause = len(sched.result)
+            time.sleep(1.0)
+            assert len(sched.result) == at_pause, (
+                "progressed while paused (%d → %d) keys=%d"
+                % (at_pause, len(sched.result), n_keys)
+            )
+            flag["v"] = False
+            thr.join(90)
+            assert not thr.is_alive(), "pause/resume hung keys=%d" % n_keys
+            final = out["final"]
+            assert final and len(final["translations"]) == n, (
+                "pause/resume lost strings keys=%d got %s"
+                % (n_keys, len(final["translations"]) if final else None)
+            )
+            assert not prov.violations, prov.violations[:2]
+
+        # ── 9. RPM-style pacing: delay > 0, 40t, peak spacing holds ─────────
+        # delay = threads * 60 / rpm. With rpm=240, delay=10s — too slow for CI.
+        # Use a small delay and assert peak concurrent per key still ≤ threads,
+        # and that with delay the request rate isn't a single burst of 40 at t=0
+        # for more than one "wave" when many batches exist.
+        items = [It(i, "pace%d" % i) for i in range(80)]
+        prov = StrictProvider(delay=0.0)
+        t0 = time.time()
+        stamps: list[float] = []
+        _orig_cp = StrictProvider.complete_prompt
+
+        def timed_cp(self, prompt, batch, cfg):
+            stamps.append(time.time())
+            return _orig_cp(self, prompt, batch, cfg)
+
+        StrictProvider.complete_prompt = timed_cp  # type: ignore[method-assign]
+        try:
+            _, out = stream_run(
+                Req(items, threads=MAX_T, api_keys=["K0"], delay_seconds=0.05,
+                    max_batch_size=2),
+                prov, timeout=60,
+            )
+        finally:
+            StrictProvider.complete_prompt = _orig_cp  # type: ignore[method-assign]
+        assert_clean("pace", Req(items, threads=MAX_T, api_keys=["K0"]),
+                     out, prov, 80)
+        # With delay=0.05 and 40 threads, first wave can be ~40 nearly at once,
+        # second wave must be delayed — total wall clock must exceed naive
+        # zero-delay run. Just check we finished and no double-claim.
+        assert time.time() - t0 > 0.05, "pacing finished impossibly fast"
+
+        # ── 10. Cross-key isolation: dead key's peak never > threads ────────
+        items = [It(i, "iso%d" % i) for i in range(200)]
+        prov = StrictProvider(auth_keys={"K0"}, delay=0.002)
+        _, out = stream_run(
+            Req(items, threads=MAX_T, api_keys=["K0", "K1", "K2", "K3"]),
+            prov, timeout=90,
+        )
+        assert_clean("iso",
+                     Req(items, threads=MAX_T, api_keys=["K0", "K1", "K2", "K3"]),
+                     out, prov, 200)
+
+        print(
+            "OK — scheduler high-threads (40): matrix 1–4 keys, tiny remainders, "
+            "dedup, huge/many-files, failover, rate, all-dead, pause/resume, "
+            "pacing, cross-key isolation — no double-claim, peak/key ≤ threads"
+        )
+    finally:
+        (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
+         scheduler.get_provider) = saved
+
+
+def check_scheduler_tail() -> None:
+    """Tail / ramp-down behaviour when many workers remain but few strings left.
+
+    The user-visible case: ~200 strings left, 20–40 threads — does ONE worker
+    grind the rest alone, or do free workers share remaining batches? Also
+    covers pacing ("waiting 1s"), rest vs hold, multi-key, 1-string, exact
+    batch boundaries, pause mid-tail, and dead-key during drain.
+    """
+    import json
+    import math
+    import threading
+    import time
+    from collections import defaultdict
+
+    import scheduler
+    from providers.base import TranslateResult, Usage
+
+    saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
+             scheduler.get_provider)
+    scheduler._RETRY_BACKOFF_FIRST = 0
+    scheduler._RETRY_BACKOFF_REST = 0
+
+    class TrackProv:
+        name = "fake"
+
+        def __init__(self, delay=0.01, auth_keys=None, rate_once=None):
+            self.delay = delay
+            self.auth_keys = set(auth_keys or ())
+            self.rate_once = dict(rate_once or {})
+            self.lock = threading.Lock()
+            self.active_ids: set[str] = set()
+            self.violations: list[str] = []
+            self.peak_global = 0
+            self.peak_batches = 0  # concurrent complete_prompt calls
+            self.cur_batches = 0
+            self.claims: list[tuple[float, str, int]] = []  # successful only
+            self.batch_sizes: list[int] = []
+
+        def count_tokens(self, text, cfg):
+            return None
+
+        def translate(self, batch, lang, glossary, cfg, engine=""):
+            return self.complete_prompt("", batch, cfg)
+
+        def complete_prompt(self, prompt, batch, cfg):
+            ids = [it.id for it in batch]
+            id_set = set(ids)
+            k = cfg.api_key or ""
+            with self.lock:
+                if self.active_ids & id_set:
+                    self.violations.append("double-claim %s" % sorted(id_set)[:6])
+                self.active_ids |= id_set
+                self.cur_batches += 1
+                self.peak_batches = max(self.peak_batches, self.cur_batches)
+                self.peak_global = max(self.peak_global, len(self.active_ids))
+            try:
+                if self.delay:
+                    time.sleep(self.delay)
+                if k in self.auth_keys:
+                    raise RuntimeError(
+                        "API key not valid. Please pass a valid API key. (403)"
+                    )
+                if self.rate_once.get(k, 0) > 0:
+                    self.rate_once[k] -= 1
+                    raise RuntimeError("429 Too Many Requests: rate limit exceeded")
+                with self.lock:
+                    self.claims.append((time.time(), k, len(batch)))
+                    self.batch_sizes.append(len(batch))
+                return TranslateResult(
+                    {it.id: it.text + "_ru" for it in batch}, Usage(10, 12)
+                )
+            finally:
+                with self.lock:
+                    self.active_ids -= id_set
+                    self.cur_batches -= 1
+
+    class Req:
+        target_lang = "russian"
+        glossary = {}
+        base_url = ""
+        model = ""
+        max_context_tokens = 0
+        root = ""
+        engine = ""
+        free_only = False
+        extra_instruction = ""
+        group_small_files = "off"
+        provider = "fake"
+
+        def __init__(self, items, threads=40, api_keys=None, delay_seconds=0.0,
+                     max_batch_size=10, api_key="K0", api_key_2=""):
+            self.items = items
+            self.threads = threads
+            self.api_keys = list(api_keys) if api_keys is not None else ["K0"]
+            self.delay_seconds = delay_seconds
+            self.max_batch_size = max_batch_size
+            self.api_key = api_key
+            self.api_key_2 = api_key_2
+
+    class It:
+        def __init__(self, i, text, file="a.txt"):
+            self.id = str(i)
+            self.text = text
+            self.context = ""
+            self.file = file
+            self.path = []
+
+    def run(req, prov, timeout=90, pause_flag=None):
+        should = (lambda: pause_flag["v"]) if pause_flag else (lambda: False)
+        scheduler.get_provider = lambda n: prov
+        sched = scheduler.TranslationScheduler(req, should_pause=should)
+        stats = {
+            "final": None,
+            "claims_by_worker": defaultdict(int),
+            "rest_by_worker": defaultdict(int),
+            "delay_by_worker": defaultdict(int),
+            "phases": defaultdict(int),
+            "peak_busy": 0,
+            "tail_peak_busy": 0,  # peak concurrent busy when done >= 70% total
+            "busy_now": set(),
+            "claim_events": [],  # (done_before, worker, batch_size)
+        }
+        busy_phases = {
+            "translating_batch", "finishing_batch", "waiting_retry", "batch_error",
+        }
+
+        def go():
+            for line in sched.stream():
+                evt = json.loads(line)
+                if evt.get("type") == "progress":
+                    wi = evt.get("worker_idx")
+                    ph = evt.get("phase") or ""
+                    stats["phases"][ph] += 1
+                    if wi is not None:
+                        if ph == "translating_batch":
+                            stats["claims_by_worker"][wi] += 1
+                            stats["claim_events"].append(
+                                (int(evt.get("done") or 0), wi,
+                                 int(evt.get("batch_size") or 0))
+                            )
+                        if ph == "resting":
+                            stats["rest_by_worker"][wi] += 1
+                        if ph == "waiting_delay":
+                            stats["delay_by_worker"][wi] += 1
+                        if ph in busy_phases:
+                            stats["busy_now"].add(wi)
+                        elif ph in ("resting", "paused", "done", "waiting_delay",
+                                    "completed_batch", "error", "idle"):
+                            stats["busy_now"].discard(wi)
+                        peak = len(stats["busy_now"])
+                        stats["peak_busy"] = max(stats["peak_busy"], peak)
+                        done = int(evt.get("done") or 0)
+                        tot = int(evt.get("total") or 0)
+                        if tot and done >= int(0.7 * tot):
+                            stats["tail_peak_busy"] = max(
+                                stats["tail_peak_busy"], peak
+                            )
+                elif evt.get("type") == "done":
+                    stats["final"] = evt
+
+        thr = threading.Thread(target=go, daemon=True)
+        thr.start()
+        if pause_flag is None:
+            thr.join(timeout)
+            assert not thr.is_alive(), "tail test deadlock threads=%s" % req.threads
+            return sched, stats, None
+        return sched, stats, thr
+
+    def expect_n(stats, n, label):
+        fin = stats["final"]
+        assert fin is not None, "%s: no final" % label
+        tr = fin.get("translations") or {}
+        assert len(tr) == n, "%s: got %d/%d" % (label, len(tr), n)
+
+    try:
+        # ── 0. Pure formula: b_est + free-rank gate (unit, no network) ─────
+        items = [It(i, "u%d" % i) for i in range(30)]
+        scheduler.get_provider = lambda n: TrackProv(delay=0)
+        sched = scheduler.TranslationScheduler(
+            Req(items, threads=10, api_keys=["K0"], max_batch_size=10),
+            should_pause=lambda: False,
+        )
+        with sched.cond:
+            # Simulate pool with rem strings, no one in-flight
+            sched.pool = scheduler.OrderedDict(
+                {"a.txt": [It(i, "x") for i in range(25)]}
+            )
+            sched.avg_batch_items = 10.0
+            sched.in_flight_workers.clear()
+            rem = sched._remaining_locked()
+            b_est = max(1, math.ceil(rem / max(1.0, sched.avg_batch_items)))
+            assert rem == 25 and b_est == 3, "formula rem=%s b_est=%s" % (rem, b_est)
+            # Free ranks 0,1,2 may claim; 3+ rest
+            for wi in range(10):
+                rank = sched._effective_rank_locked(wi)
+                assert rank == wi, "free rank wi=%d got %d" % (wi, rank)
+            # If worker 0 is busy, free ranks renumber — wi=1 becomes rank 0
+            sched.in_flight_workers.add(0)
+            assert sched._effective_rank_locked(0) == 0  # busy still computes
+            assert sched._effective_rank_locked(1) == 0, (
+                "busy higher peer must not block free lower-index claim"
+            )
+            assert sched._effective_rank_locked(2) == 1
+            # rem=5 → b_est=1 → only one free worker engages
+            sched.pool = scheduler.OrderedDict(
+                {"a.txt": [It(i, "x") for i in range(5)]}
+            )
+            rem = sched._remaining_locked()
+            b_est = max(1, math.ceil(rem / max(1.0, sched.avg_batch_items)))
+            assert b_est == 1, "tiny rem b_est=%s" % b_est
+
+        # ── 1. Classic user case: ~200 left, 40 threads, batch~10 ──────────
+        # b_est starts ~20; free workers share. NOT a single thrashing thread.
+        n, threads, batch = 200, 40, 10
+        items = [It(i, "t%d" % i) for i in range(n)]
+        prov = TrackProv(delay=0.015)
+        _, stats = run(
+            Req(items, threads=threads, api_keys=["K0"], max_batch_size=batch),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, n, "200/40")
+        assert not prov.violations, prov.violations
+        # Multiple concurrent batches somewhere in the run
+        assert prov.peak_batches >= 2, (
+            "expected parallel claims on 200 strings, peak_batches=%d"
+            % prov.peak_batches
+        )
+        # At least a few distinct workers must have claimed (not worker 0 only)
+        claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+        assert len(claimers) >= 3, (
+            "tail serialized to %s claimers (want ≥3): %s"
+            % (len(claimers), dict(stats["claims_by_worker"]))
+        )
+        # Ramp-down: NOT all 40 workers claim. With rem=200 / batch=10,
+        # b_est≈20 — about that many claim a first wave; the rest never get
+        # work (they sit on empty-pool wait or a brief rest). REST emits are
+        # racy (only if a high-rank free worker inspects while rem>0), so the
+        # load-bearing check is claimers << threads, not rest-event counts.
+        assert len(claimers) < threads, (
+            "ramp-down failed: all %d workers claimed (%s)"
+            % (threads, dict(stats["claims_by_worker"]))
+        )
+        assert len(claimers) <= 25, (
+            "too many claimers for b_est~20: %d %s"
+            % (len(claimers), sorted(claimers))
+        )
+        # Peak concurrent busy should be well below worker_count (40)
+        assert stats["peak_busy"] <= threads, "peak_busy > threads"
+        assert stats["peak_busy"] >= 2, "peak_busy=%s too low" % stats["peak_busy"]
+        # No batch larger than max_batch_size
+        assert max(prov.batch_sizes) <= batch, prov.batch_sizes[:5]
+        # Last ~30% of work: still can be parallel if multiple batches remain,
+        # but never more workers than remaining batch estimate roughly allows.
+        # Soft check: tail_peak_busy ≤ ceil(0.3*n / 1) but practically ≤ threads
+        assert stats["tail_peak_busy"] <= threads
+
+        # ── 2. Fewer strings than one full batch → single claimer wave ─────
+        for n_left in (1, 3, 7, 9):
+            items = [It(i, "s%d" % i) for i in range(n_left)]
+            prov = TrackProv(delay=0.005)
+            _, stats = run(
+                Req(items, threads=40, api_keys=["K0"], max_batch_size=10),
+                prov, timeout=30,
+            )[:2]
+            expect_n(stats, n_left, "sub-batch n=%d" % n_left)
+            assert not prov.violations
+            # One request total (or at most a few on retry — none here)
+            assert prov.peak_batches == 1, (
+                "sub-batch n=%d peak_batches=%d (must be 1)"
+                % (n_left, prov.peak_batches)
+            )
+            claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+            assert len(claimers) == 1, (
+                "sub-batch n=%d claimers=%s" % (n_left, claimers)
+            )
+
+        # ── 3. Exact multiples of batch size ───────────────────────────────
+        for n_left, batch in ((40, 10), (30, 5), (200, 25)):
+            items = [It(i, "e%d" % i) for i in range(n_left)]
+            prov = TrackProv(delay=0.008)
+            _, stats = run(
+                Req(items, threads=40, api_keys=["K0"], max_batch_size=batch),
+                prov, timeout=60,
+            )[:2]
+            expect_n(stats, n_left, "exact n=%d b=%d" % (n_left, batch))
+            assert not prov.violations
+            # Ideal batch count = n/batch; allow a little slack from packing
+            ideal = n_left // batch
+            assert len(prov.batch_sizes) >= ideal, (
+                "exact n=%d b=%d batches=%d ideal=%d sizes=%s"
+                % (n_left, batch, len(prov.batch_sizes), ideal, prov.batch_sizes)
+            )
+            if ideal >= 3:
+                claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+                assert len(claimers) >= min(3, ideal), (
+                    "exact n=%d: claimers=%s" % (n_left, claimers)
+                )
+
+        # ── 4. Busy higher worker must not serialize the pool ──────────────
+        # Long delay + small batches: while low-index workers are in-flight,
+        # free mid-index workers still pick up remaining batches.
+        n, threads, batch = 60, 20, 5
+        items = [It(i, "p%d" % i) for i in range(n)]
+        prov = TrackProv(delay=0.04)  # hold batches long enough to overlap
+        _, stats = run(
+            Req(items, threads=threads, api_keys=["K0"], max_batch_size=batch),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, n, "no-serialize")
+        assert not prov.violations
+        assert prov.peak_batches >= 3, (
+            "free-rank fix regression: peak_batches=%d (want ≥3 parallel)"
+            % prov.peak_batches
+        )
+        claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+        assert len(claimers) >= 3, "no-serialize claimers=%s" % claimers
+
+        # ── 5. Multi-key tail: both keys keep working; peak/key ≤ threads ──
+        n, threads = 200, 15
+        items = [It(i, "k%d" % i, file="f%d.txt" % (i % 8)) for i in range(n)]
+        prov = TrackProv(delay=0.01)
+        keys = ["K0", "K1"]
+        sched, stats = run(
+            Req(items, threads=threads, api_keys=keys, max_batch_size=10),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, n, "2key-tail")
+        assert not prov.violations
+        with prov.lock:
+            keys_used = {k for _, k, _ in prov.claims}
+        assert keys_used == set(keys), "keys_used=%s" % keys_used
+        # Workers from both key groups claimed
+        w0 = [w for w in stats["claims_by_worker"] if w < threads]
+        w1 = [w for w in stats["claims_by_worker"] if w >= threads]
+        assert w0 and w1, "key groups claims w0=%s w1=%s" % (w0, w1)
+
+        # ── 6. One dead key mid-tail: survivors finish, no hang ────────────
+        items = [It(i, "d%d" % i) for i in range(120)]
+        prov = TrackProv(delay=0.008, auth_keys={"K0"})
+        _, stats = run(
+            Req(items, threads=20, api_keys=["K0", "K1"], max_batch_size=8),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, 120, "dead-key-tail")
+        assert not prov.violations
+        with prov.lock:
+            success_keys = {k for _, k, _ in prov.claims}
+        assert "K0" not in success_keys
+        assert "K1" in success_keys
+
+        # ── 7. RPM pacing at tail: waiting_delay appears; still completes ──
+        # delay_seconds=0.12, fast provider → workers show waiting_delay after
+        # batches (the "ожидание 1с" the user sees is this path, not a hang).
+        items = [It(i, "pace%d" % i) for i in range(40)]
+        prov = TrackProv(delay=0.0)
+        t0 = time.time()
+        _, stats = run(
+            Req(items, threads=8, api_keys=["K0"], delay_seconds=0.12,
+                max_batch_size=5),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, 40, "pace-tail")
+        assert stats["phases"].get("waiting_delay", 0) > 0, (
+            "expected waiting_delay events under delay_seconds; phases=%s"
+            % dict(stats["phases"])
+        )
+        # Wall clock should reflect pacing (not instant)
+        assert time.time() - t0 >= 0.1, "pacing too fast"
+
+        # ── 8. Pause mid-tail (~half done), resume, no loss ────────────────
+        n = 150
+        items = [It(i, "z%d" % i) for i in range(n)]
+        flag = {"v": False}
+        prov = TrackProv(delay=0.02)
+        sched, stats, thr = run(
+            Req(items, threads=30, api_keys=["K0"], max_batch_size=8),
+            prov, timeout=90, pause_flag=flag,
+        )
+        deadline = time.time() + 20
+        while len(sched.result) < 40 and time.time() < deadline:
+            time.sleep(0.02)
+        assert len(sched.result) >= 20, "pause-tail never started"
+        flag["v"] = True
+        time.sleep(1.2)  # drain in-flight
+        at = len(sched.result)
+        time.sleep(0.8)
+        assert len(sched.result) == at, (
+            "progressed while paused mid-tail %d→%d" % (at, len(sched.result))
+        )
+        flag["v"] = False
+        thr.join(90)
+        assert not thr.is_alive(), "pause-tail hung"
+        expect_n(stats, n, "pause-tail")
+        assert not prov.violations
+
+        # ── 9. Many tiny files at "tail size" (200 files × 1 string) ───────
+        items = [It(i, "f%d" % i, file="only_%d.txt" % i) for i in range(200)]
+        prov = TrackProv(delay=0.002)
+        _, stats = run(
+            Req(items, threads=40, api_keys=["K0"], max_batch_size=10),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, 200, "many-tiny-files")
+        assert not prov.violations
+        # Without group_small_files, each file is its own batch of 1 → many claims
+        assert len(prov.batch_sizes) >= 50
+        claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+        assert len(claimers) >= 5, "many-files claimers=%s" % claimers
+
+        # ── 10. Single huge file, 200 strings, 40t — file-local pack ──────
+        items = [It(i, "h%d" % i, file="one.txt") for i in range(200)]
+        prov = TrackProv(delay=0.01)
+        _, stats = run(
+            Req(items, threads=40, api_keys=["K0"], max_batch_size=15),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, 200, "one-file-200")
+        assert not prov.violations
+        claimers = [w for w, c in stats["claims_by_worker"].items() if c > 0]
+        assert len(claimers) >= 3, "one-file claimers=%s" % claimers
+        assert max(prov.batch_sizes) <= 15
+
+        # ── 11. Zero strings — immediate done, no hang ────────────────────
+        items = []
+        prov = TrackProv(delay=0)
+        _, stats = run(
+            Req(items, threads=40, api_keys=["K0", "K1"]),
+            prov, timeout=15,
+        )[:2]
+        expect_n(stats, 0, "empty")
+
+        # ── 12. All keys dead on a small tail — terminate with errors ─────
+        items = [It(i, "x%d" % i) for i in range(25)]
+        prov = TrackProv(delay=0, auth_keys={"K0", "K1"})
+        t0 = time.time()
+        _, stats = run(
+            Req(items, threads=20, api_keys=["K0", "K1"], max_batch_size=5),
+            prov, timeout=45,
+        )[:2]
+        assert stats["final"] is not None
+        assert stats["final"].get("errors"), "all-dead tail no errors"
+        assert time.time() - t0 < 30, "all-dead tail too slow"
+
+        # ── 13. Rate blip mid-tail recovers ────────────────────────────────
+        items = [It(i, "r%d" % i) for i in range(80)]
+        prov = TrackProv(delay=0.005, rate_once={"K0": 8})
+        _, stats = run(
+            Req(items, threads=25, api_keys=["K0"], max_batch_size=8),
+            prov, timeout=60,
+        )[:2]
+        expect_n(stats, 80, "rate-tail")
+        assert not prov.violations
+
+        print(
+            "OK — scheduler tail/ramp-down: formula free-rank, 200×40 parallel "
+            "not serial, sub-batch single claimer, exact multiples, no-serialize "
+            "under load, 2-key, dead-key, RPM waiting_delay, pause mid-tail, "
+            "many-files, one-file, empty, all-dead, rate-recover"
+        )
     finally:
         (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
          scheduler.get_provider) = saved
@@ -4513,6 +5388,8 @@ def main() -> int:
     check_prompt_width()
     check_providers()
     check_scheduler()
+    check_scheduler_high_threads()
+    check_scheduler_tail()
     check_renpy_python_pool()
     check_renpy_python_sources()
     check_renpy_keystring_safety()

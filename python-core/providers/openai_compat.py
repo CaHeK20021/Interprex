@@ -212,6 +212,22 @@ class CustomProvider(_OpenAICompat):
         return models[0] if models else ""
 
 
+class NvidiaProvider(_OpenAICompat):
+    """NVIDIA API Catalog / build.nvidia.com (NIM cloud).
+
+    OpenAI-compatible chat at integrate.api.nvidia.com — same path as Custom
+    with the base URL pre-filled so the user only pastes an NVIDIA API key and
+    picks a model (e.g. google/gemma-4-31b-it). No Structured Outputs required:
+    Interprex uses prompt-JSON like every other openai_compat backend.
+    """
+    name = "nvidia"
+    default_base_url = "https://integrate.api.nvidia.com/v1"
+    sends_num_ctx = False
+    # NVIDIA models often reject response_format=json_object (catalog marks
+    # many as no Structured Outputs). Prompt-only JSON is fine.
+    sends_json_object = False
+
+
 class OpenRouterProvider(_OpenAICompat):
     name = "openrouter"
     default_base_url = "https://openrouter.ai/api/v1"

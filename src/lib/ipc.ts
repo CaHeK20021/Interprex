@@ -258,7 +258,7 @@ export interface SidecarTranslateReq {
   model: string;
   max_context_tokens: number;
   max_batch_size: number;
-  // Concurrent workers PER api key (1..10). Total workers = threads * #keys.
+  // Concurrent workers PER api key (1..40). Total workers = threads * #keys.
   // Cloud only; local providers send 1.
   threads?: number;
   // Minimum wall-clock seconds a request must occupy, to pace under a provider's
@@ -286,6 +286,7 @@ export interface TranslateProgress {
   phase?:
     | "initializing"
     | "translating_batch"
+    | "finishing_batch" // pause requested; HTTP still in flight (will not start a new batch)
     | "completed_batch"
     | "paused"
     | "waiting_retry"

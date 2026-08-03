@@ -198,8 +198,9 @@ class TranslateReq(BaseModel):
     max_batch_size: int = 30
     root: str = ""
     engine: str = ""
-    # Parallelism: number of concurrent worker threads PER api key (1..10). Total
+    # Parallelism: number of concurrent worker threads PER api key (1..40). Total
     # workers = threads * number-of-keys. Cloud only; local providers send 1.
+    # Scheduler clamps to scheduler.MAX_THREADS_PER_KEY.
     threads: int = 1
     # Minimum wall-clock duration (seconds) a single request must occupy: if a
     # batch finishes faster, the worker sleeps the remainder before claiming the
@@ -297,6 +298,10 @@ _PROBE_SPECS: dict[str, dict] = {
     },
     "openrouter": {
         "url": "https://openrouter.ai/api/v1/models",
+        "header": "authorization",  # Bearer
+    },
+    "nvidia": {
+        "url": "https://integrate.api.nvidia.com/v1/models",
         "header": "authorization",  # Bearer
     },
 }

@@ -14,11 +14,19 @@ import {
 } from "./ipc";
 
 /** Which backends the user can pick. Mirrors the Python provider registry. */
-export type ProviderId = "ollama" | "lmstudio" | "kaggle" | "gemini" | "openrouter" | "custom";
+export type ProviderId =
+  | "ollama"
+  | "lmstudio"
+  | "kaggle"
+  | "gemini"
+  | "openrouter"
+  | "nvidia"
+  | "custom";
 
 // needsKey: an API key is required (cloud). needsUrl: a server URL is required
 // (no usable default — local servers have a default, Kaggle's ngrok URL does
 // not). Kaggle needs a URL AND optionally a key (vLLM started with --api-key).
+// NVIDIA Build has a fixed cloud URL (no needsUrl) — key + model only.
 export const PROVIDERS: {
   id: ProviderId;
   label: string;
@@ -30,6 +38,7 @@ export const PROVIDERS: {
   { id: "kaggle", label: "Kaggle (ngrok)", needsKey: false, needsUrl: true },
   { id: "gemini", label: "Google Gemini", needsKey: true, needsUrl: false },
   { id: "openrouter", label: "OpenRouter", needsKey: true, needsUrl: false },
+  { id: "nvidia", label: "NVIDIA Build", needsKey: true, needsUrl: false },
   { id: "custom", label: "Custom (OpenAI-compatible)", needsKey: true, needsUrl: true },
 ];
 
@@ -52,7 +61,7 @@ export interface TranslateOptions {
   maxContextTokens: number;
   /** Maximum number of strings to send in a single API request batch. */
   maxBatchSize: number;
-  /** Concurrent workers per API key (1..10). Total = threads * #keys. Cloud
+  /** Concurrent workers per API key (1..40). Total = threads * #keys. Cloud
    *  only; pass 1 for local providers. Default 1. */
   threads?: number;
   /** Minimum wall-clock seconds each request must occupy, to pace under a

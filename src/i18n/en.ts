@@ -78,8 +78,9 @@ const en = {
   onlyFreeModels: "Only free models",
   threads: "Threads",
   threadsHint:
-    "Parallel requests per API key. With 2 keys, each key gets this many. " +
-    "Higher = faster, but watch the provider's per-minute limit.",
+    "Parallel requests per API key (1–40). With 2 keys, each key gets this many " +
+    "(total workers = threads × keys). Higher = faster, but watch the provider's " +
+    "per-minute limit and set RPM so pacing keeps you under it.",
   rpmLimit: "Limit, req/min",
   rpmNoLimit: "none",
   rpmLimitHint:
@@ -142,6 +143,7 @@ const en = {
   phase_extracting: "extracting",
   phase_translating: "translating",
   phase_paused: "paused",
+  phase_pausing: "pausing (finishing in-flight batches)",
   phase_saving: "saving",
   phase_backing_up: "backing up",
   phase_injecting: "writing back",
@@ -163,13 +165,19 @@ const en = {
     `Translating batch ${num} (${size} strings) — ${elapsed}s elapsed` +
     (retry && retry > 1 ? ` (retry ${retry - 1}/100)` : "") +
     (elapsed > 15 ? " (waiting for model response)" : ""),
-  statusPaused: (num: number, size: number) =>
-    `Translation paused (batch ${num}, ${size} strings)`,
+  // Always free at the claim gate — owned batches finish before parking here.
+  statusPaused: (_num: number, _size: number) => "Paused — waiting to resume",
+  statusFinishingBatch: (num: number, size: number, elapsed: number) =>
+    `Finishing batch ${num} (${size} strings) before pause — ${elapsed}s`,
   statusWaitingRetry: (num: number, size: number, retry: number, waitLeft: number) =>
     `Translating batch ${num} (${size} strings) — Waiting before retry ${waitLeft}s` +
     (retry && retry > 0 ? ` (retry ${retry}/100)` : ""),
   statusCompletedBatch: (num: number) => `Completed batch ${num}!`,
-  statusWaitingDelay: (waitLeft: number) => `Pacing — ${waitLeft}s left`,
+  // After a successful batch: keep that fact + show RPM pacing countdown.
+  statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
+    batchNum
+      ? `Batch ${batchNum} done — waiting ${waitLeft}s`
+      : `Waiting ${waitLeft}s`,
   statusResting: "Resting (waiting for work)",
   statusWorkerError: "Key failed",
   pyStatusWaiting: "Waiting...",

@@ -671,11 +671,13 @@ export default function App() {
     Number(loadSetting("maxBatchSize", "30")),
   );
   // Parallelism + rate limit, stored PER PROVIDER. threads: workers per key
-  // (1..10). rpmLimit: the model's requests-per-minute cap PER KEY that the user
+  // (1..40). rpmLimit: the model's requests-per-minute cap PER KEY that the user
   // reads off their provider dashboard; the per-request pacing delay is DERIVED
   // from it (see rpmToDelay), so the user never thinks in seconds. 0 = no limit.
+  // Must match scheduler.MAX_THREADS_PER_KEY / the select below.
+  const MAX_THREADS = 40;
   const [threads, setThreads] = useState(() =>
-    Math.min(10, Math.max(1, Number(loadProviderSetting("providerThreads", provider, "1")) || 1)),
+    Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", provider, "1")) || 1)),
   );
   const [rpmLimit, setRpmLimit] = useState(() =>
     Math.max(0, Number(loadProviderSetting("providerRpm", provider, "0")) || 0),
@@ -724,8 +726,32 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // Drag-select: mousedown on a checkbox, drag over others to select/deselect
   const dragRef = useRef<{ active: boolean; selecting: boolean; ids: string[] } | null>(null);
-  // IDs of strings that were just translated in the current/last batch run
-  const [justTranslatedIds, setJustTranslatedIds] = useState<Set<string>>(new Set());
+  // Live "just translated" pin: id → recency rank (higher = more recent).
+  // During a run, each landed batch bumps ranks so green rows bubble to the
+  // top of the table (page 1 first). Cleared on pause/resume so the pin
+  // session starts fresh after the user continues.
+  const [justTranslatedRank, setJustTranslatedRank] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+  const justTranslatedSeqRef = useRef(0);
+  const clearJustTranslated = useCallback(() => {
+    justTranslatedSeqRef.current = 0;
+    setJustTranslatedRank(new Map());
+  }, []);
+  const pinJustTranslated = useCallback((ids: Iterable<string>) => {
+    const list = Array.isArray(ids) ? (ids as string[]) : Array.from(ids);
+    if (list.length === 0) return;
+    setJustTranslatedRank((prev) => {
+      const next = new Map(prev);
+      let seq = justTranslatedSeqRef.current;
+      for (const id of list) {
+        seq += 1;
+        next.set(id, seq);
+      }
+      justTranslatedSeqRef.current = seq;
+      return next;
+    });
+  }, []);
   // Filter strings by source type: all, regular strings (say, screen, define), python (uscore), or none
   const [stringTypeFilter, setStringTypeFilter] = useState<"all" | "regular" | "python" | "none">("all");
   // Filter strings by translation status: all, translated, or untranslated
@@ -757,8 +783,8 @@ export default function App() {
   const handleSearchQueryChange = useCallback((val: string) => {
     setSearchQuery(val);
     setPage(0);
-    setJustTranslatedIds(new Set());
-  }, []);
+    clearJustTranslated();
+  }, [clearJustTranslated]);
 
   const handleSearchModeCheckbox = (field: "original" | "translation", checked: boolean) => {
     setPage(0);
@@ -808,7 +834,7 @@ export default function App() {
     setStringTypeFilter("all");
     setOnlyLatinInTranslation(false);
     setFilterHiddenModPaths(new Set());
-    setJustTranslatedIds(new Set()); // Clear pinned/highlighted translations
+    clearJustTranslated(); // Clear pinned/highlighted translations
     setTranslationStatusFilter("all");
     setPage(0);
   };
@@ -972,12 +998,23 @@ export default function App() {
   const [activeModel, setActiveModel] = useState("");
   const [modelsLoading, setModelsLoading] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  // Fully paused = every worker finished its OWNED batch and parks free at the
+  // claim gate (`paused`). While someone still drains (`finishing_batch` /
+  // translating / retry) the header says "pausing…", not a fake global paused.
   const isFullyPaused = useMemo(() => {
     if (!isPaused) return false;
     const phases = Object.values(workerPhases);
     if (phases.length === 0) return false;
-    return phases.every((p) => p === "paused");
+    return phases.every(
+      (p) =>
+        p === "paused" ||
+        p === "done" ||
+        p === "error" ||
+        p === "idle" ||
+        p === "resting",
+    );
   }, [isPaused, workerPhases]);
+  const isPausing = isPaused && !isFullyPaused;
   const [abortController, _setAbortController] = useState<AbortController | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const setAbortController = (controller: AbortController | null) => {
@@ -1065,9 +1102,9 @@ export default function App() {
 
   // Clear recently translated highlight when changing active directory/engine
   useEffect(() => {
-    setJustTranslatedIds(new Set());
+    clearJustTranslated();
     setEditedModPaths(new Set());
-  }, [root, modsDir, translationMode]);
+  }, [root, modsDir, translationMode, clearJustTranslated]);
 
   useEffect(() => {
     ping().then((up) => {
@@ -1289,7 +1326,8 @@ export default function App() {
       // Bulk mode: apply editingVal to every string that shares this original text
       const matches = strings.filter((s) => s.original === original);
       const updatedStrings = { ...project.strings };
-      const newJustTranslated = new Set(justTranslatedIds);
+      const pinIds: string[] = [];
+      const unpinIds: string[] = [];
 
       for (const strObj of matches) {
         const prev = updatedStrings[strObj.id];
@@ -1300,9 +1338,9 @@ export default function App() {
           approved: prev?.approved ?? false,
         };
         if (editingVal.trim() !== "") {
-          newJustTranslated.add(strObj.id);
+          pinIds.push(strObj.id);
         } else {
-          newJustTranslated.delete(strObj.id);
+          unpinIds.push(strObj.id);
         }
         if (editingVal !== prevTrans && translationMode === "mods") {
           const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
@@ -1320,7 +1358,14 @@ export default function App() {
       saveProject(updated).catch(fail);
       // Defer the heavy table re-render so the next cell opens without waiting
       startTransition(() => {
-        setJustTranslatedIds(newJustTranslated);
+        if (unpinIds.length) {
+          setJustTranslatedRank((prev) => {
+            const next = new Map(prev);
+            for (const uid of unpinIds) next.delete(uid);
+            return next;
+          });
+        }
+        if (pinIds.length) pinJustTranslated(pinIds);
         setProject(updated);
       });
       if (matches.length > 1) {
@@ -1349,14 +1394,11 @@ export default function App() {
       // Heavy updates: re-rendering the table row. Deferred so clicking the
       // next cell is instant — React prioritises startEdit over this render.
       if (editingVal.trim() !== "") {
-        setJustTranslatedIds((prev) => {
-          const next = new Set(prev);
-          next.add(id);
-          return next;
-        });
+        pinJustTranslated([id]);
       } else {
-        setJustTranslatedIds((prev) => {
-          const next = new Set(prev);
+        setJustTranslatedRank((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Map(prev);
           next.delete(id);
           return next;
         });
@@ -1589,6 +1631,9 @@ export default function App() {
           }
           setIsPaused(false);
         } else {
+          // Fresh pin session after resume: only landings from here on bubble.
+          // (In-flight drain during pause may still pin — that's intentional.)
+          clearJustTranslated();
           await resumeTranslation();
           setIsPaused(false);
         }
@@ -1645,12 +1690,8 @@ export default function App() {
         return !(entry?.approved) && !(entry?.translated);
       });
 
-      // Record translating IDs so they are pinned and highlighted
-      if (targetIds) {
-        setJustTranslatedIds(new Set(todo.map((s) => s.id)));
-      } else {
-        setJustTranslatedIds(new Set());
-      }
+      // Live pin starts empty; each completed batch pins its ids (green + top).
+      clearJustTranslated();
 
       // Calculate unique representatives matching the backend de-duplication,
       // scoped to the selected mods so the progress total matches the table.
@@ -1757,8 +1798,11 @@ export default function App() {
             });
             // Fill rows live: merge each batch's translations into the project as
             // they land, so the table updates as the model works instead of all at
-            // the end.
+            // the end. Also pin them green at the top (most recent first) and
+            // jump to page 1 so the new rows are visible without scrolling.
             if (Object.keys(p.translations).length) {
+              pinJustTranslated(Object.keys(p.translations));
+              setPage(0);
               currentProject = mergeTranslations(currentProject, p.translations, strings);
               setProject(currentProject);
               if (translationMode === "mods" && targetIds) {
@@ -2014,7 +2058,7 @@ export default function App() {
     // (its own base_url gets cleared). Empty = user removed the proxy.
     saveSetting("proxyUrl", proxyUrl);
     // Cloud providers the proxy can route (mirrors the backend probe specs).
-    const cloud: ProviderId[] = ["gemini", "openrouter"];
+    const cloud: ProviderId[] = ["gemini", "openrouter", "nvidia"];
     const probe: Record<string, string> = {};
     for (const p of cloud) {
       const keys = loadProviderKeys(p).filter(Boolean);
@@ -2440,14 +2484,23 @@ export default function App() {
   }
 
   function getProgressStatusText(p: TranslateProgress): string {
-    if (isPaused || p.phase === "paused") {
+    // Per-worker truth: pause only freezes NEW claims. A worker that already
+    // owns a batch keeps translating / finishing / retrying until that batch
+    // lands, then parks free at the claim gate as `paused` (one shared state).
+    if (p.phase === "paused") {
       return t("statusPaused")(
-        p.batch_num ?? 1,
+        p.batch_num ?? 0,
         p.batch_size ?? 0
       ) as string;
     }
     if (p.phase === "initializing") {
       return t("statusInitializing") as string;
+    } else if (p.phase === "finishing_batch") {
+      return t("statusFinishingBatch")(
+        p.batch_num ?? 1,
+        p.batch_size ?? 0,
+        p.elapsed ?? 0
+      ) as string;
     } else if (p.phase === "translating_batch") {
       return t("statusTranslatingBatch")(
         p.batch_num ?? 1,
@@ -2468,7 +2521,10 @@ export default function App() {
     } else if (p.phase === "completed_batch") {
       return t("statusCompletedBatch")(p.batch_num ?? 1) as string;
     } else if (p.phase === "waiting_delay") {
-      return t("statusWaitingDelay")(p.wait_left ?? 0) as string;
+      return t("statusWaitingDelay")(
+        p.wait_left ?? 0,
+        p.batch_num
+      ) as string;
     } else if (p.phase === "resting") {
       return t("statusResting") as string;
     } else if (p.phase === "error") {
@@ -2528,7 +2584,13 @@ export default function App() {
     (translationMode === "mods" && (selectedModPaths.length === 0 || hasMixedEngines));
 
   // phase_* keys map to plain strings; cast narrows the t() union for JSX.
-  const phaseLabel = busy ? (isFullyPaused ? (t("phase_paused" as StringKey) as string) : (t(`phase_${phase}` as StringKey) as string)) : "";
+  const phaseLabel = busy
+    ? isFullyPaused
+      ? (t("phase_paused" as StringKey) as string)
+      : isPausing
+        ? (t("phase_pausing" as StringKey) as string)
+        : (t(`phase_${phase}` as StringKey) as string)
+    : "";
 
   // Filter strings by search query (original, translation, path), type and mode
   const filteredStrings = useMemo(() => {
@@ -2538,7 +2600,7 @@ export default function App() {
     if (translationMode === "mods" && modsDir && gameRoot) {
       const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/").toLowerCase();
       result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
+        if (justTranslatedRank.has(s.id)) return true;
         const filePath = s.file.startsWith("uasset://") ? s.file.substring(9) : s.file;
         const strAbs = norm(`${gameRoot}/${filePath}`);
         // Check if this string belongs to any hidden or unselected mod
@@ -2555,23 +2617,23 @@ export default function App() {
 
     // Filter by string type (regular vs python/uscore)
     if (stringTypeFilter === "regular") {
-      result = result.filter((s) => !s.path.includes("uscore") || justTranslatedIds.has(s.id));
+      result = result.filter((s) => !s.path.includes("uscore") || justTranslatedRank.has(s.id));
     } else if (stringTypeFilter === "python") {
-      result = result.filter((s) => s.path.includes("uscore") || justTranslatedIds.has(s.id));
+      result = result.filter((s) => s.path.includes("uscore") || justTranslatedRank.has(s.id));
     } else if (stringTypeFilter === "none") {
-      result = result.filter((s) => justTranslatedIds.has(s.id));
+      result = result.filter((s) => justTranslatedRank.has(s.id));
     }
 
     // Filter by translation status
     if (translationStatusFilter === "translated") {
       result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
+        if (justTranslatedRank.has(s.id)) return true;
         const entry = project?.strings[s.id];
         return entry && entry.translated && entry.translated.trim() !== "";
       });
     } else if (translationStatusFilter === "untranslated") {
       result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
+        if (justTranslatedRank.has(s.id)) return true;
         const entry = project?.strings[s.id];
         return !entry || !entry.translated || entry.translated.trim() === "";
       });
@@ -2601,7 +2663,7 @@ export default function App() {
         lenMap.set(s.id, len);
       }
       result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
+        if (justTranslatedRank.has(s.id)) return true;
         return (lenMap.get(s.id) || 0) > 0;
       });
       result = [...result].sort((a, b) => (lenMap.get(b.id) || 0) - (lenMap.get(a.id) || 0));
@@ -2610,7 +2672,7 @@ export default function App() {
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       result = result.filter((s) => {
-        if (justTranslatedIds.has(s.id)) return true;
+        if (justTranslatedRank.has(s.id)) return true;
         
         const entry = project?.strings[s.id];
         const orig = s.original.toLowerCase();
@@ -2629,17 +2691,18 @@ export default function App() {
       });
     }
 
-    // Sort recently translated rows to the top
-    if (justTranslatedIds.size > 0) {
+    // Pin recently landed translations to the top (higher rank = more recent).
+    // Stable sort keeps relative order among unpinned rows.
+    if (justTranslatedRank.size > 0) {
       result = [...result].sort((a, b) => {
-        const aJust = justTranslatedIds.has(a.id) ? 1 : 0;
-        const bJust = justTranslatedIds.has(b.id) ? 1 : 0;
-        return bJust - aJust;
+        const ar = justTranslatedRank.get(a.id) ?? 0;
+        const br = justTranslatedRank.get(b.id) ?? 0;
+        return br - ar;
       });
     }
 
     return result;
-  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedIds, translationStatusFilter, translationMode, selectedModPaths, modsDir, gameRoot, filterHiddenModPaths]);
+  }, [strings, searchQuery, searchMode, onlyLatinInTranslation, project, stringTypeFilter, target, justTranslatedRank, translationStatusFilter, translationMode, selectedModPaths, modsDir, gameRoot, filterHiddenModPaths]);
 
   // Memoize mod list statistics to avoid expensive loops on every render (e.g., during checkbox selection).
   const renderModsList = useMemo(() => {
@@ -3173,11 +3236,15 @@ export default function App() {
                     ? "ok"
                     : ph === "error" || ph === "batch_error"
                       ? "err"
-                      : ph === "translating_batch" || ph === "initializing"
+                      : ph === "translating_batch" ||
+                          ph === "finishing_batch" ||
+                          ph === "initializing"
                         ? "busy"
-                        : ph === "done" || ph === "resting" || ph === "idle"
-                          ? "stopped"
-                          : "idle";
+                        : ph === "paused"
+                          ? "idle" // purple/paused accent via phase-paused CSS
+                          : ph === "done" || ph === "resting" || ph === "idle"
+                            ? "stopped"
+                            : "idle";
                 return (
                   <div key={i} className={`worker-card phase-${ph} tone-${tone}`}>
                     <span className="worker-card-name">
@@ -3236,7 +3303,7 @@ export default function App() {
               setApiKeys(loadProviderKeys(next));
               setShownKeys(new Set());
               setModel(loadProviderSetting("providerModel", next, ""));
-              setThreads(Math.min(10, Math.max(1, Number(loadProviderSetting("providerThreads", next, "1")) || 1)));
+              setThreads(Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", next, "1")) || 1)));
               setRpmLimit(Math.max(0, Number(loadProviderSetting("providerRpm", next, "0")) || 0));
               
               // Synchronously restore freeOnly for openrouter
@@ -3280,8 +3347,8 @@ export default function App() {
               ))}
             </select>
           ) : provider === "custom" ? (
-            // Custom provider: always show a typeable field — the user knows
-            // their model name even if /models isn't reachable.
+            // Custom: always typeable — user knows their model even if /models
+            // is missing on the remote server.
             <input
               value={model}
               placeholder={t("modelPlaceholderLocal")}
@@ -3290,6 +3357,25 @@ export default function App() {
                 saveProviderSetting("providerModel", provider, e.target.value);
               }}
               disabled={busy && !isFullyPaused}
+            />
+          ) : provider === "nvidia" ? (
+            // NVIDIA: live list via GET integrate.api.nvidia.com/v1/models
+            // (same as OpenRouter — NOT a static list). While loading / if the
+            // list fails, keep a free-text field so a known id still works.
+            <input
+              value={model}
+              placeholder={
+                modelsLoading
+                  ? (t("modelCheckingKey") as string)
+                  : !primaryKey
+                    ? (t("modelNeedKey") as string)
+                    : "e.g. google/gemma-4-31b-it"
+              }
+              onChange={(e) => {
+                setModel(e.target.value);
+                saveProviderSetting("providerModel", provider, e.target.value);
+              }}
+              disabled={(busy && !isFullyPaused) || modelsLoading}
             />
           ) : providerInfo.needsKey ? (
             // Key-needing provider (Gemini) with no models: the field stays
@@ -3335,13 +3421,13 @@ export default function App() {
               <select
                 value={threads}
                 onChange={(e) => {
-                  const n = Math.min(10, Math.max(1, Number(e.target.value) || 1));
+                  const n = Math.min(MAX_THREADS, Math.max(1, Number(e.target.value) || 1));
                   setThreads(n);
                   saveProviderSetting("providerThreads", provider, String(n));
                 }}
                 disabled={busy && !isFullyPaused}
               >
-                {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
+                {Array.from({ length: MAX_THREADS }, (_, i) => i + 1).map((n) => (
                   <option key={n} value={n}>{n}</option>
                 ))}
               </select>
@@ -3876,7 +3962,7 @@ export default function App() {
                   s={s}
                   translated={entry?.translated}
                   isSelected={selectedIds.has(s.id)}
-                  isJustTranslated={justTranslatedIds.has(s.id)}
+                  isJustTranslated={justTranslatedRank.has(s.id)}
                   isEditing={editingId === s.id}
                   isBulkEdit={editingId === s.id && isBulkEdit}
                   editingVal={editingVal}

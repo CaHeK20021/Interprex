@@ -1519,6 +1519,9 @@ input[type="range"]::-webkit-slider-thumb:active {
 /* Neutral phases keep their own accent on the border without a loud tint. */
 .worker-card.phase-waiting_retry,
 .worker-card.phase-waiting_delay { border-left-color: #e0a64b; }
+/* Pause requested but HTTP still in flight — yellow busy + purple edge so it
+   doesn't look like a free "translating" card OR a fully paused one. */
+.worker-card.phase-finishing_batch { border-left-color: #7a86ff; }
 .worker-card.phase-paused { border-left-color: #7a86ff; }
 .worker-card.phase-paused .worker-dot { background: #7a86ff; }
 
