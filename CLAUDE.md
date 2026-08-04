@@ -538,7 +538,16 @@ the full app only to *see* it.
     computation (`_say_get_code`). Lines with unbalanced `[` (e.g. `if_any [
     "value"`) are correctly rejected — `[` is not in the char class so the
     regex can't consume it as a prefix token.
-  - **C#** (DLL string resources) + **Unity** (UnityPy assets).
+  - **C#** (DLL string resources) + **Unity** (UnityPy assets). Production
+    pipeline: game DLLs only (Assembly-CSharp* + deny-list middleware —
+    Naninovel/Unity.*/Elringus never extracted); typetree `m_Text` when
+    TypeTreeGenerator works; **content blobs** (Naninovel Script /
+    I2 / Yarn markers or dialogue-density) with `AssetRaw` path =
+    `[type, path_id, byte_offset]`; small UI raw pass only when typetree
+    dead; rich-text tags kept (`</i>` is not a path); inject rebuilds
+    MonoBehaviour raw via `set_raw_data` so translations may be longer
+    than EN (no truncate). Verified on Touchstarved (Naninovel): ~3.5k
+    unique dialogue, 0 lorem/DLL junk, RU longer-than-EN inject round-trip.
   - **i18n** (JSON/key-value locale files).
   - **Fusion/Chowdren** (.dia): ARR1.0 container, number+31 cipher (Iconoclasts).
   - **MMF2** langfile: INI `lang_*.txt` (Baba Is You).
@@ -592,7 +601,8 @@ the full app only to *see* it.
 - Adaptive calibration from real `usage`; graceful fallback everywhere.
 - Parallel scheduler (`scheduler.py`): N threads × M keys, priority ramp-down,
   key-failover reclaim, request pacing + staggered retries, error-class handling,
-  pause that never drops an in-flight batch. Live per-thread status grid +
+  pause that never drops a successful in-flight batch (HTTP always finishes;
+  on FAILURE while paused → hold, no auto-retry until Continue). Live per-thread status grid +
   resting coverage bar in the UI; OpenRouter daily-quota readout.
 - Themed in-app folder browser (`FolderPicker.tsx` + `/fs/*`) with game-launcher
   quick-jumps (Steam/Epic/GOG); replaces the native OS dialog.

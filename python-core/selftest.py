@@ -4296,6 +4296,43 @@ def check_scheduler() -> None:
         assert out["final"] and len(out["final"]["translations"]) == 50, \
             "pause/resume lost strings"
 
+        # Pause after a batch ERROR: must NOT auto-retry while paused (user hit
+        # Pause because something is wrong — hammering is the opposite).
+        class FailNProvider(FakeProvider):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+                self.lock = threading.Lock()
+
+            def translate(self, batch, lang, glossary, cfg, engine=""):
+                with self.lock:
+                    self.calls += 1
+                    n = self.calls
+                if n <= 2:
+                    raise RuntimeError("The read operation timed out")
+                return super().translate(batch, lang, glossary, cfg, engine)
+
+        items = [It(i, "to%d" % i) for i in range(5)]
+        flag = {"v": False}
+        fail_prov = FailNProvider()
+        # 1 thread so the first batch is the only one in flight.
+        sched, t, out = run(Req(items, threads=1), fail_prov, pause_flag=flag)
+        # Let the first (failing) attempt fire, then pause immediately.
+        time.sleep(0.15)
+        flag["v"] = True
+        time.sleep(0.3)
+        calls_at_pause = fail_prov.calls
+        time.sleep(1.5)
+        assert fail_prov.calls == calls_at_pause, (
+            "auto-retried while paused after error (%d → %d)"
+            % (calls_at_pause, fail_prov.calls)
+        )
+        flag["v"] = False
+        t.join(20)
+        assert not t.is_alive(), "pause-after-error hung"
+        assert out["final"] and len(out["final"]["translations"]) == 5, \
+            "pause-after-error lost strings on resume"
+
         # --- Hybrid fit: re-ask shorter, then record a font-shrink factor -------
         # A menu choice needs a pixel budget, which the scheduler computes only for
         # renpy + a "menu" path + a resolved source font. Drive that path with a

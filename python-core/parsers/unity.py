@@ -1,7 +1,15 @@
 """Parser for Unity.
 
-Extracts/injects code strings from C# DLL files (using DllEditor Mono.Cecil helper)
-and UI-text strings from scenes, prefabs, assets, and Addressables localization StringTables.
+Production extract pipeline (priority order):
+  1. Game DLLs only (Assembly-CSharp* + non-middleware) via DllEditor
+  2. Addressables localization StringTables
+  3. Typetree UI fields (m_Text / m_text) when TypeTreeGenerator works
+  4. Content MonoBehaviours — VN/script/localization blobs (Naninovel, I2, Yarn, …)
+     identified by markers OR dialogue density; length-prefix with byte offsets
+  5. Small UI MonoBehaviours raw fallback (strict filter) when typetree failed
+
+Inject: typetree save when possible; otherwise rebuild MonoBehaviour raw with
+length-changing string slots + UnityPy set_raw_data (no truncate-to-EN-length).
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ SKIP_NAMESPACES = {
     "ProBuilder",
     "UnityEngine.ProBuilder",
     "UnityEngine.Timeline",
-    "UnityEngine.Playables", 
+    "UnityEngine.Playables",
     "Unity.Collections",
     "Unity.TextMeshPro",
     "TMPro",
@@ -39,12 +47,43 @@ SKIP_NAMESPACES = {
     "Unity.Services",
     "Newtonsoft.Json",
     "AstarPathfindingProject",
-    "Pathfinding"
+    "Pathfinding",
+    "Naninovel",
+    "Elringus",
 }
 
 IGNORE_DIRS = {
     "bin", "obj", ".vs", "node_modules", "venv", ".git", ".interprex_backups", "__macosx"
 }
+
+# Markers: MonoBehaviour raw that holds STORY/LOCALIZATION text (not engine UI chrome).
+# Universal — any middleware that bakes dialogue into serialized script assets.
+_CONTENT_MARKERS: tuple[bytes, ...] = (
+    b"GenericTextScriptLine",   # Naninovel Script
+    b"LabelScriptLine",
+    b"CommandScriptLine",
+    b"CommentScriptLine",
+    b"mTerms",                  # I2 Localization
+    b"mTermData",
+    b"TermData",
+    b"DialogueEntry",           # Dialogue System / similar
+    b"Yarn.Unity",
+    b"YarnProgram",
+    b"InkList",
+    b"LocalizedStringTable",
+    b"StringTableEntry",
+    b"ScriptableDialogue",
+)
+
+# Config/locale blobs that look "texty" but must not enter the table.
+_SKIP_BLOB_MARKERS: tuple[bytes, ...] = (
+    b"CultureInfo",
+    b"ManagedTextConfiguration",
+    b"ResourceProviderConfiguration",
+)
+
+# Soft size gate for "UI chrome" raw pass (prefab text, menus). Content blobs ignore this.
+_UI_RAW_MAX_SIZE = 48_000
 
 def should_skip_type(type_full_name: str) -> bool:
     if not type_full_name:
@@ -55,20 +94,46 @@ def should_skip_type(type_full_name: str) -> bool:
     return False
 
 def is_custom_dll(filename: str) -> bool:
-    """True if the DLL is likely game code or a custom mod (not system/engine library)."""
+    """True if the DLL is likely game/mod code (not engine, middleware, or runtime).
+
+    Always keeps Assembly-CSharp*. Rejects known Unity/middleware stacks so
+    Naninovel/TMP/Mathematics error strings never pollute the extract table.
+    Unknown third-party mod DLLs still pass (deny-list, not allow-list).
+    """
     fn = filename.lower()
     if not fn.endswith(".dll"):
         return False
-    system_prefixes = (
-        "system.", "microsoft.", "unityengine.", "unityeditor.", "mscorlib",
-        "netstandard", "mono.", "newtonsoft", "fastjson", "nlog", "log4net",
+
+    # Game scripts — always
+    if fn.startswith("assembly-csharp"):
+        return True
+
+    # Exact runtime / player binaries that used to slip through
+    if fn in (
+        "unityplayer.dll", "baselib.dll", "gameassembly.dll",
+        "unitycrashhandler64.dll", "unitycrashhandler32.dll",
+    ):
+        return False
+    if fn.startswith("mono"):
+        return False
+
+    deny_prefixes = (
+        "system.", "microsoft.", "unityengine.", "unityeditor.", "unity.",
+        "mscorlib", "netstandard", "mono.", "newtonsoft", "fastjson", "nlog", "log4net",
         "protobuf", "steamworks", "epoxy", "i2local", "customui", "harmony",
         "bepinex", "accessibility", "webconnection", "sqlite", "mysql", "audiotoolbox",
-        "qsp", "fmod", "sdl", "openal", "openvr", "softpcg"
+        "qsp", "fmod", "sdl", "openal", "openvr", "softpcg",
+        # VN / middleware engines (strings are framework errors, not game text)
+        "elringus.", "naninovel.", "naninovel",
+        "spine.", "DOTween", "dotween", "rewired", "photon", "mirror.",
+        "facepunch", "com.unity.", "unityengine",
     )
-    for pref in system_prefixes:
-        if fn.startswith(pref):
+    for pref in deny_prefixes:
+        if fn.startswith(pref.lower()):
             return False
+    # Unity.* modules ship as Unity.Mathematics.dll etc.
+    if fn.startswith("unity"):
+        return False
     return True
 
 # ── Compiled regexes ────────────────────────────────────────────────────────
@@ -76,7 +141,7 @@ _GUID_RE          = re.compile(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f
 _VERSION_RE       = re.compile(r'^v?\d+(\.\d+){2,}([.\-+]\w+)?$')
 _HEX_HASH_RE      = re.compile(r'^[0-9a-fA-F]{12,}$')
 _URL_RE           = re.compile(r'https?://|www\.')
-_PATH_RE          = re.compile(r'[/\\]')
+_RICH_TAG_RE      = re.compile(r'</?[a-zA-Z#/][^<>]*>')  # TMP/Naninovel rich text
 _EXT_RE           = re.compile(
     r'\.(png|jpg|jpeg|gif|bmp|tga|wav|mp3|ogg|mp4|avi'
     r'|prefab|unity|asset|shader|mat|anim|controller'
@@ -93,6 +158,35 @@ _CODE_WORD_RE     = re.compile(
     r'|^[A-Z0-9]{2,}(?:_[A-Z0-9]+)+$'           # SCREAMING_SNAKE
     r'|^(?:\w+_)+\w+$'                           # any_underscore_word
 )
+_NANO_ID_RE       = re.compile(r'^~[0-9a-f]{6,}$', re.I)
+_ASSEMBLY_NAME_RE = re.compile(
+    r'Version=\d+\.\d+\.\d+\.\d+|Culture=neutral|PublicKeyToken=|Elringus\.|Naninovel\.',
+    re.I,
+)
+_TYPE_NAME_RE     = re.compile(
+    r'^(?:[A-Z][a-zA-Z0-9]+)+(?:ScriptLine|Configuration|Manager|Behaviour|'
+    r'Provider|Controller|Handler|Component|Attribute|Exception|Serializer|'
+    r'Localizer|Parser|Player|Navigator)$'
+)
+
+
+def _strip_rich_tags(t: str) -> str:
+    return _RICH_TAG_RE.sub("", t)
+
+
+def _looks_like_filesystem_path(t: str) -> bool:
+    """True for real asset/FS paths — NOT rich-text closing tags like </i>."""
+    plain = _strip_rich_tags(t)
+    if "\\" in plain:
+        return True
+    if re.match(r"^[A-Za-z]:/", plain):
+        return True
+    if re.search(r"(?:^|[\s\"'])(?:Assets|Resources|StreamingAssets|Packages)/", plain):
+        return True
+    # multi-segment path ending in a file-like token
+    if re.search(r"(?:^|/)\w+(?:/[\w.-]+){2,}", plain) and _EXT_RE.search(plain):
+        return True
+    return False
 
 # ── Whitelist: однословные UI-метки которые точно нужны ─────────────────────
 _KNOWN_UI = frozenset({
@@ -136,30 +230,41 @@ def _is_game_text(text: str) -> bool:
     if not any(c.isalpha() for c in t):
         return False
 
+    plain = _strip_rich_tags(t).strip()
+    if not plain or not any(c.isalpha() for c in plain):
+        return False
+
     # ── Жесткие исключения ──────────────────────────────────────────────────
     if _GUID_RE.match(t):           return False
     if _VERSION_RE.match(t):        return False
     if _HEX_HASH_RE.match(t):       return False
     if _URL_RE.search(t):           return False
-    if _PATH_RE.search(t):          return False
-    if _EXT_RE.search(t):           return False
+    if _looks_like_filesystem_path(t): return False
+    if _EXT_RE.search(plain) and "/" not in t and "\\" not in t and "<" not in t:
+        # bare "foo.png" — skip; rich-text with tags already stripped above
+        if " " not in plain:
+            return False
     if _PLACEHOLDER_RE.match(t):    return False
     if _LOG_TAG_RE.match(t):        return False
+    if _ASSEMBLY_NAME_RE.search(t): return False
+    if _NANO_ID_RE.match(t):        return False
+    if _TYPE_NAME_RE.match(t):      return False
+    if "lorem ipsum" in t.lower():  return False
 
     # ── Быстрый пропуск: очевидно человеческий текст ───────────────────────
-    if ' ' in t or '\n' in t:       return True   # многословный / диалог
-    if t.lower() in _KNOWN_UI:      return True   # известная UI-метка
+    if " " in plain or "\n" in plain: return True   # многословный / диалог
+    if plain.lower() in _KNOWN_UI:  return True   # известная UI-метка
 
     # ── Одно слово: усиленный фильтр ────────────────────────────────────────
-    if _CODE_WORD_RE.match(t):      return False
-    if t.lower() in _KNOWN_CODE:    return False
+    if _CODE_WORD_RE.match(plain):  return False
+    if plain.lower() in _KNOWN_CODE: return False
 
     # Все-капсовое короткое слово без подчеркиваний -> кнопка UI (PLAY, EXIT)
-    if t.isupper() and len(t) <= 20 and '_' not in t:
+    if plain.isupper() and len(plain) <= 20 and "_" not in plain:
         return True
 
     # Title-case слово нормальной длины -> название предмета/локации
-    if t[0].isupper() and t[1:].islower() and 4 <= len(t) <= 30:
+    if plain[0].isupper() and plain[1:].islower() and 4 <= len(plain) <= 30:
         return True
 
     return False
@@ -240,6 +345,7 @@ def _is_game_text_raw(text: str) -> bool:
 
     Builds on _is_game_text but adds guards against common Unity asset junk
     that only shows up in raw extraction (no typetree context).
+    Rich-text tags (<i>, </color>, …) are allowed — slash-in-tag is NOT a path.
     """
     t = text.strip()
 
@@ -249,29 +355,51 @@ def _is_game_text_raw(text: str) -> bool:
     if not any(c.isalpha() for c in t):
         return False
 
+    plain = _strip_rich_tags(t).strip()
+    if not plain or not any(c.isalpha() for c in plain):
+        return False
+
     if _GUID_RE.match(t):              return False
     if _VERSION_RE.match(t):           return False
     if _VERSION_RAW_RE.match(t):       return False
     if _HEX_HASH_RE.match(t):          return False
     if _URL_RE.search(t):              return False
-    if _PATH_RE.search(t):             return False
-    if _EXT_RE.search(t):              return False
+    if _looks_like_filesystem_path(t): return False
+    if _EXT_RE.search(plain) and " " not in plain and "<" not in t:
+        return False
     if _LOG_TAG_RE.match(t):           return False
+    if _ASSEMBLY_NAME_RE.search(t):    return False
+    if _NANO_ID_RE.match(t):           return False
+    if _TYPE_NAME_RE.match(t):         return False
 
     low = t.lower()
+    plain_low = plain.lower()
 
     # ── Hard rules: underscore = internal identifier, never dialogue ────────
-    if '_' in t:
+    # Apply on tag-stripped text so "<color=…>foo_bar</color>" still rejected,
+    # but dialogue with no underscore passes even if tags contain '='.
+    if "_" in plain:
         return False
 
-    # ── Hard rule: "Unity" anywhere = engine internal ───────────────────────
-    if 'unity' in low:
+    # ── Hard rule: "Unity" as engine token (not the word inside a sentence) ──
+    if plain_low == "unity" or plain_low.startswith("unityengine") or plain_low.startswith("unity."):
         return False
 
     # ── Hard rule: assembly references ("UnityEngine...", "Version=0.0.0.0") ─
-    if ', assembly-' in low or ', unity.' in low or ', unityengine' in low:
+    if ", assembly-" in low or ", unity." in low or ", unityengine" in low:
         return False
-    if 'version=0.0.0.0' in low or 'culture=neutral' in low:
+    if "version=0.0.0.0" in low or "culture=neutral" in low:
+        return False
+
+    # ── Framework / placeholder chrome (Naninovel defaults, TMP samples) ───
+    if "lorem ipsum" in plain_low:
+        return False
+    if plain_low in (
+        "naninovel", "choice text", "actor name", "tip title", "tip category",
+        "memory usage text", "confirmation message.", "new text",
+        "select a script to play", "panel title", "dialogue options",
+        "1. lorem ipsum",
+    ):
         return False
 
     # ── Placeholder / gibberish ─────────────────────────────────────────────
@@ -389,15 +517,15 @@ def _is_game_text_raw(text: str) -> bool:
             pass  # keep it — could be all-caps UI like "SPACE"
 
     # ── Standard pass-through ───────────────────────────────────────────────
-    if ' ' in t or '\n' in t:              return True   # multi-word → likely dialogue/UI
-    if t.lower() in _KNOWN_UI:             return True
+    if " " in plain or "\n" in plain:      return True   # multi-word → likely dialogue/UI
+    if plain_low in _KNOWN_UI:             return True
 
     # ALL CAPS button label
-    if t.isupper() and len(t) <= 20 and '_' not in t:
+    if plain.isupper() and len(plain) <= 20 and "_" not in plain:
         return True
 
     # Title-case normal word
-    if t[0].isupper() and t[1:].islower() and 3 <= len(t) <= 30:
+    if plain[0].isupper() and plain[1:].islower() and 3 <= len(plain) <= 30:
         return True
 
     return False
@@ -405,20 +533,69 @@ def _is_game_text_raw(text: str) -> bool:
 
 def _extract_length_prefixed(raw: bytes) -> list[str]:
     """Extract all length-prefixed UTF-8 strings from Unity serialized bytes."""
-    strings = []
+    return [s for _, s in _extract_length_prefixed_at(raw)]
+
+
+def _extract_length_prefixed_at(raw: bytes) -> list[tuple[int, str]]:
+    """Like _extract_length_prefixed but returns (byte_offset, string) pairs.
+
+    Offset points at the int32 length prefix — used as the stable inject address.
+    Scans every byte (Unity blobs interleave strings with binary); overlaps are
+    possible in theory, so callers should prefer non-overlapping left-to-right.
+    """
+    out: list[tuple[int, str]] = []
     i = 0
-    while i + 4 < len(raw):
-        slen = struct.unpack_from('<I', raw, i)[0]
-        if 2 <= slen <= 5000 and i + 4 + slen <= len(raw):
-            chunk = raw[i+4:i+4+slen]
+    n = len(raw)
+    while i + 4 < n:
+        slen = struct.unpack_from("<I", raw, i)[0]
+        if 2 <= slen <= 5000 and i + 4 + slen <= n:
+            chunk = raw[i + 4 : i + 4 + slen]
             try:
-                s = chunk.decode('utf-8')
+                s = chunk.decode("utf-8")
                 if s.isprintable() and len(s) > 0:
-                    strings.append(s)
+                    out.append((i, s))
             except (UnicodeDecodeError, ValueError):
                 pass
         i += 1
-    return strings
+    return out
+
+
+def _aligned_string_end(offset: int, slen: int) -> int:
+    """Byte offset after a Unity AlignedString (length + data + pad to 4)."""
+    end = offset + 4 + slen
+    return (end + 3) & ~3
+
+
+def _pack_aligned_string(text: str) -> bytes:
+    data = text.encode("utf-8")
+    blob = struct.pack("<I", len(data)) + data
+    pad = (4 - (len(blob) % 4)) % 4
+    if pad:
+        blob += b"\x00" * pad
+    return blob
+
+
+def _blob_is_content(raw: bytes) -> bool:
+    """True if this MonoBehaviour looks like story/localization payload."""
+    if any(m in raw for m in _CONTENT_MARKERS):
+        return True
+    # Density heuristic: many multi-word prose strings → dialogue-ish asset
+    if len(raw) < 8_000:
+        return False
+    hits = 0
+    for _, s in _extract_length_prefixed_at(raw):
+        t = s.strip()
+        if len(t) >= 40 and " " in t and _is_game_text_raw(t):
+            hits += 1
+            if hits >= 12:
+                return True
+    return False
+
+
+def _blob_is_skip_config(raw: bytes) -> bool:
+    if any(m in raw for m in _CONTENT_MARKERS):
+        return False
+    return any(m in raw for m in _SKIP_BLOB_MARKERS)
 
 
 def find_aa_dir(root: str) -> str | None:
@@ -728,6 +905,7 @@ class UnityParser(BaseParser):
 
             failed_count = 0
             typetree_found = 0
+            env = None
             try:
                 env = UnityPy.load(fpath)
                 # Resolve and set generator using cached helper
@@ -831,12 +1009,33 @@ class UnityParser(BaseParser):
                             failed_count += 1
             except Exception as e:
                 print(f"Error parsing assets file {fpath}: {e}", file=sys.stderr)
+                env = None
 
-            if typetree_found == 0 and failed_count > 0:
-                print(f"Typetree failed for all {failed_count} objects in {os.path.basename(fpath)}, trying length-prefix fallback.", file=sys.stderr)
-                results.extend(self._extract_raw_fallback(fpath, root))
-            elif failed_count > 0:
-                print(f"Warning: Failed to extract {failed_count} objects in compiled asset {fpath}.", file=sys.stderr)
+            # Always try content blobs (Naninovel Script, I2, Yarn, …) — they are
+            # almost never m_Text fields, so typetree success on UI does not cover them.
+            if env is not None:
+                content_n = self._extract_raw_from_env(
+                    env, fpath, root, results, mode="content"
+                )
+                if typetree_found == 0 and failed_count > 0:
+                    print(
+                        f"Typetree failed for {failed_count} objects in "
+                        f"{os.path.basename(fpath)}; content-blob hit {content_n}, "
+                        f"running UI raw pass.",
+                        file=sys.stderr,
+                    )
+                    # Small UI chrome only when typetree is dead; skip if content
+                    # already gave us a full script game (avoids lorem placeholders
+                    # from the same Naninovel default UI when scripts dominate).
+                    self._extract_raw_from_env(
+                        env, fpath, root, results, mode="ui"
+                    )
+                elif failed_count > 0:
+                    print(
+                        f"Warning: Failed to extract {failed_count} objects in "
+                        f"compiled asset {fpath}.",
+                        file=sys.stderr,
+                    )
 
         for fpath in source_files:
             rel_path = os.path.relpath(fpath, root).replace("\\", "/")
@@ -864,219 +1063,277 @@ class UnityParser(BaseParser):
 
         return results
 
-    def _extract_raw_fallback(self, fpath: str, root: str) -> list[TranslationString]:
-        """Fallback extraction via length-prefix scanning of raw MonoBehaviour bytes.
+    def _extract_raw_from_env(
+        self,
+        env: Any,
+        fpath: str,
+        root: str,
+        results: list[TranslationString],
+        mode: str = "content",
+    ) -> int:
+        """Length-prefix extract from MonoBehaviours already loaded in ``env``.
 
-        Used when typetree fails for ALL objects in an asset file (missing DLL,
-        unknown type tree, etc.). Scans raw bytes for Unity's int32-length-prefixed
-        UTF-8 strings and applies a stricter filter than the typetree path.
-        Provides context from sibling strings in the same blob (neighboring
-        strings from the same MonoBehaviour are usually related — a character
-        name near its dialogue, a quest title near its description).
+        mode:
+          - ``content``: script/localization blobs (markers or dialogue density)
+          - ``ui``: small chrome MonoBehaviours only (menus, buttons)
+          - ``all``: every MonoBehaviour (legacy full scan)
+
+        Paths are ``["AssetRaw", type, path_id, byte_offset]`` so inject can
+        rewrite the exact slot and grow/shrink the string.
+        Appends into ``results``; returns how many strings were added.
         """
         rel_path = os.path.relpath(fpath, root).replace("\\", "/")
-        results = []
-        seen_texts: set[str] = set()
+        # Dedup by stable id key so content+ui passes don't double-emit
+        existing = {(s.file, tuple(s.path), s.original) for s in results}
+        added = 0
+        base = os.path.basename(fpath)
+
+        _UI_NAMES = frozenset({
+            "play", "quit", "load", "save", "back", "next", "yes", "no",
+            "ok", "all", "none", "video", "audio", "game", "settings",
+            "gallery", "music", "loading", "credits", "options", "resume",
+            "start", "new", "continue", "delete", "accept", "cancel",
+            "confirm", "close", "help", "return", "pause", "skip",
+            "adult", "content", "disclaimer",
+        })
 
         try:
-            import UnityPy
-            env = UnityPy.load(fpath)
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
-                raw = obj.get_raw_data()
+                try:
+                    raw = obj.get_raw_data()
+                except Exception:
+                    continue
                 if len(raw) < 20:
                     continue
 
-                # Phase 1: collect all valid strings from this blob
-                blob_strings: list[str] = []
-                for s in _extract_length_prefixed(raw):
-                    t = s.strip()
-                    if t and t not in seen_texts and _is_game_text_raw(t):
-                        blob_strings.append(t)
-
-                if not blob_strings:
+                is_content = _blob_is_content(raw)
+                if mode == "content":
+                    if not is_content:
+                        continue
+                elif mode == "ui":
+                    if is_content or _blob_is_skip_config(raw):
+                        continue
+                    if len(raw) > _UI_RAW_MAX_SIZE:
+                        continue
+                elif mode == "all":
+                    if _blob_is_skip_config(raw) and not is_content:
+                        continue
+                else:
                     continue
 
-                # Phase 2: detect possible speaker names in this blob
-                # Names: 1-2 words, ≤20 chars, starts uppercase, not a common UI word
-                _UI_NAMES = frozenset({
-                    "play", "quit", "load", "save", "back", "next", "yes", "no",
-                    "ok", "all", "none", "video", "audio", "game", "settings",
-                    "gallery", "music", "loading", "credits", "options", "resume",
-                    "start", "new", "continue", "delete", "accept", "cancel",
-                    "confirm", "close", "help", "return", "pause", "skip",
-                    "adult", "content", "disclaimer",
-                })
+                # Non-overlapping left-to-right scan (skip nested false hits)
+                candidates: list[tuple[int, str]] = []
+                cursor = 0
+                for offset, s in _extract_length_prefixed_at(raw):
+                    if offset < cursor:
+                        continue
+                    t = s.strip()
+                    if not t or not _is_game_text_raw(t):
+                        continue
+                    # Keep original bytes (not stripped) for inject fidelity
+                    candidates.append((offset, s))
+                    slen = struct.unpack_from("<I", raw, offset)[0]
+                    cursor = _aligned_string_end(offset, slen)
+
+                if not candidates:
+                    continue
+
+                texts = [s.strip() for _, s in candidates]
                 possible_names: list[str] = []
-                for s in blob_strings:
+                for s in texts:
                     words = s.split()
-                    if (1 <= len(words) <= 2 and
-                            len(s) <= 20 and
-                            s[0].isupper() and
-                            s.lower() not in _UI_NAMES and
-                            not any(c in s for c in '?!.:;,()[]{}') and
-                            not s.isupper() and
-                            not re.match(r'^[A-Z][a-z]+$', s)):  # single common word like "Video"
+                    if (
+                        1 <= len(words) <= 2
+                        and len(s) <= 20
+                        and s[0].isupper()
+                        and s.lower() not in _UI_NAMES
+                        and not any(c in s for c in "?!.:;,()[]{}")
+                        and not s.isupper()
+                        and not re.match(r"^[A-Z][a-z]+$", s)
+                    ):
                         possible_names.append(s)
 
-                # Phase 3: emit each string with full context
-                for idx, t in enumerate(blob_strings):
-                    seen_texts.add(t)
+                for offset, s in candidates:
+                    t = s.strip()
+                    path = ["AssetRaw", obj.type.name, str(obj.path_id), str(offset)]
+                    key = (rel_path, tuple(path), t)
+                    if key in existing:
+                        continue
+                    existing.add(key)
 
-                    ctx_parts = [f"File: {os.path.basename(fpath)}"]
-
-                    # Speaker hint (only for dialogue blobs)
-                    if possible_names and len(possible_names) <= 3:
+                    ctx_parts = [f"File: {base}", f"PathID: {obj.path_id}"]
+                    if is_content:
+                        ctx_parts.append("Kind: content")
+                    if possible_names and len(possible_names) <= 3 and " " in t and len(t) > 10:
                         ctx_parts.append(f"Speakers in this block: {', '.join(possible_names)}")
-
-                    # Sibling context: only for dialogue-like strings
-                    # (multi-word, >10 chars). UI buttons like "Play", "SOLD OUT"
-                    # don't need context — LLM knows what they are.
-                    siblings = [s for s in blob_strings if s != t]
-                    if siblings and ' ' in t and len(t) > 10:
-                        capped = []
+                    siblings = [x for x in texts if x != t]
+                    if siblings and " " in t and len(t) > 10:
+                        capped: list[str] = []
                         total = 0
-                        for s in siblings:
-                            if len(capped) >= 15:
+                        for sib in siblings:
+                            if len(capped) >= 12:
                                 break
-                            addition = len(s) + 2
-                            if total + addition > 800:
+                            addition = len(sib) + 2
+                            if total + addition > 600:
                                 break
-                            capped.append(s)
+                            capped.append(sib)
                             total += addition
-                        ctx_parts.append(f"Other strings in this block: {'; '.join(capped)}")
+                        if capped:
+                            ctx_parts.append(f"Other strings in this block: {'; '.join(capped)}")
 
-                    path = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
                     results.append(self._mk(rel_path, path, t, ", ".join(ctx_parts)))
+                    added += 1
+        except Exception as e:
+            print(f"Error in raw extract ({mode}) for {fpath}: {e}", file=sys.stderr)
+
+        return added
+
+    def _extract_raw_fallback(self, fpath: str, root: str) -> list[TranslationString]:
+        """Legacy entry: full raw scan (content + ui). Prefer _extract_raw_from_env."""
+        results: list[TranslationString] = []
+        try:
+            import UnityPy
+            env = UnityPy.load(fpath)
+            self._extract_raw_from_env(env, fpath, root, results, mode="content")
+            self._extract_raw_from_env(env, fpath, root, results, mode="ui")
         except Exception as e:
             print(f"Error in raw fallback for {fpath}: {e}", file=sys.stderr)
-
         return results
 
     def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str],
                              env: Any = None, font_bytes: bytes | None = None,
                              target_lang: str | None = None) -> int:
-        """Inject translations AND fonts via pure binary patching — no UnityPy.save().
+        """Inject into MonoBehaviour raw via length-changing string rebuild.
 
-        Patches both strings and fonts in the same pass, writing the file
-        once at the end. This avoids UnityPy's re-serialization.
+        Prefers path-addressed slots ``AssetRaw / type / path_id / offset``.
+        Falls back to text-match for legacy ``RawFallback`` paths.
+        Uses UnityPy ``set_raw_data`` + file save so RU can be longer than EN.
         """
         rel_path = os.path.relpath(fpath, root).replace("\\", "/")
         written = 0
 
         try:
-            with open(fpath, "rb") as f:
-                file_bytes = bytearray(f.read())
-
-            patches: list[tuple[int, int, bytes]] = []
-
             if env is None:
                 import UnityPy
                 env = UnityPy.load(fpath)
 
-            # Font patching via raw bytes — replace PPtr references to non-Cyrillic fonts
-            # with LiberationSans (which supports Cyrillic). This is a SAFE size-preserving
-            # change: we only swap 8-byte path_ids in PPtrs, no file size change.
-            is_non_latin = target_lang and target_lang.lower() in ("ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr")
-            if is_non_latin:
-                # Find LiberationSans path_id (our target)
-                liberation_pid = None
-                for obj in env.objects:
-                    if obj.type.name == "Font":
-                        try:
-                            data = obj.read()
-                            if data.m_Name == "LiberationSans":
-                                liberation_pid = obj.path_id
-                                break
-                        except:
-                            pass
-
-                if liberation_pid:
-                    # Find all Font objects that DON'T support Cyrillic
-                    # and build a map: old_pid -> liberation_pid
-                    non_cyrillic_fonts = set()
-                    for obj in env.objects:
-                        if obj.type.name == "Font":
-                            try:
-                                data = obj.read()
-                                if data.m_Name != "LiberationSans":
-                                    non_cyrillic_fonts.add(obj.path_id)
-                            except:
-                                pass
-
-                    if non_cyrillic_fonts:
-                        # Scan entire file for PPtr references to non-Cyrillic fonts
-                        # PPtr = int32 FileID (0) + int64 PathID
-                        for old_pid in non_cyrillic_fonts:
-                            old_pptr = struct.pack('<Iq', 0, old_pid)
-                            new_pptr = struct.pack('<Iq', 0, liberation_pid)
-                            idx = 0
-                            while True:
-                                idx = file_bytes.find(old_pptr, idx)
-                                if idx < 0:
-                                    break
-                                patches.append((idx, idx + 12, new_pptr))
-                                idx += 12
-
-            # String patching via raw bytes
+            # path forms:
+            #   AssetRaw | MonoBehaviour | <path_id> | <offset>
+            #   RawFallback | MonoBehaviour | <path_id> | length_prefix  (legacy)
+            # Scan blobs and make_id each candidate (same walk as extract).
+            objects_changed = 0
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
-                raw = obj.get_raw_data()
+                try:
+                    raw = bytes(obj.get_raw_data())
+                except Exception:
+                    continue
                 if len(raw) < 20:
                     continue
 
-                # Use the object's EXACT byte offset in the file — no search
-                raw_offset = obj.byte_start
+                # Collect replacements: offset -> new_text (only for slots we own)
+                replacements: dict[int, str] = {}
+                cursor = 0
+                for offset, s in _extract_length_prefixed_at(raw):
+                    if offset < cursor:
+                        continue
+                    t = s.strip()
+                    slen = struct.unpack_from("<I", raw, offset)[0]
+                    end = _aligned_string_end(offset, slen)
+                    cursor = end
+                    if not t or not _is_game_text_raw(t):
+                        continue
 
-                # Scan raw blob for strings
-                j = 0
-                while j + 4 < len(raw):
-                    slen = struct.unpack_from('<I', raw, j)[0]
-                    if 2 <= slen <= 5000 and j + 4 + slen <= len(raw):
-                        chunk = raw[j+4:j+4+slen]
-                        try:
-                            s = chunk.decode('utf-8')
-                            if s.isprintable() and len(s) > 0:
-                                t = s.strip()
-                                if t and '_' not in t and _is_game_text_raw(t):
-                                    path = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
-                                    sid = make_id(self.engine, rel_path, path, t)
-                                    if sid in translations:
-                                        new_text = translations[sid]
-                                        new_bytes = new_text.encode('utf-8')
+                    path_new = ["AssetRaw", obj.type.name, str(obj.path_id), str(offset)]
+                    path_old = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
+                    sid_new = make_id(self.engine, rel_path, path_new, t)
+                    sid_old = make_id(self.engine, rel_path, path_old, t)
+                    if sid_new in translations:
+                        replacements[offset] = translations[sid_new]
+                    elif sid_old in translations:
+                        replacements[offset] = translations[sid_old]
 
-                                        # Only replace string bytes, keep original length prefix.
-                                        # Truncate translation to original slen.
-                                        max_str_len = min(len(new_bytes), slen)
-                                        new_str = new_bytes[:max_str_len]
+                if not replacements:
+                    continue
 
-                                        file_start = raw_offset + j
-                                        file_end = raw_offset + j + 4 + slen
-                                        new_blob = struct.pack('<I', slen) + new_str
-                                        if len(new_blob) < (4 + slen):
-                                            new_blob += b'\x00' * ((4 + slen) - len(new_blob))
+                # Rebuild blob: copy non-string regions, repack strings (may resize)
+                out = bytearray()
+                pos = 0
+                for offset in sorted(replacements.keys()):
+                    slen = struct.unpack_from("<I", raw, offset)[0]
+                    aligned_end = _aligned_string_end(offset, slen)
+                    out.extend(raw[pos:offset])
+                    out.extend(_pack_aligned_string(replacements[offset]))
+                    pos = aligned_end
+                out.extend(raw[pos:])
 
-                                        patches.append((file_start, file_end, new_blob))
-                        except (UnicodeDecodeError, ValueError):
-                            pass
-                    j += 1
+                try:
+                    obj.set_raw_data(bytes(out))
+                    written += len(replacements)
+                    objects_changed += 1
+                except Exception as e:
+                    print(
+                        f"set_raw_data failed path_id={obj.path_id} in "
+                        f"{os.path.basename(fpath)}: {e}",
+                        file=sys.stderr,
+                    )
 
-            if not patches:
-                return 0
+            if objects_changed == 0:
+                # Still try font PPtr size-preserving patch on disk if needed
+                is_non_latin = target_lang and target_lang.lower() in (
+                    "ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr"
+                )
+                if is_non_latin:
+                    self._replace_font_pptrs(env, fpath)
+                return written
 
-            # Phase 2: apply patches in reverse order
-            patches.sort(key=lambda p: p[0], reverse=True)
-            for start, end, new_blob in patches:
-                file_bytes[start:end] = new_blob
-
-            # Phase 3: write patched file
             self.backup_file(root, fpath)
-            with open(fpath, "wb") as f:
-                f.write(file_bytes)
+            # UnityPy Environment.save writes into out_path dir; use file.save bytes.
+            try:
+                data = env.file.save()
+                if isinstance(data, (bytes, bytearray)) and len(data) > 0:
+                    with open(fpath, "wb") as f:
+                        f.write(data)
+                else:
+                    # Multi-cab / container: fall back to env.save into temp dir
+                    import shutil
+                    tmp = tempfile.mkdtemp(prefix="interprex_unity_")
+                    try:
+                        env.save(pack="none", out_path=tmp)
+                        # Find the rewritten asset by basename
+                        base = os.path.basename(fpath)
+                        candidate = os.path.join(tmp, base)
+                        if not os.path.isfile(candidate):
+                            for dirpath, _, filenames in os.walk(tmp):
+                                if base in filenames:
+                                    candidate = os.path.join(dirpath, base)
+                                    break
+                        if os.path.isfile(candidate):
+                            shutil.copy2(candidate, fpath)
+                        else:
+                            print(
+                                f"UnityPy save produced no {base}; inject may be incomplete",
+                                file=sys.stderr,
+                            )
+                    finally:
+                        shutil.rmtree(tmp, ignore_errors=True)
+            except Exception as e:
+                print(f"Error saving injected assets {fpath}: {e}", file=sys.stderr)
 
-            written = len(patches)
+            is_non_latin = target_lang and target_lang.lower() in (
+                "ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr"
+            )
+            if is_non_latin:
+                # Re-load after save for font PPtrs
+                try:
+                    import UnityPy
+                    env2 = UnityPy.load(fpath)
+                    self._replace_font_pptrs(env2, fpath)
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"Error in raw inject for {fpath}: {e}", file=sys.stderr)
@@ -1313,23 +1570,26 @@ class UnityParser(BaseParser):
 
                 # Font PPtr replacement: swap non-Cyrillic font references to LiberationSans
                 # This is a SAFE size-preserving change (only 12 bytes per PPtr).
-                if is_non_latin:
+                if is_non_latin and typetree_found > 0:
                     self._replace_font_pptrs(env, fpath)
 
-                if typetree_found == 0 and failed_count > 0:
-                    raw_written = self._inject_raw_fallback(fpath, root, translations,
-                                                            env=env, font_bytes=font_bytes,
-                                                            target_lang=target_lang)
-                    if raw_written > 0:
-                        written += raw_written
+                # Always attempt raw inject: content blobs (Naninovel/I2/…) never use m_Text.
+                raw_written = self._inject_raw_fallback(
+                    fpath, root, translations,
+                    env=env, font_bytes=font_bytes,
+                    target_lang=target_lang,
+                )
+                if raw_written > 0:
+                    written += raw_written
+                elif failed_count > 0 and typetree_found == 0:
+                    print(
+                        f"Warning: no typetree and no raw inject hits in {os.path.basename(fpath)} "
+                        f"({failed_count} typetree failures).",
+                        file=sys.stderr,
+                    )
 
             except Exception as e:
                 print(f"Error injecting into assets file {fpath}: {e}", file=sys.stderr)
-
-            if typetree_found == 0 and failed_count > 0:
-                pass  # already handled above
-            elif failed_count > 0:
-                print(f"Warning: Failed to inject {failed_count} objects in compiled asset {fpath}.", file=sys.stderr)
 
         for fpath in source_files:
             rel_path = os.path.relpath(fpath, root).replace("\\", "/")

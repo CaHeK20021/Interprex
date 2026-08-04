@@ -24,11 +24,11 @@ Design (plan shiny-yawning-breeze):
   * Pace: each request occupies at least `delay_seconds` of wall-clock; a worker
     that finished faster sleeps the remainder before its next claim (honours a
     provider's per-minute request limit).
-  * Pause: no NEW batch is claimed (claim gate). A worker that already OWNS a
-    batch keeps going until that batch is done (HTTP + retries + emit) — then
-    parks free as `paused`. Mid-request cards show `finishing_batch` so the UI
-    doesn't pretend they're idle. After drain every live worker is the same
-    free state ("waiting to resume"); nothing sits "holding" a batch idle.
+  * Pause: no NEW batch is claimed (claim gate). An in-flight HTTP request is
+    always finished (and on SUCCESS the translations are emitted) so we never
+    drop a paid reply — mid-request cards show `finishing_batch`. On FAILURE
+    while paused: do NOT auto-retry; hold the owned batch and wait for the
+    user to press Continue. After drain, free workers park as `paused`.
 
 Everything a worker feeds the model is identical to the legacy Gemini path:
 per-string context, the Ren'Py per-line character limit, the glossary, adaptive
@@ -766,9 +766,13 @@ class TranslationScheduler:
         for try_i in range(BATCH_TRIES):
             if self._is_aborted() or worker_key in self.dead_keys:
                 return ({}, False, False)
-            # Pause never freezes an OWNED batch (no "held idle" state). The
-            # claim gate blocks NEW work; this worker finishes what it took —
-            # retries included — then parks free at the next claim.
+            # After a failed attempt the user may have hit Pause — do not fire
+            # the next try until they Continue. (In-flight HTTP still always
+            # runs to completion; only the gap BETWEEN tries honours pause.)
+            if try_i > 0 and not self._wait_if_paused_before_retry(
+                worker_idx, batch, try_i
+            ):
+                return ({}, False, False)
 
             start_time = time.time()
             try_suffix = f" (retry {try_i + 1}/{BATCH_TRIES})" if try_i > 0 else ""
@@ -866,6 +870,16 @@ class TranslationScheduler:
                     auth_fails = 0
 
                 if try_i < BATCH_TRIES - 1:
+                    # User paused after/during this failure: hold the owned batch
+                    # and do NOT auto-retry until Continue. (They hit Pause
+                    # because something is wrong — hammering the provider is
+                    # the opposite of what they asked for.)
+                    if self.should_pause():
+                        if not self._wait_if_paused_before_retry(
+                            worker_idx, batch, try_i + 1
+                        ):
+                            return ({}, False, False)
+                        # Unpaused: fall through to normal back-off then retry.
                     # rate/overload replies STILL spend the per-minute quota on
                     # every cloud API, so wait at least the pacing delay before
                     # re-sending — and record a per-key cooldown so siblings on
@@ -1120,16 +1134,57 @@ class TranslationScheduler:
 
     # -- pause / pacing helpers -------------------------------------------------
 
+    def _wait_if_paused_before_retry(self, worker_idx, batch, next_try_i: int) -> bool:
+        """If pause is on after a batch failure, hold until Continue (or abort).
+
+        Returns False if aborted (caller should drop out without killing the key
+        for a pause — the batch stays owned only until we exit; reclaim path
+        still runs via the worker finally if the key dies later). Returns True
+        when the worker may proceed with the next try.
+        """
+        if not self.should_pause() or self._is_aborted():
+            return not self._is_aborted()
+        bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
+        while self.should_pause() and not self._is_aborted():
+            self._emit(
+                worker_idx,
+                "paused",
+                status=(
+                    f"Paused after error — press Continue to retry "
+                    f"(try {next_try_i + 1}/{BATCH_TRIES})"
+                ),
+                batch_num=bnum,
+                batch_size=len(batch),
+                try_i=max(0, next_try_i - 1),
+                last_error=None,
+            )
+            time.sleep(0.5)
+        return not self._is_aborted()
+
     def _retry_sleep(self, worker_idx, batch, try_i, start_time, min_wait=0.0,
                      stagger=0.0) -> None:
-        """Back-off between retries on an OWNED batch. Pause does NOT freeze this
-        sleep (owned work must finish); only abort interrupts. min_wait raises
-        the floor for rate/overload. stagger spreads sibling retries."""
+        """Back-off between retries on an OWNED batch.
+
+        Pause freezes the countdown: if the user hits Pause mid-wait we stop
+        ticking and park until Continue (same contract as post-error hold).
+        Abort interrupts. min_wait raises the floor for rate/overload; stagger
+        spreads sibling retries.
+        """
         sleep_time = max(min_wait,
                          _RETRY_BACKOFF_FIRST if try_i == 0 else _RETRY_BACKOFF_REST)
         sleep_time += stagger
         start_sleep = time.time()
         while not self._is_aborted():
+            # Pause mid-backoff: freeze the clock, wait for Continue, then
+            # re-run the full back-off from zero (don't fire the moment they
+            # unpause if a long rate-limit floor was still due — recompute).
+            if self.should_pause():
+                if not self._wait_if_paused_before_retry(
+                    worker_idx, batch, try_i + 1
+                ):
+                    return
+                start_sleep = time.time()
+                continue
             now = time.time()
             remaining = sleep_time - (now - start_sleep)
             if remaining <= 0:
@@ -1146,7 +1201,7 @@ class TranslationScheduler:
                 elapsed=elapsed,
                 wait_left=wait_left,
             )
-            # Sleep the EXACT remainder (capped at 1s for abort responsiveness).
+            # Sleep the EXACT remainder (capped at 1s for abort/pause responsiveness).
             # Flat 1.0s would round sub-second stagger up and re-lockstep siblings.
             time.sleep(min(1.0, remaining))
 
