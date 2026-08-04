@@ -80,7 +80,7 @@ const en = {
   threadsHint:
     "Parallel requests per API key (1–40). With 2 keys, each key gets this many " +
     "(total workers = threads × keys). Higher = faster, but watch the provider's " +
-    "per-minute limit and set RPM so pacing keeps you under it.",
+    "RPM and TPM limits so pacing keeps you under quota.",
   rpmLimit: "Limit, req/min",
   rpmNoLimit: "none",
   rpmLimitHint:
@@ -89,6 +89,20 @@ const en = {
     "the limit across the threads on each key, so you never set seconds by hand. " +
     "Leave empty for no limit. (On every cloud API a 429/503 error also spends " +
     "your quota, so retries respect the same pace.)",
+  tpmLimit: "TPM, K/min",
+  tpmNoLimit: "none",
+  tpmLimitHint:
+    "Tokens-per-minute cap PER KEY in thousands (K). Type 16 for 16 000 tok/min " +
+    "(free Gemini). The app estimates each batch from the text it will send; " +
+    "threads on the same key share one 60s token budget. Other keys are " +
+    "independent. Empty = no TPM pacing (RPM still applies if set).",
+  tpmMeterTitle: "TPM (60s window, per key)",
+  tpmMeterHint:
+    "Live tokens used in the last 60 seconds on each API key. Used = spent " +
+    "(finished requests) + reserved (in-flight). Free = room before the next " +
+    "send. If free sits high while threads wait, something is wrong — report it.",
+  tpmMeterDetail: (spent: string, reserved: string, free: string) =>
+    `spent ${spent} + R ${reserved} · free ${free}`,
   workerLabel: (n: number) => `Thread ${n}`,
   workersToggleExpand: "Show all threads",
   workersToggleCollapse: "Collapse threads",
@@ -178,6 +192,10 @@ const en = {
     batchNum
       ? `Batch ${batchNum} done — waiting ${waitLeft}s`
       : `Waiting ${waitLeft}s`,
+  statusWaitingTpm: (waitLeft: number, batchNum?: number) =>
+    batchNum
+      ? `Batch ${batchNum} — TPM wait ${waitLeft}s`
+      : `TPM wait ${waitLeft}s`,
   statusResting: "Resting (waiting for work)",
   statusWorkerError: "Key failed",
   pyStatusWaiting: "Waiting...",

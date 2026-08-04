@@ -59,9 +59,21 @@ class Usage:
     """EXACT token counts reported by the model for one completion. This is the
     model's own tokenizer counting its own input/output — the ground truth we
     calibrate against, available on every provider (OpenAI `usage`, Gemini
-    `usageMetadata`). prompt = input we sent, completion = translation produced."""
+    `usageMetadata`). prompt = input we sent, completion = translation produced.
+
+    `total_tokens` is the provider's grand total when it reports one (Gemini
+    `totalTokenCount` includes thoughts/tool tokens). 0 = unknown → use
+    prompt+completion. TPM pacing should call `billed_tokens()`, not sum by hand.
+    """
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def billed_tokens(self) -> int:
+        """Tokens that count against a TPM budget for this completion."""
+        if self.total_tokens > 0:
+            return int(self.total_tokens)
+        return int(self.prompt_tokens or 0) + int(self.completion_tokens or 0)
 
 
 @dataclass

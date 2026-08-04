@@ -670,18 +670,37 @@ export default function App() {
   const [maxBatchSize, setMaxBatchSize] = useState(() =>
     Number(loadSetting("maxBatchSize", "30")),
   );
-  // Parallelism + rate limit, stored PER PROVIDER. threads: workers per key
-  // (1..40). rpmLimit: the model's requests-per-minute cap PER KEY that the user
-  // reads off their provider dashboard; the per-request pacing delay is DERIVED
-  // from it (see rpmToDelay), so the user never thinks in seconds. 0 = no limit.
+  // Parallelism + rate limits, stored PER PROVIDER. threads: workers per key
+  // (1..40). rpmLimit: requests-per-minute PER KEY (delay DERIVED via rpmToDelay).
+  // tpmLimitK: tokens-per-minute PER KEY in thousands (UI: 16 → 16000 tok/min).
   // Must match scheduler.MAX_THREADS_PER_KEY / the select below.
   const MAX_THREADS = 40;
+  /** Load TPM as K: values ≥1000 are legacy raw tok/min → convert once. */
+  function loadTpmK(p: string): number {
+    const raw = Math.max(0, Number(loadProviderSetting("providerTpm", p, "0")) || 0);
+    return raw >= 1000 ? Math.round(raw / 1000) : raw;
+  }
   const [threads, setThreads] = useState(() =>
     Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", provider, "1")) || 1)),
   );
   const [rpmLimit, setRpmLimit] = useState(() =>
     Math.max(0, Number(loadProviderSetting("providerRpm", provider, "0")) || 0),
   );
+  const [tpmLimitK, setTpmLimitK] = useState(() => loadTpmK(provider));
+  // Live TPM ledger from the scheduler (sliding 60s, per key). Null when TPM off
+  // or before the first progress event of a run.
+  const [tpmMeters, setTpmMeters] = useState<
+    | {
+        key_idx: number;
+        label: string;
+        spent: number;
+        reserved: number;
+        used: number;
+        free: number;
+        limit: number;
+      }[]
+    | null
+  >(null);
   // Live per-worker phase (for the status grid card colours), keyed by worker_idx.
   const [workerPhases, setWorkerPhases] = useState<Record<number, string>>({});
   // Is the worker-status panel expanded? Only meaningful when threads*keys > 2.
@@ -1718,6 +1737,7 @@ export default function App() {
       });
       setKeyStatuses({ 0: "Initializing..." });
       setWorkerPhases({ 0: "initializing" });
+      setTpmMeters(null);
 
       // Threads/pacing apply to cloud backends only; local servers have one model
       // in VRAM, so parallel requests there just contend. Send 1 / 0 for them.
@@ -1748,15 +1768,31 @@ export default function App() {
             maxBatchSize: maxBatchSize,
             threads: effThreads,
             delaySeconds: effDelay,
+            // UI is in K (16 → 16000 tok/min); sidecar wants absolute tokens.
+            tpmLimit: providerInfo.needsKey ? tpmLimitK * 1000 : 0,
             root: activeRoot ?? undefined,
             fontStyle,
             extraInstruction: extraInstruction ?? "",
           },
           (p) => {
+            // Do NOT spread the whole event into progress state — tpm_keys / etc.
+            // are unrelated and a fat payload was crowding the live progress UI.
             setProgress({
-              ...p,
-              done: initialDone + p.done,
+              done: initialDone + (p.done ?? 0),
               total: totalUnique,
+              batches: p.batches ?? 0,
+              translations: p.translations ?? {},
+              status: p.status,
+              phase: p.phase,
+              batch_num: p.batch_num,
+              batch_size: p.batch_size,
+              try_i: p.try_i,
+              elapsed: p.elapsed,
+              worker_idx: p.worker_idx ?? p.key_idx,
+              key_idx: p.key_idx,
+              wait_left: p.wait_left,
+              requests_sent: p.requests_sent,
+              last_error: p.last_error,
             });
             const wi = p.worker_idx ?? p.key_idx;
             if (wi !== undefined) {
@@ -1769,6 +1805,31 @@ export default function App() {
               }
             } else if (p.status) {
               setKeyStatuses({ 0: p.status });
+            }
+            // Live TPM meter ONLY when this run actually has a cap. Empty TPM
+            // field → tpm_limit 0 → never show a bar (was polluting NVIDIA Build
+            // runs and crowding the main progress numbers).
+            const runTpm =
+              providerInfo.needsKey && tpmLimitK > 0 ? tpmLimitK * 1000 : 0;
+            if (runTpm > 0 && p.tpm_limit && p.tpm_limit > 0) {
+              if (p.tpm_keys && p.tpm_keys.length > 0) {
+                const rows = p.tpm_keys.filter((k) => (k.limit ?? 0) > 0);
+                setTpmMeters(rows.length ? rows : null);
+              } else if (p.tpm_used !== undefined) {
+                setTpmMeters([
+                  {
+                    key_idx: 0,
+                    label: "K1",
+                    spent: p.tpm_spent ?? p.tpm_used,
+                    reserved: p.tpm_reserved ?? 0,
+                    used: p.tpm_used,
+                    free: p.tpm_free ?? Math.max(0, p.tpm_limit - p.tpm_used),
+                    limit: p.tpm_limit,
+                  },
+                ]);
+              }
+            } else {
+              setTpmMeters(null);
             }
             // OpenRouter daily budget: today's total = pre-run baseline + this
             // run's server-side request count (absolute, so no double counting).
@@ -2526,6 +2587,11 @@ export default function App() {
         p.wait_left ?? 0,
         p.batch_num
       ) as string;
+    } else if (p.phase === "waiting_tpm") {
+      return t("statusWaitingTpm")(
+        p.wait_left ?? 0,
+        p.batch_num
+      ) as string;
     } else if (p.phase === "resting") {
       return t("statusResting") as string;
     } else if (p.phase === "error") {
@@ -3257,6 +3323,54 @@ export default function App() {
                 );
               })}
             </div>
+            {/* Compact TPM readout under the worker grid — only when the user set
+                a TPM cap for this run. Never above the main progress bar. */}
+            {tpmLimitK > 0 &&
+              tpmMeters &&
+              tpmMeters.length > 0 &&
+              tpmMeters.some((m) => m.limit > 0) && (
+                <div className="tpm-meter-panel" title={t("tpmMeterHint") as string}>
+                  <div className="tpm-meter-head">{t("tpmMeterTitle") as string}</div>
+                  {tpmMeters.map((m) => {
+                    const pct =
+                      m.limit > 0
+                        ? Math.min(100, Math.round((m.used / m.limit) * 100))
+                        : 0;
+                    const tone =
+                      pct >= 95
+                        ? "full"
+                        : pct >= 70
+                          ? "high"
+                          : pct > 0
+                            ? "ok"
+                            : "idle";
+                    const fmtTok = (n: number) =>
+                      n >= 1000
+                        ? `${(n / 1000).toFixed(1)}k`
+                        : String(Math.round(n));
+                    return (
+                      <div key={m.key_idx} className={`tpm-meter-row tone-${tone}`}>
+                        <span className="tpm-meter-label">{m.label}</span>
+                        <div className="tpm-meter-bar">
+                          <div
+                            className="tpm-meter-fill"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <span className="tpm-meter-nums">
+                          <strong>{fmtTok(m.used)}</strong>
+                          {" / "}
+                          {fmtTok(m.limit)}
+                          <span className="tpm-meter-detail">
+                            {" · free "}
+                            {fmtTok(m.free)}
+                          </span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
           </div>
         );
       })()}
@@ -3306,6 +3420,7 @@ export default function App() {
               setModel(loadProviderSetting("providerModel", next, ""));
               setThreads(Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", next, "1")) || 1)));
               setRpmLimit(Math.max(0, Number(loadProviderSetting("providerRpm", next, "0")) || 0));
+              setTpmLimitK(loadTpmK(next));
               
               // Synchronously restore freeOnly for openrouter
               const isOp = next === "openrouter";
@@ -3450,6 +3565,27 @@ export default function App() {
                   const v = Math.min(100000, Number(digits) || 0);
                   setRpmLimit(v);
                   saveProviderSetting("providerRpm", provider, String(v));
+                }}
+                disabled={busy && !isFullyPaused}
+              />
+            </label>
+            <label className="field" title={t("tpmLimitHint") as string}>
+              <span className={`control-label engine-${engine || "none"}`}>
+                <strong>{t("tpmLimit")}</strong>
+              </span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={tpmLimitK || ""}
+                placeholder={t("tpmNoLimit") as string}
+                className="no-spin"
+                style={{ width: 56 }}
+                onChange={(e) => {
+                  const digits = e.target.value.replace(/[^\d]/g, "");
+                  // Stored/displayed in K (16 = 16000 tok/min). Cap 10000K.
+                  const v = Math.min(10_000, Number(digits) || 0);
+                  setTpmLimitK(v);
+                  saveProviderSetting("providerTpm", provider, String(v));
                 }}
                 disabled={busy && !isFullyPaused}
               />

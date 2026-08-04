@@ -4530,6 +4530,282 @@ def check_scheduler() -> None:
          scheduler.get_provider) = saved
 
 
+def check_scheduler_tpm() -> None:
+    """Tokens-per-minute pacing (scheduler.tpm_limit): per-key 60s window shared
+    by threads on that key, estimated from our prompt text before send.
+
+    Offline + fast: shorten the sliding window and pin the pre-send estimate so
+    CI does not wait a real minute. Covers:
+      * concurrent threads on ONE key never over-book the TPM budget;
+      * TWO keys each get their own budget (aggregate concurrency rises);
+      * waiting_tpm phase is emitted when the window is full;
+      * tpm_limit=0 leaves concurrency unconstrained (no TPM gate);
+      * progress events carry an exact ledger (used/spent/reserved/free);
+      * partial free budget shrinks a fat batch so free tokens are used now.
+    """
+    import json
+    import threading
+    import time
+    import scheduler
+    from providers.base import TranslateResult, Usage
+
+    saved = (
+        scheduler._RETRY_BACKOFF_FIRST,
+        scheduler._RETRY_BACKOFF_REST,
+        scheduler.get_provider,
+        scheduler._TPM_WINDOW_S,
+        scheduler.TranslationScheduler._est_batch_tokens,
+    )
+    scheduler._RETRY_BACKOFF_FIRST = 0
+    scheduler._RETRY_BACKOFF_REST = 0
+    # Short window so sequential batches under a tight TPM can proceed in CI.
+    scheduler._TPM_WINDOW_S = 0.45
+    # Fixed pre-send cost — real Calibrator estimates the full system prompt and
+    # would be huge relative to our tiny fake Usage, making tests flaky.
+    EST = 80
+    scheduler.TranslationScheduler._est_batch_tokens = (
+        lambda self, batch, cal: EST
+    )
+
+    class TpmProvider:
+        """Counts concurrent in-flight translates; each request costs ACT tokens."""
+        name = "fake"
+        ACT = 80  # prompt+completion committed after success
+
+        def __init__(self, hold=0.08, act=None):
+            self.hold = hold
+            self.act = self.ACT if act is None else act
+            self.lock = threading.Lock()
+            self.inflight = 0
+            self.max_inflight = 0
+            self.calls = 0
+            self.call_keys: list[str] = []
+            self.batch_sizes: list[int] = []
+            self.phases: list[str] = []
+
+        def count_tokens(self, text, cfg):
+            return None
+
+        def translate(self, batch, lang, glossary, cfg, engine=""):
+            with self.lock:
+                self.inflight += 1
+                self.max_inflight = max(self.max_inflight, self.inflight)
+                self.calls += 1
+                self.call_keys.append(cfg.api_key or "")
+                self.batch_sizes.append(len(batch))
+            try:
+                time.sleep(self.hold)
+                half = max(1, self.act // 2)
+                return TranslateResult(
+                    {it.id: it.text + "_x" for it in batch},
+                    Usage(half, self.act - half),
+                )
+            finally:
+                with self.lock:
+                    self.inflight -= 1
+
+        def complete_prompt(self, prompt, batch, cfg):
+            return self.translate(batch, "fake", {}, cfg)
+
+    class Req:
+        target_lang = "russian"
+        glossary = {}
+        base_url = ""
+        model = ""
+        max_context_tokens = 0
+        max_batch_size = 1
+        root = ""
+        engine = ""
+        free_only = False
+        extra_instruction = ""
+        delay_seconds = 0.0
+
+        def __init__(self, items, threads=1, api_keys=None, tpm_limit=0,
+                     api_key="", api_key_2="", max_batch_size=None):
+            self.items = items
+            self.threads = threads
+            # Prefer api_keys only — a leftover default api_key would add a
+            # phantom third key and inflate max_inflight in the two-key case.
+            keys = list(api_keys or [])
+            self.api_keys = keys
+            self.api_key = api_key or (keys[0] if keys else "K0")
+            self.api_key_2 = api_key_2
+            self.tpm_limit = tpm_limit
+            self.provider = "fake"
+            if max_batch_size is not None:
+                self.max_batch_size = max_batch_size
+
+    class It:
+        def __init__(self, i, text="hi", file="a.txt"):
+            self.id = str(i)
+            self.text = text
+            self.context = ""
+            self.file = file
+            self.path = []
+
+    def run(req, prov, timeout=20):
+        scheduler.get_provider = lambda n: prov
+        sched = scheduler.TranslationScheduler(req, should_pause=lambda: False)
+        out = {
+            "final": None,
+            "phases": [],
+            "tpm_events": [],
+            "max_used_seen": 0,
+        }
+
+        def go():
+            for line in sched.stream():
+                evt = json.loads(line)
+                if evt.get("type") == "progress" and evt.get("phase"):
+                    out["phases"].append(evt["phase"])
+                    if evt.get("tpm_limit"):
+                        out["tpm_events"].append(evt)
+                        used = evt.get("tpm_used")
+                        if used is not None:
+                            out["max_used_seen"] = max(
+                                out["max_used_seen"], int(used)
+                            )
+                        for row in evt.get("tpm_keys") or []:
+                            # Never report used > limit + one fat est (reserve).
+                            assert row["used"] >= 0 and row["free"] >= 0
+                            assert row["spent"] + row["reserved"] == row["used"], (
+                                "ledger identity broken: %s" % row
+                            )
+                            assert row["used"] <= row["limit"] + EST + 1, (
+                                "over-book: used=%s limit=%s" % (
+                                    row["used"], row["limit"],
+                                )
+                            )
+                if evt.get("type") == "done":
+                    out["final"] = evt
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(timeout)
+        assert not t.is_alive(), "scheduler_tpm deadlocked (timeout)"
+        return out
+
+    try:
+        # ── 1. One key, tight TPM: est 80, cap 100 → at most 1 in flight ──
+        # 5 threads would otherwise all fire; reserve must serialize them.
+        n = 6
+        items = [It(i, "t%d" % i) for i in range(n)]
+        prov = TpmProvider(hold=0.1)
+        out = run(Req(items, threads=5, api_keys=["K0"], tpm_limit=100), prov)
+        assert out["final"] and len(out["final"]["translations"]) == n, \
+            "tpm single-key lost strings: %s" % (out["final"],)
+        assert prov.max_inflight == 1, (
+            "tpm single-key must not over-book: max_inflight=%d (cap 100, est 80)"
+            % prov.max_inflight
+        )
+        assert "waiting_tpm" in out["phases"], (
+            "expected waiting_tpm when siblings contend; phases=%s"
+            % sorted(set(out["phases"]))
+        )
+        assert out["tpm_events"], "expected live tpm_* ledger on progress events"
+        assert any(
+            e.get("tpm_keys") and e["tpm_keys"][0].get("limit") == 100
+            for e in out["tpm_events"]
+        ), "tpm_keys missing or wrong limit"
+        # With est 80 and cap 100, used while reserved must not exceed ~100.
+        assert out["max_used_seen"] <= 100 + EST, (
+            "counter reported used past budget: %d" % out["max_used_seen"]
+        )
+
+        # ── 2. Two keys, same TPM each: both can run at once (2 × budget) ──
+        items = [It(i, "k%d" % i) for i in range(8)]
+        prov2 = TpmProvider(hold=0.12)
+        out2 = run(
+            Req(items, threads=3, api_keys=["KA", "KB"], tpm_limit=100),
+            prov2,
+        )
+        assert out2["final"] and len(out2["final"]["translations"]) == 8, \
+            "tpm two-key lost strings"
+        assert prov2.max_inflight >= 2, (
+            "tpm two-key should allow 1 inflight per key; max_inflight=%d"
+            % prov2.max_inflight
+        )
+        # Still not more than 2 (one per key) under this budget.
+        assert prov2.max_inflight <= 2, (
+            "tpm two-key over-booked across keys: max_inflight=%d"
+            % prov2.max_inflight
+        )
+        assert set(prov2.call_keys) == {"KA", "KB"}, \
+            "both keys must have worked: %s" % sorted(set(prov2.call_keys))
+        two_key_evt = next(
+            (e for e in out2["tpm_events"] if len(e.get("tpm_keys") or []) == 2),
+            None,
+        )
+        assert two_key_evt is not None, "expected 2 rows in tpm_keys for 2 keys"
+
+        # ── 3. tpm_limit=0: no TPM gate → multi-thread concurrency free ──
+        items = [It(i, "z%d" % i) for i in range(8)]
+        prov0 = TpmProvider(hold=0.1)
+        out0 = run(Req(items, threads=4, api_keys=["K0"], tpm_limit=0), prov0)
+        assert out0["final"] and len(out0["final"]["translations"]) == 8
+        assert prov0.max_inflight >= 2, (
+            "tpm=0 should allow parallel threads; max_inflight=%d"
+            % prov0.max_inflight
+        )
+        assert "waiting_tpm" not in out0["phases"], \
+            "tpm=0 must not emit waiting_tpm"
+        assert not out0["tpm_events"], "tpm=0 must not emit ledger fields"
+
+        # ── 4. Sequential under TPM still completes (window drains) ──
+        items = [It(i, "s%d" % i) for i in range(3)]
+        provs = TpmProvider(hold=0.02)
+        outs = run(Req(items, threads=1, api_keys=["K0"], tpm_limit=100), provs)
+        assert outs["final"] and len(outs["final"]["translations"]) == 3, \
+            "tpm sequential lost strings after window drain"
+        assert provs.calls == 3
+
+        # ── 5. Shrink-to-free: partial free uses a smaller batch now ──
+        # Per-item est = 40 so a 4-item claim costs 160; with free 50 only 1
+        # item fits → first send must be size 1, not wait forever for 160.
+        scheduler.TranslationScheduler._est_batch_tokens = (
+            lambda self, batch, cal: 40 * max(1, len(batch))
+        )
+        n5 = 4
+        items = [It(i, "sh%d" % i, file="one.txt") for i in range(n5)]
+        prov5 = TpmProvider(hold=0.02, act=40)
+        # Seed the ledger as if 50 free remains: limit 100, already spent 50.
+        # We do that by running a tiny pre-spend via the real reserve path after
+        # constructing the scheduler — but easier: limit 50 and est 40*N so the
+        # first claim of 4 is shrunk to 1 (40 <= 50 < 80).
+        out5 = run(
+            Req(
+                items, threads=1, api_keys=["K0"], tpm_limit=50,
+                max_batch_size=4,
+            ),
+            prov5,
+        )
+        assert out5["final"] and len(out5["final"]["translations"]) == n5, \
+            "tpm shrink lost strings: %s" % (out5["final"],)
+        assert prov5.batch_sizes, "no batches sent"
+        assert max(prov5.batch_sizes) <= 1, (
+            "expected shrink to 1 item under free 50 / est 40×N; sizes=%s"
+            % prov5.batch_sizes
+        )
+        # Restore fixed EST for restore of outer finally.
+        scheduler.TranslationScheduler._est_batch_tokens = (
+            lambda self, batch, cal: EST
+        )
+
+        print(
+            "OK — scheduler TPM: single-key serializes (max_inflight=1), "
+            "two keys share budgets (max_inflight=2), tpm=0 unrestricted, "
+            "window drain completes, live ledger on events, shrink-to-free"
+        )
+    finally:
+        (
+            scheduler._RETRY_BACKOFF_FIRST,
+            scheduler._RETRY_BACKOFF_REST,
+            scheduler.get_provider,
+            scheduler._TPM_WINDOW_S,
+            scheduler.TranslationScheduler._est_batch_tokens,
+        ) = saved
+
+
 def check_scheduler_high_threads() -> None:
     """Hard gate for raising the UI/backend threads cap to 40.
 
@@ -5926,6 +6202,7 @@ def main() -> int:
     check_prompt_width()
     check_providers()
     check_scheduler()
+    check_scheduler_tpm()
     check_scheduler_high_threads()
     check_scheduler_tail()
     check_renpy_python_pool()

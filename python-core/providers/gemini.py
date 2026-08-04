@@ -204,10 +204,18 @@ class GeminiProvider(BaseProvider):
                 msg = candidates[0].get("finishMessage") or f"Blocked by Gemini safety policy ({reason})"
                 raise RuntimeError(f"GEMINI_SAFETY_BLOCK: {msg}") from e
             raise RuntimeError(f"unexpected Gemini response: {data}") from e
-        # Gemini reports exact counts under usageMetadata.
+        # Gemini usageMetadata: prompt + candidates + (optional) thoughts.
+        # totalTokenCount is what AI Studio TPM actually rolls up when present.
         m = data.get("usageMetadata") or {}
+        prompt_tok = int(m.get("promptTokenCount", 0) or 0)
+        cand_tok = int(m.get("candidatesTokenCount", 0) or 0)
+        thoughts_tok = int(m.get("thoughtsTokenCount", 0) or 0)
+        total_tok = int(m.get("totalTokenCount", 0) or 0)
+        if total_tok <= 0:
+            total_tok = prompt_tok + cand_tok + thoughts_tok
         usage = Usage(
-            prompt_tokens=int(m.get("promptTokenCount", 0) or 0),
-            completion_tokens=int(m.get("candidatesTokenCount", 0) or 0),
+            prompt_tokens=prompt_tok,
+            completion_tokens=cand_tok,
+            total_tokens=total_tok,
         )
         return CompletionResult(text=text, usage=usage)

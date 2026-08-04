@@ -206,6 +206,10 @@ class TranslateReq(BaseModel):
     # batch finishes faster, the worker sleeps the remainder before claiming the
     # next one. Lets the user pace requests under a provider's per-minute limit.
     delay_seconds: float = 0.0
+    # Tokens-per-minute cap PER KEY (0 = off). Scheduler estimates each batch from
+    # the prompt text + output reserve and shares a 60s window across threads on
+    # that key so a free-tier 16k TPM model is not blown by parallel fat batches.
+    tpm_limit: int = 0
     free_only: bool = False
     # Font style for UI-width fitting: the translation is measured against the
     # SAME font inject will write ("smooth" Noto vs "pixel" bitmap) so the budget

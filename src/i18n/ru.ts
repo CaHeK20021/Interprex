@@ -77,8 +77,8 @@ const ru: Strings = {
   threads: "Потоки",
   threadsHint:
     "Параллельных запросов на один ключ API (1–40). При 2 ключах столько на каждый " +
-    "(всего потоков = потоки × ключи). Больше — быстрее, но следите за лимитом " +
-    "запросов в минуту и выставьте RPM, чтобы pacing не вылезал за квоту.",
+    "(всего потоков = потоки × ключи). Больше — быстрее, но следите за RPM и TPM, " +
+    "чтобы pacing не вылезал за квоту.",
   rpmLimit: "Лимит, зап/мин",
   rpmNoLimit: "нет",
   rpmLimitHint:
@@ -87,6 +87,20 @@ const ru: Strings = {
     "потоками на каждом ключе, так что секунды вручную задавать не нужно. " +
     "Пусто — без лимита. (У всех облачных API ошибка 429/503 тоже тратит квоту, " +
     "поэтому повторы соблюдают тот же темп.)",
+  tpmLimit: "TPM, K/мин",
+  tpmNoLimit: "нет",
+  tpmLimitHint:
+    "Лимит токенов в минуту НА КЛЮЧ в тысячах (K). Пиши 16 = 16 000 ток/мин " +
+    "(бесплатный Gemini). Приложение оценивает пакет по тексту; потоки одного " +
+    "ключа делят окно 60 с. Другие ключи независимы. Пусто — без TPM pacing " +
+    "(RPM, если задан, всё равно действует).",
+  tpmMeterTitle: "TPM (окно 60 с, на ключ)",
+  tpmMeterHint:
+    "Живой расход токенов за последние 60 с на каждом API-ключе. Used = spent " +
+    "(завершённые запросы) + reserved (в полёте). Free = сколько ещё можно " +
+    "отправить. Если free высокий, а потоки ждут — пиши, это баг.",
+  tpmMeterDetail: (spent: string, reserved: string, free: string) =>
+    `spent ${spent} + R ${reserved} · free ${free}`,
   workerLabel: (n: number) => `Поток ${n}`,
   workersToggleExpand: "Показать все потоки",
   workersToggleCollapse: "Свернуть потоки",
@@ -176,6 +190,10 @@ const ru: Strings = {
     batchNum
       ? `Пакет ${batchNum} переведен — ожидание ${waitLeft} сек`
       : `Ожидание ${waitLeft} сек`,
+  statusWaitingTpm: (waitLeft: number, batchNum?: number) =>
+    batchNum
+      ? `Пакет ${batchNum} — ждём TPM ${waitLeft} сек`
+      : `Ждём TPM ${waitLeft} сек`,
   statusResting: "Отдыхает (ждёт работу)",
   statusWorkerError: "Ключ не сработал",
   pyStatusWaiting: "Ожидание...",

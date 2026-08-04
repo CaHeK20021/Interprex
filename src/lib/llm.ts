@@ -67,6 +67,8 @@ export interface TranslateOptions {
   /** Minimum wall-clock seconds each request must occupy, to pace under a
    *  provider's per-minute limit. 0 = no pacing. */
   delaySeconds?: number;
+  /** Tokens-per-minute cap PER KEY (0 = off). Threads on one key share it. */
+  tpmLimit?: number;
   root?: string;
   /** Font style for UI-width fitting — measure against the same font inject will
    *  write ("smooth" Noto vs "pixel" bitmap). Ren'Py menu choices only. */
@@ -105,6 +107,7 @@ export async function translateBatch(
       max_batch_size: opts.maxBatchSize,
       threads: opts.threads ?? 1,
       delay_seconds: opts.delaySeconds ?? 0,
+      tpm_limit: opts.tpmLimit ?? 0,
       root: opts.root ?? "",
       engine: strings[0]?.engine ?? "",
       font_style: opts.fontStyle ?? "smooth",

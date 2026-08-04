@@ -99,9 +99,15 @@ class _OpenAICompat(BaseProvider):
         # OpenAI-compatible servers (incl. LM Studio and Ollama) return exact
         # token counts here, from the loaded model's own tokenizer.
         u = data.get("usage") or {}
+        prompt_tok = int(u.get("prompt_tokens", 0) or 0)
+        completion_tok = int(u.get("completion_tokens", 0) or 0)
+        total_tok = int(u.get("total_tokens", 0) or 0)
+        if total_tok <= 0:
+            total_tok = prompt_tok + completion_tok
         usage = Usage(
-            prompt_tokens=int(u.get("prompt_tokens", 0) or 0),
-            completion_tokens=int(u.get("completion_tokens", 0) or 0),
+            prompt_tokens=prompt_tok,
+            completion_tokens=completion_tok,
+            total_tokens=total_tok,
         )
         return CompletionResult(text=text, usage=usage)
 

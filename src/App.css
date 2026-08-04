@@ -1535,7 +1535,65 @@ input[type="range"]::-webkit-slider-thumb:active {
 .worker-card.tone-idle { opacity: 0.7; }
 /* Neutral phases keep their own accent on the border without a loud tint. */
 .worker-card.phase-waiting_retry,
-.worker-card.phase-waiting_delay { border-left-color: #e0a64b; }
+.worker-card.phase-waiting_delay,
+.worker-card.phase-waiting_tpm { border-left-color: #e0a64b; }
+
+/* Compact TPM ledger INSIDE the workers panel (not next to main progress). */
+.tpm-meter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.tpm-meter-head {
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.tpm-meter-row {
+  display: grid;
+  grid-template-columns: auto minmax(40px, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.tpm-meter-label {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.tpm-meter-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 80%, transparent);
+  overflow: hidden;
+  min-width: 0;
+}
+.tpm-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #41c98a;
+  transition: width 0.25s ease;
+}
+.tpm-meter-row.tone-high .tpm-meter-fill { background: #e0a64b; }
+.tpm-meter-row.tone-full .tpm-meter-fill { background: #e0564b; }
+.tpm-meter-row.tone-idle .tpm-meter-fill { background: var(--muted); }
+.tpm-meter-nums {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 11px;
+}
+.tpm-meter-detail {
+  color: var(--muted);
+  font-weight: 400;
+}
 /* Pause requested but HTTP still in flight — yellow busy + purple edge so it
    doesn't look like a free "translating" card OR a fully paused one. */
 .worker-card.phase-finishing_batch { border-left-color: #7a86ff; }

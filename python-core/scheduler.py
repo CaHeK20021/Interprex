@@ -24,6 +24,16 @@ Design (plan shiny-yawning-breeze):
   * Pace: each request occupies at least `delay_seconds` of wall-clock since the
     last fire (RPM). A worker that finished faster sleeps only the REMAINING
     wall-clock time before its next claim — never a full delay restart.
+  * TPM (tokens-per-minute, PER KEY): before each send, estimate the batch's
+    token cost from our prompt text (Calibrator + output_ratio reserve), then
+    wait until a 60s sliding window on that key has room. Threads on the same
+    key share one window via reserve-on-send + commit-actual-after-usage so they
+    can't all fire fat batches at once and blow a 16k TPM free tier. Other keys
+    are independent (3 keys × 16k TPM ≈ 48k aggregate). Every progress event
+    carries a live ledger snapshot (`tpm_keys`: spent/reserved/used/free/limit)
+    so the UI can show an exact counter. If free tokens remain but the full
+    batch would exceed them, the batch is shrunk to fit (leftovers back to the
+    pool) — free budget is not left idle waiting for a fat batch.
   * Pause: no NEW batch is claimed (claim gate). An in-flight HTTP request is
     always finished (and on SUCCESS the translations are emitted) so we never
     drop a paid reply — mid-request cards show `finishing_batch`. On FAILURE
@@ -75,6 +85,13 @@ _RETRY_BACKOFF_REST = 16
 
 # Default window when the UI doesn't constrain it (cloud models, big local ones).
 DEFAULT_CONTEXT_TOKENS = 8192
+
+# Sliding window for tokens-per-minute pacing (provider TPM is almost always a
+# rolling 60s bucket). Events older than this are dropped from the per-key ledger.
+_TPM_WINDOW_S = 60.0
+# Small safety margin on pre-send estimates so a slightly dense tokenizer doesn't
+# overshoot the real TPM cap before usage comes back.
+_TPM_EST_SAFETY = 1.08
 
 
 def _classify_error(msg: str) -> str:
@@ -346,6 +363,9 @@ class TranslationScheduler:
         self.threads = max(1, min(MAX_THREADS_PER_KEY, int(getattr(req, "threads", 1) or 1)))
         self.worker_count = self.threads * len(keys)
         self.delay_seconds = max(0.0, float(getattr(req, "delay_seconds", 0.0) or 0.0))
+        # Tokens-per-minute cap PER KEY (0 = off). Shared by all threads on that
+        # key via a sliding 60s ledger; independent across keys.
+        self.tpm_limit = max(0, int(getattr(req, "tpm_limit", 0) or 0))
 
         # --- shared state, all guarded by self.cond -----------------------------
         self.cond = threading.Condition()
@@ -364,6 +384,12 @@ class TranslationScheduler:
         # keys are unaffected) — so with 2+ keys each waits exactly as long as ITS
         # OWN provider quota demands, no more. Guarded by self.cond.
         self.key_cooldown: dict[str, float] = {}
+        # Per-key TPM ledger: committed (ts, tokens) spends in the last 60s, plus
+        # reserved tokens for in-flight sends so sibling threads can't over-book.
+        self.key_token_events: dict[str, list[tuple[float, int]]] = {}
+        self.key_token_reserved: dict[str, int] = {}
+        # How many tokens THIS worker currently has reserved (for clean unreserve).
+        self.worker_tpm_reserve: dict[int, int] = {}
         self.reclaim_count: dict[str, int] = {}
         self.result: dict[str, str] = {}  # rep id -> translation (authoritative)
         self.errors: list[str] = []
@@ -423,6 +449,10 @@ class TranslationScheduler:
             done = len(self.result)
             batches = self.batches
             requests_sent = self.requests_sent
+            tpm_snap = (
+                self._tpm_snapshot_locked(now=time.time())
+                if self.tpm_limit > 0 else None
+            )
         evt = {
             "type": "progress",
             "done": done,
@@ -436,8 +466,250 @@ class TranslationScheduler:
             "key_idx": worker_idx,
             "translations": {},
         }
+        if tpm_snap is not None:
+            evt["tpm_limit"] = tpm_snap["limit"]
+            evt["tpm_keys"] = tpm_snap["keys"]
+            # Flat fields for THIS worker's key (handy single-key UI + logs).
+            k_i = 0
+            if self.threads > 0 and self.keys_to_use:
+                k_i = min(
+                    worker_idx // self.threads,
+                    len(self.keys_to_use) - 1,
+                )
+            if 0 <= k_i < len(tpm_snap["keys"]):
+                row = tpm_snap["keys"][k_i]
+                evt["tpm_used"] = row["used"]
+                evt["tpm_spent"] = row["spent"]
+                evt["tpm_reserved"] = row["reserved"]
+                evt["tpm_free"] = row["free"]
         evt.update(extra)
         self.event_queue.put(json.dumps(evt, ensure_ascii=False))
+
+    # -- TPM (tokens-per-minute) pacing, per key --------------------------------
+
+    def _est_batch_tokens(self, batch: list, cal: Calibrator) -> int:
+        """Pre-send estimate of total tokens this batch will cost (input+output).
+
+        Built from the exact prompt we will send: Calibrator chars/token (refined
+        from real usage after the first batch) × (1 + out_ratio) with a small
+        safety margin. Output is reserved, never measured — the translation does
+        not exist yet. Used only for TPM gating; packing still uses input_budget.
+        """
+        prompt = build_prompt(
+            batch, self.req.target_lang, self.req.glossary,
+            self.req.engine, getattr(self.req, "extra_instruction", "") or "",
+        )
+        prompt_tok = max(1, cal.est_tokens(prompt))
+        out_ratio = max(0.1, float(cal.out_ratio))
+        return max(1, int(prompt_tok * (1.0 + out_ratio) * _TPM_EST_SAFETY))
+
+    @staticmethod
+    def _tpm_key_label(key: str, key_idx: int) -> str:
+        """Short stable label for the UI (never the full secret)."""
+        k = (key or "").strip()
+        if len(k) >= 4:
+            return f"K{key_idx + 1}…{k[-4:]}"
+        return f"K{key_idx + 1}"
+
+    def _tpm_snapshot_locked(self, now: float | None = None) -> dict:
+        """Exact per-key ledger for the UI counter. Caller holds self.cond."""
+        now = time.time() if now is None else now
+        keys_out: list[dict] = []
+        for i, k in enumerate(self.keys_to_use):
+            self._tpm_prune_locked(k, now)
+            spent = sum(t for _, t in self.key_token_events.get(k, ()))
+            reserved = int(self.key_token_reserved.get(k, 0) or 0)
+            used = spent + reserved
+            keys_out.append({
+                "key_idx": i,
+                "label": self._tpm_key_label(k, i),
+                "spent": spent,
+                "reserved": reserved,
+                "used": used,
+                "free": max(0, self.tpm_limit - used),
+                "limit": self.tpm_limit,
+            })
+        return {"limit": self.tpm_limit, "keys": keys_out}
+
+    def _tpm_prune_locked(self, key: str, now: float) -> None:
+        ev = self.key_token_events.get(key)
+        if not ev:
+            return
+        cutoff = now - _TPM_WINDOW_S
+        i = 0
+        n = len(ev)
+        while i < n and ev[i][0] <= cutoff:
+            i += 1
+        if i:
+            del ev[:i]
+
+    def _tpm_used_locked(self, key: str, now: float) -> int:
+        """Committed spends in the window + in-flight reserves for this key."""
+        self._tpm_prune_locked(key, now)
+        spent = sum(t for _, t in self.key_token_events.get(key, ()))
+        reserved = self.key_token_reserved.get(key, 0)
+        return spent + reserved
+
+    def _tpm_earliest_fit_locked(self, key: str, est: int, now: float) -> float:
+        """Wall-clock time when `est` tokens fit under this key's TPM, or `now`."""
+        if self.tpm_limit <= 0:
+            return now
+        used = self._tpm_used_locked(key, now)
+        # A single batch larger than the whole minute budget: only fire when the
+        # key is idle — we cannot stay under the cap, but we can avoid stacking.
+        if est > self.tpm_limit:
+            if used == 0:
+                return now
+            events = self.key_token_events.get(key) or []
+            if events:
+                return events[0][0] + _TPM_WINDOW_S
+            return now + 0.15  # waiting on another worker's reserve
+        if used + est <= self.tpm_limit:
+            return now
+        free_needed = used + est - self.tpm_limit
+        events = self.key_token_events.get(key) or []
+        spent_only = sum(t for _, t in events)
+        if free_needed > spent_only:
+            # Need siblings to finish/unreserve — short poll.
+            return now + 0.15
+        freed = 0
+        for ts, tok in events:
+            freed += tok
+            if freed >= free_needed:
+                return ts + _TPM_WINDOW_S
+        return now + 0.15
+
+    def _tpm_reserve_locked(self, worker_idx: int, key: str, est: int) -> None:
+        self.key_token_reserved[key] = self.key_token_reserved.get(key, 0) + est
+        self.worker_tpm_reserve[worker_idx] = (
+            self.worker_tpm_reserve.get(worker_idx, 0) + est
+        )
+
+    def _tpm_unreserve_locked(self, worker_idx: int, key: str,
+                              amount: int | None = None) -> None:
+        amt = (
+            self.worker_tpm_reserve.get(worker_idx, 0)
+            if amount is None else max(0, int(amount))
+        )
+        if amt <= 0:
+            return
+        self.key_token_reserved[key] = max(
+            0, self.key_token_reserved.get(key, 0) - amt
+        )
+        left = self.worker_tpm_reserve.get(worker_idx, 0) - amt
+        if left > 0:
+            self.worker_tpm_reserve[worker_idx] = left
+        else:
+            self.worker_tpm_reserve.pop(worker_idx, None)
+
+    def _tpm_commit(self, worker_idx: int, key: str, tokens: int) -> None:
+        """Drop this worker's reserve and record a committed spend (if any)."""
+        now = time.time()
+        with self.cond:
+            self._tpm_unreserve_locked(worker_idx, key)
+            if tokens > 0:
+                self.key_token_events.setdefault(key, []).append((now, int(tokens)))
+                self._tpm_prune_locked(key, now)
+            self.cond.notify_all()
+
+    def _tpm_shrink_to_free(
+        self, batch: list, cal: Calibrator, worker_key: str, fname: str,
+    ) -> list:
+        """If free TPM is partial, cut the batch so est fits NOW (use free budget).
+
+        Fat batches that wait while free tokens sit idle is the usual "threads
+        look stuck but TPM isn't full" symptom. Leftovers go back to the front of
+        the file's pool under the same claim ownership model (this worker already
+        popped them; we reinsert the tail only).
+        """
+        if self.tpm_limit <= 0 or len(batch) <= 1:
+            return batch
+        with self.cond:
+            free = max(
+                0,
+                self.tpm_limit - self._tpm_used_locked(worker_key, time.time()),
+            )
+        if free <= 0:
+            return batch  # nothing free — full wait, don't splinter
+        est = self._est_batch_tokens(batch, cal)
+        if est <= free:
+            return batch
+        # Largest prefix whose estimate fits free (at least 1 item — a single
+        # oversized item still waits the normal gate).
+        lo, hi = 1, len(batch)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            e = self._est_batch_tokens(batch[:mid], cal)
+            if e <= free:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best >= len(batch):
+            return batch
+        leftover = batch[best:]
+        kept = batch[:best]
+        with self.cond:
+            cur = self.pool.get(fname)
+            if cur is None:
+                self.pool[fname] = list(leftover)
+            else:
+                # Prefer prepend so the same scene continues next claim.
+                self.pool[fname] = list(leftover) + list(cur)
+            self.pool.move_to_end(fname, last=False)
+            self.cond.notify_all()
+        logger.info(
+            "TPM shrink: free=%d est=%d → batch %d→%d (rest requeued)",
+            free, est, len(batch), len(kept),
+        )
+        return kept
+
+    def _wait_tpm(self, worker_idx: int, worker_key: str, est: int) -> bool:
+        """Block until this key's TPM window can absorb `est` tokens, then reserve.
+
+        Returns False if aborted / key died (no reserve held). Pause parks without
+        burning the window; Continue rechecks immediately.
+        """
+        if self.tpm_limit <= 0 or est <= 0:
+            return True
+        while not self._is_aborted():
+            while self.should_pause() and not self._is_aborted():
+                self._emit(worker_idx, "paused", status="Paused")
+                time.sleep(0.5)
+            if self._is_aborted():
+                return False
+            with self.cond:
+                if worker_key in self.dead_keys:
+                    return False
+                now = time.time()
+                ready_at = self._tpm_earliest_fit_locked(worker_key, est, now)
+                if ready_at <= now + 0.001:
+                    self._tpm_reserve_locked(worker_idx, worker_key, est)
+                    return True
+                wait_s = max(0.0, ready_at - now)
+                wait_left = int(math.ceil(wait_s))
+                bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
+                used = self._tpm_used_locked(worker_key, now)
+                free = max(0, self.tpm_limit - used)
+                spent = sum(t for _, t in self.key_token_events.get(worker_key, ()))
+                reserved = int(self.key_token_reserved.get(worker_key, 0) or 0)
+            self._emit(
+                worker_idx,
+                "waiting_tpm",
+                status=(
+                    f"TPM {used}/{self.tpm_limit} "
+                    f"(spent {spent} + R {reserved}, free {free}) — "
+                    f"wait {wait_left}s for ~{est} tok..."
+                ),
+                wait_left=wait_left,
+                batch_num=bnum,
+                tpm_est=est,
+            )
+            # Sleep the remainder (capped) so we recheck soon when a sibling
+            # unreserves; never a flat 1s that would re-lockstep threads.
+            time.sleep(min(0.35, max(0.05, wait_s)))
+        return False
 
     # -- pool primitives (call under self.cond) ---------------------------------
 
@@ -784,6 +1056,13 @@ class TranslationScheduler:
 
             start_time = time.time()
             try_suffix = f" (retry {try_i + 1}/{BATCH_TRIES})" if try_i > 0 else ""
+            # TPM gate BEFORE the request leaves: estimate from our prompt text,
+            # wait until this key's 60s window has room, reserve so siblings on
+            # the same key cannot over-book. Other keys are unaffected.
+            est_tokens = self._est_batch_tokens(batch, cal)
+            if not self._wait_tpm(worker_idx, worker_key, est_tokens):
+                return ({}, False, False)
+            tpm_held = self.tpm_limit > 0
             self._emit(
                 worker_idx,
                 "translating_batch",
@@ -798,6 +1077,8 @@ class TranslationScheduler:
                     batch, cfg, worker_idx, try_i, try_suffix, start_time
                 )
                 if self._is_aborted():
+                    if tpm_held:
+                        self._tpm_commit(worker_idx, worker_key, 0)
                     return ({}, False, False)
                 if not tr.translations:
                     raise RuntimeError(
@@ -807,10 +1088,21 @@ class TranslationScheduler:
                 batch_tr = tr.translations
 
                 # Oversized-translation re-ask (Ren'Py char limits) — identical to
-                # the legacy path so the per-line cap is still enforced.
-                self._enforce_char_limits(batch, batch_tr, cfg)
+                # the legacy path so the per-line cap is still enforced. Re-asks
+                # are real API calls and MUST count toward TPM (spent), not just
+                # the main batch.
+                reask_tok = self._enforce_char_limits(batch, batch_tr, cfg)
 
                 cal.observe(prompt_chars, tr.usage)
+                actual_tok = int(tr.usage.billed_tokens() or 0) + int(reask_tok or 0)
+                if tpm_held:
+                    # Prefer exact usage; fall back to the pre-send estimate if
+                    # the provider returned zeros (unknown).
+                    self._tpm_commit(
+                        worker_idx, worker_key,
+                        actual_tok if actual_tok > 0 else est_tokens,
+                    )
+                    tpm_held = False
                 with self.cond:
                     self.tok_in += tr.usage.prompt_tokens
                     self.tok_out += tr.usage.completion_tokens
@@ -846,6 +1138,14 @@ class TranslationScheduler:
                     try_i=try_i,
                 )
                 # A failed request that still reached the server spent the quota.
+                # TPM: commit the estimate (no usage on error); pure connection
+                # failures release the reserve without counting spend.
+                if tpm_held:
+                    if _reached_server(err_str):
+                        self._tpm_commit(worker_idx, worker_key, est_tokens)
+                    else:
+                        self._tpm_commit(worker_idx, worker_key, 0)
+                    tpm_held = False
                 if _reached_server(err_str):
                     with self.cond:
                         self.requests_sent += 1
@@ -995,7 +1295,7 @@ class TranslationScheduler:
     # those always re-ask, even for 1–2 words.
     _MAX_WORDS_FONT_FIT = 2
 
-    def _enforce_char_limits(self, batch, batch_tr, cfg) -> None:
+    def _enforce_char_limits(self, batch, batch_tr, cfg) -> int:
         """Make any translation that overran its UI budget fit.
 
         Ren'Py fixed-width captions — WITHOUT ever butchering a word into an
@@ -1011,13 +1311,16 @@ class TranslationScheduler:
         still over after re-asks, keep the last model text + log (fail-soft).
 
         Either way the final text is the model's own — never cut — and a short
-        Ren'Py caption never degrades to "Сох"."""
+        Ren'Py caption never degrades to "Сох".
+
+        Returns billed tokens spent on re-ask API calls (for TPM ledger).
+        """
         all_oversized = [
             it for it in batch
             if it.id in batch_tr and self._overflows(it.id, batch_tr[it.id])
         ]
         if not all_oversized:
-            return
+            return 0
 
         # Partition: research line-limits always re-ask; Ren'Py short captions
         # skip the re-ask (font-shrink only).
@@ -1039,7 +1342,7 @@ class TranslationScheduler:
             self._record_font_shrink(it.id, batch_tr[it.id])
 
         if not oversized:
-            return
+            return 0
         logger.info(
             "Detected %d translations exceeding UI budget "
             "(%d research line-limit, %d multi-word width). "
@@ -1048,6 +1351,7 @@ class TranslationScheduler:
             len(oversized) - len(line_limited), len(short_fit),
         )
 
+        reask_billed = 0
         for round_no in range(self._MAX_REASKS):
             retry_batch = []
             for it in oversized:
@@ -1083,9 +1387,11 @@ class TranslationScheduler:
             except Exception as e_retry:  # noqa: BLE001
                 logger.error("Retry translation failed: %s", e_retry)
                 break
+            reask_billed += int(retry_tr.usage.billed_tokens() or 0)
             with self.cond:
                 self.tok_in += retry_tr.usage.prompt_tokens
                 self.tok_out += retry_tr.usage.completion_tokens
+                self.requests_sent += 1  # re-ask also hit the provider
             # Keep a re-ask result only if it actually fits better than what we had.
             for rit in retry_batch:
                 if rit.id not in retry_tr.translations:
@@ -1106,7 +1412,7 @@ class TranslationScheduler:
                     batch_tr[rit.id] = r
             oversized = [it for it in oversized if self._overflows(it.id, batch_tr[it.id])]
             if not oversized:
-                return
+                return reask_billed
 
         # Still overflowing: Ren'Py → font-shrink; research → keep text + warn.
         for it in oversized:
@@ -1118,6 +1424,7 @@ class TranslationScheduler:
                 )
             else:
                 self._record_font_shrink(it.id, batch_tr[it.id])
+        return reask_billed
 
     # Font-shrink floor: never make a caption smaller than this fraction of the
     # game's own size — below it text is unreadable, better to let it ride a hair
@@ -1302,6 +1609,9 @@ class TranslationScheduler:
                 continue
 
             _fname, batch = payload
+            # Use free TPM now: shrink a fat batch if partial budget remains so
+            # free tokens aren't left idle while we wait for a full-size send.
+            batch = self._tpm_shrink_to_free(batch, cal, worker_key, _fname)
             t0 = time.time()
             tr_map: dict[str, str] = {}
             key_died = False
@@ -1371,9 +1681,9 @@ class TranslationScheduler:
                 for i in range(self.worker_count)
             ]
             logger.info(
-                "Spawning %d workers across %d key(s) (threads=%d, delay=%.1fs)",
+                "Spawning %d workers across %d key(s) (threads=%d, delay=%.1fs, tpm=%d)",
                 self.worker_count, len(self.keys_to_use), self.threads,
-                self.delay_seconds,
+                self.delay_seconds, self.tpm_limit,
             )
             yield from self._spawn_and_drain(assignment)
 

@@ -13,6 +13,7 @@ const KEYS = {
   providerModel: "interprex.providerModel",
   providerThreads: "interprex.providerThreads",
   providerRpm: "interprex.providerRpm",
+  providerTpm: "interprex.providerTpm",
   maxBatchSize: "interprex.maxBatchSize",
   openrouterFreeOnly: "interprex.openrouterFreeOnly",
   // OpenRouter daily free-request counter. The API doesn't report requests
@@ -61,7 +62,8 @@ type ProviderKey =
   | "providerApiKey2"
   | "providerModel"
   | "providerThreads"
-  | "providerRpm";
+  | "providerRpm"
+  | "providerTpm";
 
 export function loadProviderSetting(
   key: ProviderKey,

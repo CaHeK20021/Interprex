@@ -264,6 +264,8 @@ export interface SidecarTranslateReq {
   // Minimum wall-clock seconds a request must occupy, to pace under a provider's
   // per-minute limit. 0 = no pacing.
   delay_seconds?: number;
+  // Tokens-per-minute cap PER KEY (0 = off). Shared by threads on that key.
+  tpm_limit?: number;
   root?: string;
   engine?: string;
   // "smooth" | "pixel" — measure UI-fit against the same font inject will write.
@@ -291,6 +293,7 @@ export interface TranslateProgress {
     | "paused"
     | "waiting_retry"
     | "waiting_delay" // pacing: holding the request to the min duration
+    | "waiting_tpm" // TPM pacing: waiting for tokens/min room on this key
     | "resting" // idle by priority ramp-down (the pool is too shallow)
     | "batch_error" // one attempt failed (retry may follow); live session log
     | "error" // this worker's key failed
@@ -309,6 +312,22 @@ export interface TranslateProgress {
   requests_sent?: number;
   /** Live error text for the session log (batch attempt failures). */
   last_error?: string;
+  // Live TPM ledger (tokens/min PER KEY, sliding 60s). Present when tpm_limit > 0.
+  tpm_limit?: number;
+  tpm_used?: number; // spent + reserved on this worker's key
+  tpm_spent?: number;
+  tpm_reserved?: number;
+  tpm_free?: number;
+  tpm_est?: number; // estimated cost of the batch currently waiting / reserved
+  tpm_keys?: {
+    key_idx: number;
+    label: string;
+    spent: number;
+    reserved: number;
+    used: number;
+    free: number;
+    limit: number;
+  }[];
 }
 
 export interface TranslateResult {
@@ -374,6 +393,13 @@ export async function translateViaSidecar(
         wait_left: evt.wait_left,
         requests_sent: evt.requests_sent,
         last_error: evt.last_error,
+        tpm_limit: evt.tpm_limit,
+        tpm_used: evt.tpm_used,
+        tpm_spent: evt.tpm_spent,
+        tpm_reserved: evt.tpm_reserved,
+        tpm_free: evt.tpm_free,
+        tpm_est: evt.tpm_est,
+        tpm_keys: evt.tpm_keys,
       });
     } else if (evt.type === "done") {
       result = {

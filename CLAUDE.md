@@ -313,6 +313,17 @@ SAME pool drives every engine. Verified by `check_scheduler` in `selftest.py`
   per-thread (`delay × rank/threads`) so threads that all error at once don't
   re-fire in lockstep — the final sleep tick must be the EXACT remainder, not a
   flat 1s, or sub-second offsets round up and re-synchronize.
+- **TPM** (`tpm_limit`, tokens/min PER KEY, 0 = off): free-tier Gemini etc. also
+  cap **tokens** per minute, which RPM alone cannot protect. Before each send the
+  worker estimates cost from the exact prompt text (`Calibrator.est_tokens` ×
+  `(1+out_ratio)` × safety), waits until a **60s sliding window on that key** has
+  room (`waiting_tpm` phase), then **reserves** so sibling threads on the same key
+  cannot over-book; after the reply, the reserve is replaced by exact
+  `usage` (prompt+completion). Other keys are independent (3 keys × 16k ≈ 48k
+  aggregate). UI field next to RPM (`providerTpm`) is in **thousands (K)** —
+  user types `16` → sidecar gets `tpm_limit=16000`. Verified by
+  `check_scheduler_tpm` (single-key max_inflight=1 under tight cap, two-key =2,
+  tpm=0 unrestricted, window drain).
 - **Error classes** (`_classify_error`): `rate` (429/503/overload) → retry with
   back-off ≥ delay + per-key `key_cooldown` (siblings on that key wait, other
   keys keep going); `auth` (401/403/invalid key) → fail the key fast (2-try
