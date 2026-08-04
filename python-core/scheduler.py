@@ -184,12 +184,17 @@ class TranslationScheduler:
         # Pixel budget (the GROUND TRUTH the translation must fit) per item, so
         # the oversize check measures real rendered width, not len()*avg.
         self.item_orig_px: dict[str, float] = {}
+        # RimWorld research-tree buttons: max wrapped lines (ground truth) + lang
+        # used for the offline Arial/Noto measure. Empty for non-research items.
+        self.item_max_lines: dict[str, int] = {}
+        self.item_line_lang: dict[str, str] = {}
         # rep id -> font-shrink factor (<1.0) for captions that STILL overflow
         # after all re-asks; consumed by inject to reduce that style's font. Empty
         # for the common case (shortening was enough). Guarded by self.cond.
         self.size_overrides: dict[str, float] = {}
         self.item_file: dict[str, str] = {}
         prepared_by_file: "OrderedDict[str, list]" = OrderedDict()
+        from parsers.i18n import is_research_project_label
         for c in reps:
             context = c.context
             is_menu = "menu" in c.path
@@ -216,6 +221,7 @@ class TranslationScheduler:
             # (multi-line note) stays in context.
             max_chars = 0
             max_pixels = 0
+            max_lines = 0
             if (is_menu or is_screen_button) and self.is_renpy and req.root and self.source_font_path:
                 try:
                     from parsers.renpy import (
@@ -264,8 +270,39 @@ class TranslationScheduler:
                     logger.error(
                         "Error calculating char limit for '%s': %s", c.text, e_limit
                     )
+            # RimWorld research-tree buttons (ResearchProjectDef.label only):
+            # fixed 140px cell, height grows with wrap → limit by LINE COUNT so
+            # a long RU name cannot cover the node below. Ground truth = measured
+            # wrap lines; max_chars is only a model hint. No font-shrink path
+            # (engine has none for research cells).
+            elif is_research_project_label(
+                getattr(c, "file", "") or "",
+                getattr(c, "path", None) or [],
+                context or getattr(c, "context", "") or "",
+            ):
+                try:
+                    from parsers.i18n import (
+                        RESEARCH_BUTTON_MAX_LINES,
+                        RESEARCH_BUTTON_WIDTH_PX,
+                        research_label_char_limit,
+                    )
+                    max_lines = RESEARCH_BUTTON_MAX_LINES
+                    max_chars = research_label_char_limit(
+                        req.target_lang, max_lines, RESEARCH_BUTTON_WIDTH_PX
+                    )
+                    self.item_limits[c.id] = max_chars
+                    self.item_max_lines[c.id] = max_lines
+                    self.item_line_lang[c.id] = req.target_lang
+                except Exception as e_limit:
+                    logger.error(
+                        "Error calculating research line limit for '%s': %s",
+                        c.text, e_limit,
+                    )
             prepared_by_file.setdefault(c.file, []).append(
-                TranslateItem(id=c.id, text=c.text, context=context, max_chars=max_chars, max_pixels=max_pixels)
+                TranslateItem(
+                    id=c.id, text=c.text, context=context,
+                    max_chars=max_chars, max_pixels=max_pixels, max_lines=max_lines,
+                )
             )
             self.item_file[c.id] = c.file
         self._prepared_by_file = prepared_by_file
@@ -903,9 +940,21 @@ class TranslationScheduler:
             return 0.0
 
     def _overflows(self, item_id: str, translation: str) -> bool:
-        """True if `translation` renders WIDER than the original's pixel budget.
-        Measures real rendered width in the target-script font — no len()/avg
-        approximation. Falls back to the char hint if pixels are unavailable."""
+        """True if `translation` overruns its budget.
+
+        - Ren'Py fixed-width captions: rendered pixel WIDTH vs original budget.
+        - RimWorld research-tree buttons: wrapped LINE COUNT vs max_lines.
+        - Fallback: char hint * 1.1 when no pixel/line ground truth exists."""
+        # Line-count path (research tree) — ground truth is wrap lines, not width.
+        max_lines = self.item_max_lines.get(item_id)
+        if max_lines:
+            try:
+                from parsers.i18n import research_label_overflows
+                lang = self.item_line_lang.get(item_id) or self.req.target_lang
+                return research_label_overflows(translation, lang, max_lines)
+            except Exception:
+                limit = self.item_limits.get(item_id)
+                return limit is not None and len(translation) > limit * 1.1
         orig_px = self.item_orig_px.get(item_id)
         if orig_px:
             ratio = self._overflow_ratio(item_id, translation)
@@ -920,20 +969,27 @@ class TranslationScheduler:
     # (size_overrides). Only multi-word captions (3+), where a synonym/rephrase can
     # genuinely shorten without mangling, go through the re-ask. User rule:
     # "≤2 words → full word + font shrink; 3+ words → may re-ask shorter".
+    # NOTE: research-tree line limits do NOT use font-shrink (engine has none) —
+    # those always re-ask, even for 1–2 words.
     _MAX_WORDS_FONT_FIT = 2
 
     def _enforce_char_limits(self, batch, batch_tr, cfg) -> None:
-        """Make any translation that overran its Ren'Py per-line width budget fit —
-        WITHOUT ever butchering a word into an abbreviation. Two paths by word count:
+        """Make any translation that overran its UI budget fit.
 
+        Ren'Py fixed-width captions — WITHOUT ever butchering a word into an
+        abbreviation. Two paths by word count:
         - 1–2 words (e.g. "Сохранение"): keep the word WHOLE, record a font-shrink
           factor (size_overrides) so inject renders it smaller but intact. No re-ask.
         - 3+ words: re-ask the model for a shorter rephrase up to _MAX_REASKS times
           (a synonym can shorten honestly here), then font-shrink whatever still
           overflows.
 
+        RimWorld research-tree buttons (item_max_lines): always re-ask shorter
+        (line-count ground truth). No font-shrink — the research UI has none. If
+        still over after re-asks, keep the last model text + log (fail-soft).
+
         Either way the final text is the model's own — never cut — and a short
-        caption never degrades to "Сох"."""
+        Ren'Py caption never degrades to "Сох"."""
         all_oversized = [
             it for it in batch
             if it.id in batch_tr and self._overflows(it.id, batch_tr[it.id])
@@ -941,41 +997,61 @@ class TranslationScheduler:
         if not all_oversized:
             return
 
-        # Partition: short captions skip the re-ask entirely (font-shrink only).
+        # Partition: research line-limits always re-ask; Ren'Py short captions
+        # skip the re-ask (font-shrink only).
         def _word_count(s: str) -> int:
             return len(s.split())
 
-        short_fit = [it for it in all_oversized
-                     if _word_count(batch_tr[it.id]) <= self._MAX_WORDS_FONT_FIT]
-        oversized = [it for it in all_oversized
-                     if _word_count(batch_tr[it.id]) > self._MAX_WORDS_FONT_FIT]
+        line_limited = [it for it in all_oversized if it.id in self.item_max_lines]
+        renpy_oversized = [it for it in all_oversized if it.id not in self.item_max_lines]
 
-        # Record font-shrink for the short ones right away — full word preserved.
+        short_fit = [it for it in renpy_oversized
+                     if _word_count(batch_tr[it.id]) <= self._MAX_WORDS_FONT_FIT]
+        oversized = [it for it in renpy_oversized
+                     if _word_count(batch_tr[it.id]) > self._MAX_WORDS_FONT_FIT]
+        # Research labels always go through re-ask (even 1-word giants that wrap).
+        oversized = line_limited + oversized
+
+        # Record font-shrink for the Ren'Py short ones right away — full word preserved.
         for it in short_fit:
             self._record_font_shrink(it.id, batch_tr[it.id])
 
         if not oversized:
             return
         logger.info(
-            "Detected %d multi-word translations exceeding width budget. "
-            "Re-asking shorter (%d short captions font-shrunk, word kept whole)...",
-            len(oversized), len(short_fit),
+            "Detected %d translations exceeding UI budget "
+            "(%d research line-limit, %d multi-word width). "
+            "Re-asking shorter (%d short Ren'Py captions font-shrunk)...",
+            len(oversized), len(line_limited),
+            len(oversized) - len(line_limited), len(short_fit),
         )
 
         for round_no in range(self._MAX_REASKS):
             retry_batch = []
             for it in oversized:
                 prev = batch_tr[it.id]
-                ratio = self._overflow_ratio(it.id, prev) or 1.15
-                # Aim a bit under the budget: tighten the char target by the
-                # measured overflow ratio so the model has a concrete smaller
-                # number to hit, not a vague "shorter".
                 base = self.item_limits.get(it.id) or len(prev)
-                tighter = max(3, int(min(base, len(prev)) / max(ratio, 1.01)))
-                retry_batch.append(
-                    TranslateItem(id=it.id, text=it.text, context=it.context,
-                                  max_chars=tighter)
-                )
+                max_lines = self.item_max_lines.get(it.id)
+                if max_lines:
+                    # Line-limit: tighten char hint ~15% per re-ask so the model
+                    # gets a concrete smaller number, not just "shorter".
+                    tighter = max(4, int(min(base, len(prev)) * (0.85 ** (round_no + 1))))
+                    retry_batch.append(
+                        TranslateItem(
+                            id=it.id, text=it.text, context=it.context,
+                            max_chars=tighter, max_lines=max_lines,
+                        )
+                    )
+                else:
+                    ratio = self._overflow_ratio(it.id, prev) or 1.15
+                    # Aim a bit under the budget: tighten the char target by the
+                    # measured overflow ratio so the model has a concrete smaller
+                    # number to hit, not a vague "shorter".
+                    tighter = max(3, int(min(base, len(prev)) / max(ratio, 1.01)))
+                    retry_batch.append(
+                        TranslateItem(id=it.id, text=it.text, context=it.context,
+                                      max_chars=tighter)
+                    )
             try:
                 retry_prompt = build_prompt(
                     retry_batch, self.req.target_lang, self.req.glossary,
@@ -993,15 +1069,33 @@ class TranslationScheduler:
                 if rit.id not in retry_tr.translations:
                     continue
                 r = retry_tr.translations[rit.id]
-                if self._overflow_ratio(rit.id, r) <= self._overflow_ratio(rit.id, batch_tr[rit.id]) or not self.item_orig_px.get(rit.id):
+                if rit.id in self.item_max_lines:
+                    # Prefer fewer lines; if equal lines, prefer shorter char count.
+                    try:
+                        from parsers.i18n import research_label_line_count
+                        lang = self.item_line_lang.get(rit.id) or self.req.target_lang
+                        old_n = research_label_line_count(batch_tr[rit.id], lang)
+                        new_n = research_label_line_count(r, lang)
+                        if new_n < old_n or (new_n == old_n and len(r) <= len(batch_tr[rit.id])):
+                            batch_tr[rit.id] = r
+                    except Exception:
+                        batch_tr[rit.id] = r
+                elif self._overflow_ratio(rit.id, r) <= self._overflow_ratio(rit.id, batch_tr[rit.id]) or not self.item_orig_px.get(rit.id):
                     batch_tr[rit.id] = r
             oversized = [it for it in oversized if self._overflows(it.id, batch_tr[it.id])]
             if not oversized:
                 return
 
-        # Still overflowing after the last re-ask: font-shrink the remainder.
+        # Still overflowing: Ren'Py → font-shrink; research → keep text + warn.
         for it in oversized:
-            self._record_font_shrink(it.id, batch_tr[it.id])
+            if it.id in self.item_max_lines:
+                logger.warning(
+                    "Research button id '%s' still exceeds %d lines after re-asks; "
+                    "keeping model text (no truncate, no font-shrink available).",
+                    it.id, self.item_max_lines[it.id],
+                )
+            else:
+                self._record_font_shrink(it.id, batch_tr[it.id])
 
     # Font-shrink floor: never make a caption smaller than this fraction of the
     # game's own size — below it text is unreadable, better to let it ride a hair

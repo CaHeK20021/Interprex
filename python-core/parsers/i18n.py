@@ -708,6 +708,250 @@ def _strip_json_comments(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# RimWorld research-tree button layout (MainTabWindow_Research)
+#
+# Engine ground truth (decompiled):
+#   ResearchItemW = 140; label height = Text.CalcHeight(label, 140)
+#   Font = GameFont.Small → Resources/Fonts/Arial_small, wordWrap on
+#   Box grows with lines; researchViewY is fixed → 3+ lines commonly
+#   overlap the next node (vanilla Y step 0.7 → only 70 px between tops).
+# We never touch researchViewX/Y. Only ResearchProjectDef.label is limited
+# (description is unlimited — it is not drawn on the tree button).
+# ---------------------------------------------------------------------------
+RESEARCH_BUTTON_WIDTH_PX = 140.0
+RESEARCH_BUTTON_MAX_LINES = 2
+# Approx Small/Arial_small. Line COUNT only needs consistent glyph widths;
+# exact Unity line-height is irrelevant for the wrap decision.
+_RESEARCH_FONT_SIZE = 14
+_RESEARCH_CTX_MARKER = "research tree button"
+
+_ASSETS_FONTS = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
+
+# Script alphabet samples for avg-glyph char hints (mirrors renpy tables, kept
+# local so i18n does not import the whole Ren'Py parser).
+_RESEARCH_ALPHABET = {
+    "english": "etaoinshrdlucmfwypvbgkjqxz ETAOINSHRDLU",
+    "russian": "оеаинтсрвлкмдпуяыьгзбчйхжшюцщэфъ ОЕАИНТСРВЛКМДПУЯ",
+    "ukrainian": "оеаинтсрвлкмдпуяыьгзбчйхжшюцщэфїєґ ОЕАИНТСРВЛКМДПУЯ",
+    "german": "enisratdhulcgmobwfkzpvjyxqß ENISRATH",
+    "french": "esaitnrulodcmpévqfbghjàxèyêz ESATINRUL",
+    "spanish": "eaosrnidlctumpbgvyqhfzjñx EAOSRNIDL",
+    "portuguese": "aeosrinmdutclpvqbgfhjãõçx AEOSRINMD",
+    "japanese": "のにあとるはでをとがてもするくき",
+    "chinese": "的一是不了人我在有他这为之大来",
+    "korean": "이근는을를의가에한것으로고다",
+}
+
+
+def _normalize_research_lang(target_lang: str) -> str:
+    """Map UI display names → bare script keys used by alphabet/font tables."""
+    t = (target_lang or "english").strip().lower()
+    aliases = {
+        "ru": "russian", "russian (русский)": "russian",
+        "uk": "ukrainian", "ua": "ukrainian",
+        "de": "german", "fr": "french", "es": "spanish",
+        "pt": "portuguese", "portuguese (brazil)": "portuguese",
+        "portuguesebrazilian": "portuguese",
+        "ja": "japanese", "jp": "japanese",
+        "zh": "chinese", "chinese (simplified)": "chinese",
+        "chinesesimplified": "chinese", "chinesetraditional": "chinese",
+        "ko": "korean", "kr": "korean",
+        "en": "english",
+    }
+    if t in aliases:
+        return aliases[t]
+    if t in _RESEARCH_ALPHABET:
+        return t
+    # "Portuguese (Brazil)" / "Chinese (Simplified)" → part before '('
+    head = t.split("(", 1)[0].strip()
+    if head in aliases:
+        return aliases[head]
+    if head in _RESEARCH_ALPHABET:
+        return head
+    return "english"
+
+
+def is_research_project_label(
+    file_rel: str,
+    path: list[str] | None,
+    context: str = "",
+) -> bool:
+    """True only for ResearchProjectDef *button* labels (tree cells).
+
+    Descriptions, nested fields, ResearchTabDef tabs, MainButtonDef, etc. are
+    False — they do not grow a research-tree cell."""
+    key = ""
+    if path:
+        key = path[0] if isinstance(path[0], str) else str(path[0])
+    # DefInjected key is exactly "<defName>.label" — nested paths like
+    # tools.0.label are never research-tree buttons.
+    parts = key.split(".") if key else []
+    if len(parts) != 2 or parts[1].lower() != "label":
+        return False
+    fl = (file_rel or "").replace("\\", "/").lower()
+    ctx = (context or "").lower()
+    if "researchprojectdef" in fl:
+        return True
+    if "researchprojectdef" in ctx:
+        return True
+    return False
+
+
+def _research_font_path(target_lang: str) -> str:
+    """Font used to approximate engine wrap. Arial matches GameFont.Small for
+    Latin/Cyrillic; CJK falls back to bundled Noto (Arial has no glyphs)."""
+    lang = _normalize_research_lang(target_lang)
+    if lang in ("japanese", "chinese", "korean"):
+        cjk = os.path.join(_ASSETS_FONTS, "NotoSansCJK-Regular.ttc")
+        if os.path.isfile(cjk):
+            return cjk
+    for candidate in (
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf"),
+        os.path.join(_ASSETS_FONTS, "NotoSans-Regular.ttf"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(_ASSETS_FONTS, "NotoSans-Regular.ttf")
+
+
+def _load_research_font(target_lang: str, size: int = _RESEARCH_FONT_SIZE):
+    """PIL ImageFont or None if Pillow/font unavailable (degrade gracefully)."""
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None
+    path = _research_font_path(target_lang)
+    try:
+        # TTC needs index; Noto CJK regular is face 0.
+        if path.lower().endswith(".ttc"):
+            return ImageFont.truetype(path, size=size, index=0)
+        return ImageFont.truetype(path, size=size)
+    except Exception:
+        try:
+            return ImageFont.truetype(
+                os.path.join(_ASSETS_FONTS, "NotoSans-Regular.ttf"), size=size
+            )
+        except Exception:
+            return None
+
+
+def _glyph_width(font, ch: str) -> float:
+    try:
+        return float(font.getlength(ch))
+    except Exception:
+        try:
+            return float(font.getsize(ch)[0])
+        except Exception:
+            return float(_RESEARCH_FONT_SIZE) * 0.55
+
+
+def research_label_line_count(text: str, target_lang: str = "english",
+                              width_px: float = RESEARCH_BUTTON_WIDTH_PX) -> int:
+    """How many wrapped lines the engine would need for this caption at `width_px`.
+
+    Mirrors Text.CalcHeight → GUIStyle word-wrap at GameFont.Small: greedy
+    word wrap, overlong tokens character-broken. Explicit \\n / real newlines
+    force breaks. Returns 1 for empty. Degrades to a crude char-estimate if PIL
+    is unavailable (still usable as a soft gate)."""
+    if not text or not str(text).strip():
+        return 1
+    # Model may keep literal \n escapes (prompt rule); count them as breaks.
+    plain = str(text).replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    font = _load_research_font(target_lang)
+    if font is None:
+        # ~8 px/char heuristic at Small; still better than nothing.
+        total = 0
+        for para in plain.split("\n"):
+            total += max(1, (len(para) * 8 + int(width_px) - 1) // max(1, int(width_px)))
+        return max(1, total)
+
+    def _wrap_para(para: str) -> int:
+        if not para:
+            return 1
+        # CJK: allow break between almost any chars (engine does).
+        lang = _normalize_research_lang(target_lang)
+        cjk = lang in ("japanese", "chinese", "korean")
+        if cjk:
+            tokens = list(para)  # char-by-char
+            sep_w = 0.0
+        else:
+            tokens = para.split(" ")
+            sep_w = _glyph_width(font, " ")
+        lines = 1
+        line_w = 0.0
+        first = True
+        for tok in tokens:
+            tw = sum(_glyph_width(font, ch) for ch in tok) if tok else 0.0
+            if cjk:
+                need = tw
+                gap = 0.0
+            else:
+                gap = 0.0 if first else sep_w
+                need = gap + tw
+            if line_w + need <= width_px or first and tw <= width_px:
+                line_w += need
+                first = False
+                continue
+            # Token alone wider than the cell → char-break it.
+            if tw > width_px:
+                if not first and line_w > 0:
+                    lines += 1
+                cw = 0.0
+                for ch in tok:
+                    w = _glyph_width(font, ch)
+                    if cw + w > width_px and cw > 0:
+                        lines += 1
+                        cw = w
+                    else:
+                        cw += w
+                line_w = cw
+                first = False
+                continue
+            lines += 1
+            line_w = tw
+            first = False
+        return max(1, lines)
+
+    return sum(_wrap_para(p) for p in plain.split("\n"))
+
+
+def research_label_char_limit(
+    target_lang: str,
+    max_lines: int = RESEARCH_BUTTON_MAX_LINES,
+    width_px: float = RESEARCH_BUTTON_WIDTH_PX,
+) -> int:
+    """Character HINT for the model (not the ground truth). Derived from
+    frequency-weighted avg glyph width × max_lines at the research cell width."""
+    lang = _normalize_research_lang(target_lang)
+    sample = _RESEARCH_ALPHABET.get(lang) or _RESEARCH_ALPHABET["english"]
+    font = _load_research_font(target_lang)
+    if font is None:
+        # ~8 px/char @ Small; leave some slack.
+        per_line = max(8, int(width_px / 8))
+        return max(8, per_line * max(1, max_lines))
+    letters = [c for c in sample if c != " "]
+    letter_w = sum(_glyph_width(font, c) for c in letters) / max(1, len(letters))
+    space_w = _glyph_width(font, " ")
+    # ~16% spaces in Latin/Cyrillic prose; ~0 for CJK.
+    sf = 0.0 if lang in ("japanese", "chinese", "korean") else 0.16
+    avg = (1.0 - sf) * letter_w + sf * space_w
+    if avg <= 0:
+        avg = float(_RESEARCH_FONT_SIZE) * 0.55
+    per_line = max(4, int(width_px / avg))
+    return max(8, per_line * max(1, max_lines))
+
+
+def research_label_overflows(
+    text: str,
+    target_lang: str,
+    max_lines: int = RESEARCH_BUTTON_MAX_LINES,
+    width_px: float = RESEARCH_BUTTON_WIDTH_PX,
+) -> bool:
+    """True if `text` wraps to more than `max_lines` in a research button cell."""
+    return research_label_line_count(text, target_lang, width_px) > max_lines
+
+
 class I18nParser(BaseParser):
     engine = "i18n"
 
@@ -721,6 +965,12 @@ class I18nParser(BaseParser):
             "UI TAB/BUTTON LABELS: if a string's context says it is a UI tab or button "
             "label, the on-screen width is very limited — translate it as SHORT as "
             "possible (ideally 1-2 words), even if that means a looser wording.\n"
+            "RESEARCH TREE BUTTONS: items with max_lines set are RimWorld "
+            "ResearchProjectDef labels drawn in a fixed 140px-wide research-tree "
+            "cell. The translation MUST stay within max_lines lines at that width "
+            "(rephrase shorter if needed). Never abbreviate a single word into a "
+            "stub; rephrase the whole research name so it fits. Descriptions of "
+            "research projects have NO line limit — only the button label does.\n"
             "TONE: use a neutral, professional register. Avoid overly literary style."
         )
 
@@ -790,6 +1040,14 @@ class I18nParser(BaseParser):
                                         rp = rel_path.lower()
                                         if "researchtabdef" in rp or "mainbuttondef" in rp:
                                             ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
+                                        # Research-tree cell caption: fixed 140px, max 2 lines
+                                        # (scheduler enforces via measure; context is a hint).
+                                        elif is_research_project_label(rel_path, [child.tag], ctx):
+                                            ctx += (
+                                                f" ({_RESEARCH_CTX_MARKER} — max "
+                                                f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
+                                                f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                                            )
                                         results.append(self._mk(rel_path, [child.tag], original, ctx))
                             except Exception as e:
                                 print(f"Error reading RimWorld XML {filename}: {e}")
@@ -812,6 +1070,12 @@ class I18nParser(BaseParser):
                     # Width-limited UI tab/button label -> ask for a short translation.
                     if def_type.lower() in ("researchtabdef", "mainbuttondef"):
                         ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
+                    elif is_research_project_label(synthetic_file, [key], ctx):
+                        ctx += (
+                            f" ({_RESEARCH_CTX_MARKER} — max "
+                            f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
+                            f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                        )
                     results.append(self._mk(synthetic_file, [key], original, ctx))
             except Exception as e:
                 print(f"Error generating RimWorld DefInjected from Defs: {e}")

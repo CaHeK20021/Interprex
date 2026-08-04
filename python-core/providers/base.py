@@ -37,6 +37,10 @@ class TranslateItem:
     # Optional pixel-width budget (rendered width constraint in pixels).
     # Used by the model as a strict visual guideline (especially for Cyrillic scripts).
     max_pixels: int = 0
+    # Optional max wrapped LINE count for fixed-width UI cells (e.g. RimWorld
+    # research-tree buttons at 140px). 0 = no line limit. Surfaced to the model
+    # as a first-class field; ground truth is measured wrap, not len().
+    max_lines: int = 0
 
 
 @dataclass
@@ -162,6 +166,9 @@ def build_prompt(items: list[TranslateItem], lang: str,
             val["fixed_width"] = True
         if it.max_pixels:
             val["max_pixels"] = it.max_pixels
+            val["fixed_width"] = True
+        if it.max_lines:
+            val["max_lines"] = it.max_lines
             val["fixed_width"] = True
         payload[it.id] = val
     lines.append(json.dumps(payload, ensure_ascii=False, indent=2))

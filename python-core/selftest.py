@@ -2153,6 +2153,147 @@ def check_i18n_rimworld_defs() -> None:
     print("check_i18n_rimworld_defs OK")
 
 
+def check_rimworld_research_lines() -> None:
+    """Research-tree button labels are limited by WRAP LINE COUNT (not bare
+    char count). Mirrors MainTabWindow_Research: 140px cell, GameFont.Small,
+    max 2 lines so a long RU name cannot cover the node below. Descriptions
+    and non-research labels are unlimited."""
+    from parsers.i18n import (
+        RESEARCH_BUTTON_MAX_LINES,
+        RESEARCH_BUTTON_WIDTH_PX,
+        is_research_project_label,
+        research_label_char_limit,
+        research_label_line_count,
+        research_label_overflows,
+    )
+    from providers.base import TranslateItem, build_prompt
+
+    # --- detector: only ResearchProjectDef.<defName>.label -------------------
+    assert is_research_project_label(
+        "Languages/English/DefInjected/ResearchProjectDef/R.xml",
+        ["ImprovedCabinet.label"],
+        "RimWorld Defs | ResearchProjectDef | ImprovedCabinet.label",
+    )
+    assert is_research_project_label(
+        "1.6/Languages/English/DefInjected/ResearchProjectDef/X.xml",
+        ["Foo.label"],
+        "",
+    )
+    # description is NOT a tree button
+    assert not is_research_project_label(
+        "Languages/English/DefInjected/ResearchProjectDef/R.xml",
+        ["ImprovedCabinet.description"],
+        "RimWorld Defs | ResearchProjectDef | ImprovedCabinet.description",
+    )
+    # ThingDef / nested labels are not research buttons
+    assert not is_research_project_label(
+        "Languages/English/DefInjected/ThingDef/T.xml",
+        ["Seal.label"],
+        "RimWorld Defs | ThingDef | Seal.label",
+    )
+    assert not is_research_project_label(
+        "Languages/English/DefInjected/ResearchProjectDef/R.xml",
+        ["Foo.tools.0.label"],
+        "RimWorld Defs | ResearchProjectDef | Foo.tools.0.label",
+    )
+    # Tabs are short-prompt only, not the tree-cell line limit
+    assert not is_research_project_label(
+        "Languages/English/DefInjected/ResearchTabDef/T.xml",
+        ["Main.label"],
+        "RimWorld | ResearchTabDef | Main.label",
+    )
+
+    # --- line measure: short fits, long wraps past max_lines -----------------
+    assert research_label_line_count("Gun", "english") == 1
+    assert research_label_line_count("Печь", "russian") == 1
+    # A deliberately long RU phrase must wrap past 2 lines at 140px.
+    long_ru = (
+        "очень длинное название исследовательского проекта для проверки "
+        "переноса строк в ячейке дерева технологий"
+    )
+    n_long = research_label_line_count(long_ru, "russian")
+    assert n_long > RESEARCH_BUTTON_MAX_LINES, (
+        f"expected long RU caption to wrap past {RESEARCH_BUTTON_MAX_LINES} "
+        f"lines @ {RESEARCH_BUTTON_WIDTH_PX}px, got {n_long}"
+    )
+    assert research_label_overflows(long_ru, "russian")
+    assert not research_label_overflows("Gun turrets", "english")
+    assert not research_label_overflows("Станки", "russian")
+
+    # Explicit \\n counts as a break (model prompt keeps literal escapes).
+    assert research_label_line_count("one\\ntwo\\nthree", "english") >= 3
+
+    # Char hint is positive and scales with max_lines.
+    lim2 = research_label_char_limit("Russian", 2)
+    lim1 = research_label_char_limit("Russian", 1)
+    assert lim2 >= lim1 >= 8, f"char hints: lim1={lim1} lim2={lim2}"
+    # CJK budget differs from Latin (different avg glyph width).
+    lim_ja = research_label_char_limit("Japanese", 2)
+    lim_en = research_label_char_limit("English", 2)
+    assert lim_ja > 0 and lim_en > 0
+
+    # --- prompt surfaces max_lines as a first-class field --------------------
+    prompt = build_prompt(
+        [TranslateItem("r1", "advanced multi-analyzer",
+                       max_chars=24, max_lines=2)],
+        "Russian", {}, engine="i18n",
+    )
+    assert '"max_lines": 2' in prompt, "max_lines not surfaced to the model"
+    assert '"fixed_width": true' in prompt
+    assert "RESEARCH TREE" in prompt or "research" in prompt.lower(), \
+        "i18n addon must mention research-tree rule"
+    plain = build_prompt([TranslateItem("b", "Hello")], "Russian", {})
+    assert '"max_lines":' not in plain
+
+    # --- extract marks ResearchProjectDef.label context ----------------------
+    import shutil
+    root = tempfile.mkdtemp(prefix="interprex_rimworld_research_")
+    try:
+        defs = os.path.join(root, "Defs", "Research")
+        os.makedirs(defs, exist_ok=True)
+        # About.xml so detect sees RimWorld.
+        about = os.path.join(root, "About")
+        os.makedirs(about, exist_ok=True)
+        with open(os.path.join(about, "About.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<ModMetaData><name>T</name><packageId>t.t</packageId>'
+                '<author>t</author><description>t</description></ModMetaData>\n'
+            )
+        with open(os.path.join(defs, "R.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<Defs>\n'
+                '  <ResearchProjectDef>\n'
+                '    <defName>AdvAnalyzer</defName>\n'
+                '    <label>advanced multi-analyzer</label>\n'
+                '    <description>A long description that must NOT be line-limited.</description>\n'
+                '    <baseCost>1000</baseCost>\n'
+                '    <techLevel>Industrial</techLevel>\n'
+                '    <researchViewX>0</researchViewX>\n'
+                '    <researchViewY>0</researchViewY>\n'
+                '  </ResearchProjectDef>\n'
+                '</Defs>\n'
+            )
+        from parsers import get_parser, detect_engine
+        assert detect_engine(root) == "i18n"
+        strings = get_parser("i18n").extract(root)
+        labels = [s for s in strings if s.path and s.path[0].endswith(".label")
+                  and "ResearchProjectDef" in (s.context or "")]
+        descs = [s for s in strings if s.path and s.path[0].endswith(".description")
+                 and "ResearchProjectDef" in (s.context or "")]
+        assert len(labels) == 1, f"expected 1 research label, got {labels}"
+        assert "research tree button" in labels[0].context, labels[0].context
+        assert len(descs) == 1
+        assert "research tree button" not in descs[0].context
+        assert is_research_project_label(labels[0].file, labels[0].path, labels[0].context)
+        assert not is_research_project_label(descs[0].file, descs[0].path, descs[0].context)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("check_rimworld_research_lines OK")
+
+
 def check_i18n() -> None:
     # Build a fake Stardew + RimWorld folder structure
     root = tempfile.mkdtemp(prefix="interprex_i18n_selftest_")
@@ -3793,6 +3934,15 @@ def check_prompt_width() -> None:
     assert '"max_chars":' not in plain, "plain item leaked a max_chars value"
     assert '"fixed_width":' not in plain, "plain item leaked a fixed_width value"
     assert TranslateItem("c", "x").max_chars == 0, "default max_chars must be 0"
+    assert TranslateItem("d", "x").max_lines == 0, "default max_lines must be 0"
+
+    # max_lines (RimWorld research buttons) is also first-class, not context.
+    lines_prompt = build_prompt(
+        [TranslateItem("r", "advanced multi-analyzer", max_lines=2, max_chars=30)],
+        "Russian", {},
+    )
+    assert '"max_lines": 2' in lines_prompt, "max_lines not surfaced to the model"
+    assert '"fixed_width": true' in lines_prompt
 
     # fixed_width / max_chars rules live in the Ren'Py engine addon (they only
     # apply to Ren'Py menu choices / screen buttons, never to other engines).
@@ -5638,6 +5788,7 @@ def main() -> int:
     check_unity_localization()
     check_i18n()
     check_i18n_rimworld_defs()
+    check_rimworld_research_lines()
     check_fusion()
     check_mmf2()
     check_qsp()
