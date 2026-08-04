@@ -572,6 +572,18 @@ the full app only to *see* it.
     JSON patches in `FactoryGame/Configs/ContentLib/{ItemPatches,RecipePatches}/`.
     `detect_mods` walks up from the mods folder to resolve the game root (needed
     for `global.utoc`/`global.ucas`). Tested on 17 real mods (805 strings).
+  - **Skyrim SE** (`skyrim`, Creation Engine plugins): `.esp`/`.esm`/`.esl` with
+    24-byte SSE record headers. Extracts FULL/DESC/INFO:NAM1/MGEF:DNAM/MESG:ITXT/
+    QUST:NNAM+CNAM/…; inject rewrites inline zstrings in-place (dirty-flag tree
+    so unmodified compressed records stay byte-identical) or string tables when
+    TES4 Localized (0x80). **BSA + SkyUI**: `parsers/bsa.py` reads SSE v105
+    (LZ4 frame) / LE v104 (zlib); pulls `Interface/Translations/*_english.txt`
+    from sibling `.bsa` or loose files; inject writes LOOSE
+    `Interface/Translations/<mod>_<target>.txt` (engine prefers Data/ over
+    archive — BSA never rewritten). RaceMenu 1→389 strings. `detect_mods` lists
+    loose plugins at folder root AND foldered mods. Verified on
+    Apocalypse/Ordinator/RDO/Wyrmstooth/RaceMenu + synthetic selftest.
+    FO4/`.ba2` is a separate future engine.
 - Sidecar (FastAPI) + IPC seam + project store + minimal UI.
 - i18n (en + ru), language switcher, persisted prefs.
 - LLM translation via pluggable providers (Ollama, LM Studio, Gemini), batched
@@ -610,9 +622,9 @@ the full app only to *see* it.
 4. **More engines** (each = one `BaseParser` subclass + registry line + `Engine`
    union entry): done so far — Ren'Py, RPG Maker, C#/DLL, Unity (UnityPy), i18n
    JSON, Fusion/Chowdren, MMF2, QSP, Unreal Engine 3 (.INT), Unreal Engine 4/5
-   (.locres). Next candidates: `.pak`/`.utoc` unpacking (to reach packed
-   `.locres` in shipped UE5 games like Satisfactory), Godot (.tres/.tscn),
-   GameMaker (JSON).
+   (.locres), Skyrim SE (`.esp`/`.esm`/`.esl`). Next candidates: Skyrim BSA +
+   MCM Interface/Translations, Fallout 4 (shared ESP core + BA2 + TERM/OMOD),
+   Godot (.tres/.tscn), GameMaker (JSON).
 5. **Claude provider** — add Anthropic as a 4th provider (read the claude-api
    skill for current model id/SDK; don't hardcode from memory).
 6. **Packaging** — bundle the Python sidecar as a Tauri `externalBin` sidecar

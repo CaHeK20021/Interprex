@@ -2680,6 +2680,243 @@ def build_unreal_project() -> str:
     return root
 
 
+def build_skyrim_project() -> str:
+    """Minimal Skyrim SE plugin tree: one .esp with FULL/DESC/NAM1/DNAM + a
+    mesh-path NAM1 that must be filtered out. Uses the parser's own writer so
+    the fixture stays in lockstep with the binary format."""
+    import struct
+    from parsers.skyrim import (
+        Record, Group, SubRecord, write_plugin,
+        FLAG_COMPRESSED, _encode_zstring,
+    )
+
+    root = tempfile.mkdtemp(prefix="interprex_skyrim_selftest_")
+    tes4 = Record(
+        type=b"TES4", flags=0, form_id=0, vc=b"\x00" * 8,
+        subs=[
+            SubRecord(b"HEDR", struct.pack("<fiI", 1.7, 4, 0)),
+            SubRecord(b"CNAM", _encode_zstring("SelftestAuthor")),
+        ],
+        compressed=False, raw=b"", dirty=True,
+    )
+    spel = Record(
+        type=b"SPEL", flags=0, form_id=0x01000ABC, vc=b"\x00" * 8,
+        subs=[
+            SubRecord(b"EDID", _encode_zstring("TestSpell")),
+            SubRecord(b"FULL", _encode_zstring("Fireball")),
+            SubRecord(b"DESC", _encode_zstring(
+                "A fiery explosion for <mag> points.")),
+        ],
+        compressed=False, raw=b"", dirty=True,
+    )
+    info = Record(
+        type=b"INFO", flags=0, form_id=0x01000DEF, vc=b"\x00" * 8,
+        subs=[SubRecord(b"NAM1", _encode_zstring("It's nothing..."))],
+        compressed=False, raw=b"", dirty=True,
+    )
+    mgef = Record(
+        type=b"MGEF", flags=FLAG_COMPRESSED, form_id=0x01000FED, vc=b"\x00" * 8,
+        subs=[
+            SubRecord(b"EDID", _encode_zstring("TestEffect")),
+            SubRecord(b"FULL", _encode_zstring("Burn")),
+            SubRecord(b"DNAM", _encode_zstring(
+                "Burns the target for <dur> seconds.")),
+        ],
+        compressed=True, raw=b"", dirty=True,
+    )
+    # HDPT:FULL is text; HDPT:NAM1 is a mesh path and must be skipped.
+    hdpt = Record(
+        type=b"HDPT", flags=0, form_id=0x01000111, vc=b"\x00" * 8,
+        subs=[
+            SubRecord(b"FULL", _encode_zstring("Hair01")),
+            SubRecord(b"NAM1", _encode_zstring(r"Actors\Hair\Hair01.tri")),
+        ],
+        compressed=False, raw=b"", dirty=True,
+    )
+    # MESG with two ITXT buttons
+    mesg = Record(
+        type=b"MESG", flags=0, form_id=0x01000222, vc=b"\x00" * 8,
+        subs=[
+            SubRecord(b"FULL", _encode_zstring("Choose a path")),
+            SubRecord(b"ITXT", _encode_zstring("Left door")),
+            SubRecord(b"ITXT", _encode_zstring("Right door")),
+        ],
+        compressed=False, raw=b"", dirty=True,
+    )
+    nodes = [
+        tes4,
+        Group(label=b"SPEL", group_type=0, stamp=b"\x00" * 8,
+              children=[spel], raw=b"", dirty=True),
+        Group(label=b"INFO", group_type=0, stamp=b"\x00" * 8,
+              children=[info], raw=b"", dirty=True),
+        Group(label=b"MGEF", group_type=0, stamp=b"\x00" * 8,
+              children=[mgef], raw=b"", dirty=True),
+        Group(label=b"HDPT", group_type=0, stamp=b"\x00" * 8,
+              children=[hdpt], raw=b"", dirty=True),
+        Group(label=b"MESG", group_type=0, stamp=b"\x00" * 8,
+              children=[mesg], raw=b"", dirty=True),
+    ]
+    plugin = os.path.join(root, "TestMod.esp")
+    with open(plugin, "wb") as f:
+        f.write(write_plugin(nodes))
+
+    # SkyUI Interface/Translations (loose, UTF-16 LE) — RaceMenu-style MCM text.
+    from parsers.skyrim import _encode_translation_file
+    tl_dir = os.path.join(root, "Interface", "Translations")
+    os.makedirs(tl_dir)
+    pairs = [
+        ("$ALL", "ALL"),
+        ("$COLORS", "COLORS"),
+        ("$Body", "Body"),
+        ("$Done", "Done"),
+    ]
+    with open(os.path.join(tl_dir, "testmod_english.txt"), "wb") as f:
+        f.write(_encode_translation_file(pairs, "utf-16-le"))
+    return root
+
+
+def check_skyrim() -> None:
+    from parsers.skyrim import parse_plugin, write_plugin
+
+    root = build_skyrim_project()
+    plugin = os.path.join(root, "TestMod.esp")
+    orig_bytes = open(plugin, "rb").read()
+
+    assert detect_engine(root) == "skyrim", f"skyrim detect failed: {detect_engine(root)}"
+    # Single-file detect (flat Data layout)
+    assert detect_engine(plugin) == "skyrim", "skyrim detect on .esp file failed"
+    p = get_parser("skyrim")
+
+    strings = p.extract(root)
+    originals = {s.original for s in strings}
+
+    # Expected player-facing text
+    assert "Fireball" in originals
+    assert "A fiery explosion for <mag> points." in originals
+    assert "It's nothing..." in originals
+    assert "Burn" in originals
+    assert "Burns the target for <dur> seconds." in originals
+    assert "Hair01" in originals
+    assert "Choose a path" in originals
+    assert "Left door" in originals
+    assert "Right door" in originals
+    # SkyUI translations
+    assert "ALL" in originals and "COLORS" in originals
+    assert "Body" in originals and "Done" in originals
+
+    # Filtered: author metadata, editor IDs, mesh paths
+    assert "SelftestAuthor" not in originals, "TES4 CNAM author must not extract"
+    assert "TestSpell" not in originals, "EDID must not extract"
+    assert r"Actors\Hair\Hair01.tri" not in originals, "mesh NAM1 must not extract"
+
+    # Path shape: [recordType, formIdHex, subType, index]
+    fire = [s for s in strings if s.original == "Fireball"][0]
+    assert fire.path == ["SPEL", "01000ABC", "FULL", "0"], fire.path
+    assert fire.file == "TestMod.esp", fire.file
+    left = [s for s in strings if s.original == "Left door"][0]
+    right = [s for s in strings if s.original == "Right door"][0]
+    assert left.path == ["MESG", "01000222", "ITXT", "0"], left.path
+    assert right.path == ["MESG", "01000222", "ITXT", "1"], right.path
+    body = [s for s in strings if s.original == "Body"][0]
+    assert body.path == ["$Body"], body.path
+    assert body.file.replace("\\", "/") == "Interface/Translations/testmod_english.txt"
+
+    # Id stability
+    ids1 = {s.id for s in strings}
+    ids2 = {s.id for s in p.extract(root)}
+    assert ids1 == ids2, "skyrim ids not stable across runs"
+
+    # No-op inject keeps bytes identical (dirty-flag identity path)
+    written0 = p.inject(root, {})
+    assert written0 == 0
+    assert open(plugin, "rb").read() == orig_bytes, "noop inject must be byte-identical"
+
+    # Split ESP vs UI for inject expectations: ESP originals change in-file;
+    # UI source english file stays, target-language override is written loose.
+    esp_strings = [s for s in strings if s.file.endswith(".esp")]
+    ui_strings = [s for s in strings if "Translations" in s.file.replace("\\", "/")]
+    assert ui_strings, "SkyUI fixture missing"
+
+    tr = {}
+    esp_map = {
+        "Fireball": "Огненный шар",
+        "A fiery explosion for <mag> points.": "Огненный взрыв на <mag> очков.",
+        "It's nothing...": "Это… ничего...",
+        "Burn": "Горение",
+        "Burns the target for <dur> seconds.": "Жжёт цель <dur> сек.",
+        "Hair01": "Причёска01",
+        "Choose a path": "Выберите путь",
+        "Left door": "Левая дверь",
+        "Right door": "Правая дверь",
+    }
+    for s in esp_strings:
+        tr[s.id] = esp_map[s.original]
+    ui_map = {"ALL": "ВСЕ", "COLORS": "ЦВЕТА", "Body": "Тело", "Done": "Готово"}
+    for s in ui_strings:
+        tr[s.id] = ui_map[s.original]
+
+    written = p.inject(root, tr, target_lang="Russian")
+    assert written == len(tr), f"skyrim written={written} != {len(tr)}"
+
+    after = p.extract(root)
+    after_orig = {s.original for s in after}
+    # ESP in-place: Russian now the "original" on re-extract
+    assert "Огненный шар" in after_orig
+    assert "Огненный взрыв на <mag> очков." in after_orig
+    assert "Это… ничего..." in after_orig
+    assert "Жжёт цель <dur> сек." in after_orig
+    assert "Левая дверь" in after_orig and "Правая дверь" in after_orig
+    assert "Fireball" not in after_orig
+    assert "Left door" not in after_orig
+    # UI source english still extracted (override is a different file)
+    assert "Body" in after_orig and "ALL" in after_orig
+
+    ru_path = os.path.join(root, "Interface", "Translations", "testmod_russian.txt")
+    assert os.path.isfile(ru_path), "SkyUI loose override not written"
+    ru_raw = open(ru_path, "rb").read()
+    assert ru_raw.startswith(b"\xff\xfe"), "SkyUI override must be UTF-16 LE with BOM"
+    ru_text = ru_raw.decode("utf-16-le")
+    assert "$Body\tТело" in ru_text.replace("\r\n", "\n")
+    assert "$Done\tГотово" in ru_text.replace("\r\n", "\n")
+
+    # New UI override must be metadata type=created so restore deletes it
+    meta_path = os.path.join(root, ".interprex_backups", "metadata.json")
+    assert os.path.isfile(meta_path), "backup metadata missing after inject"
+    meta = json.load(open(meta_path, encoding="utf-8"))
+    ru_rel = "Interface/Translations/testmod_russian.txt"
+    # Windows may store either casing; find by lower
+    ru_meta = None
+    for k, v in meta.items():
+        if k.replace("\\", "/").lower() == ru_rel.lower():
+            ru_meta = v
+            break
+    assert ru_meta is not None, f"UI override not in metadata: {list(meta)}"
+    assert ru_meta.get("type") == "created", ru_meta
+    esp_meta = meta.get("TestMod.esp")
+    assert esp_meta and esp_meta.get("type") == "patch", esp_meta
+
+    # Plugin still well-formed
+    new_bytes = open(plugin, "rb").read()
+    assert new_bytes[:4] == b"TES4" and new_bytes[24:28] == b"HEDR"
+    nodes = parse_plugin(new_bytes)
+    # Identity rewrite of the (now dirty-parsed) tree must not change bytes
+    assert write_plugin(nodes) == new_bytes, "parsed tree rewrite must be identity"
+
+    # Loose-plugin sub_paths filter (mods mode flat layout) — ESP + sibling UI
+    only = p.extract(root, ["TestMod.esp"])
+    only_orig = {s.original for s in only}
+    assert "Огненный шар" in only_orig
+    assert "Body" in only_orig  # UI still visible via sibling Interface/
+
+    # Id parity anchor — stable sample (pre-inject English)
+    parity = make_id(
+        "skyrim", "TestMod.esp",
+        ["SPEL", "01000ABC", "FULL", "0"],
+        "Fireball",
+    )
+    assert fire.id == parity, f"id math drifted: {fire.id} != {parity}"
+
+
 def check_unreal() -> None:
     root = build_unreal_project()
     
@@ -5445,6 +5682,7 @@ def main() -> int:
     check_renpy_context_history()
     check_renpy_rpa()
     check_renpy_decompilation()
+    check_skyrim()
     check_unreal()
     check_unreal4()
     check_unreal4_pak()
@@ -5454,7 +5692,7 @@ def main() -> int:
     check_unreal4_5_inherited()
     check_unreal4_5_bytepatch()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
     return 0
 
 

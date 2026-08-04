@@ -89,6 +89,7 @@ body {
 .brand-title.engine-mmf2 { --brand-color: #fb7185; }
 .brand-title.engine-qsp { --brand-color: #f97316; }
 .brand-title.engine-twine { --brand-color: #d946ef; }
+.brand-title.engine-skyrim { --brand-color: #8ec8ff; }
 .brand-title.engine-i18n,
 .brand-title.engine-none { --brand-color: #5b8cff; }
 .brand { display: flex; align-items: baseline; gap: 10px; }
@@ -900,6 +901,7 @@ button.btn-danger:hover:not(:disabled) {
 .mod-progress-fill.engine-mmf2 { background: linear-gradient(90deg, #e11d48, #fb7185); --progress-glow: rgba(251, 113, 133, 0.4); }
 .mod-progress-fill.engine-qsp { background: linear-gradient(90deg, #ea580c, #f97316); --progress-glow: rgba(249, 115, 22, 0.4); }
 .mod-progress-fill.engine-twine { background: linear-gradient(90deg, #c026d3, #e879f9); --progress-glow: rgba(232, 121, 249, 0.4); }
+.mod-progress-fill.engine-skyrim { background: linear-gradient(90deg, #3b82f6, #8ec8ff); --progress-glow: rgba(142, 200, 255, 0.4); }
 .mod-progress-fill.engine-i18n, .mod-progress-fill.engine-none { background: linear-gradient(90deg, #2563eb, #60a5fa); --progress-glow: rgba(96, 165, 250, 0.4); }
 .mod-progress-percent {
   font-size: 12px;
@@ -1014,6 +1016,11 @@ button.btn-danger:hover:not(:disabled) {
   border-color: rgba(217, 70, 239, 0.3);
   background: rgba(217, 70, 239, 0.15);
 }
+.badge.engine-skyrim, .mod-engine-badge.engine-skyrim {
+  color: #8ec8ff;
+  border-color: rgba(142, 200, 255, 0.3);
+  background: rgba(142, 200, 255, 0.08);
+}
 
 /* Col-strings engine colors (text color only) */
 .col-strings.engine-rpgmaker { color: #ffa033; }
@@ -1029,6 +1036,7 @@ button.btn-danger:hover:not(:disabled) {
 .col-strings.engine-mmf2 { color: #fb7185; }
 .col-strings.engine-qsp { color: #f97316; }
 .col-strings.engine-twine { color: #d946ef; }
+.col-strings.engine-skyrim { color: #8ec8ff; }
 
 /* Engine specific progress fill colors */
 .progressfill.engine-rpgmaker { background: #ffa033; }
@@ -1043,6 +1051,7 @@ button.btn-danger:hover:not(:disabled) {
 .progressfill.engine-mmf2 { background: #fb7185; }
 .progressfill.engine-qsp { background: #f97316; }
 .progressfill.engine-twine { background: #d946ef; }
+.progressfill.engine-skyrim { background: #8ec8ff; }
 .progressfill.engine-i18n, .progressfill.engine-none { background: #5b8cff; }
 
 /* Engine specific progress label colors */
@@ -1058,6 +1067,7 @@ button.btn-danger:hover:not(:disabled) {
 .progresslabel.engine-mmf2 { color: #fb7185; }
 .progresslabel.engine-qsp { color: #f97316; }
 .progresslabel.engine-twine { color: #d946ef; }
+.progresslabel.engine-skyrim { color: #8ec8ff; }
 .progresslabel.engine-i18n, .progresslabel.engine-none { color: #5b8cff; }
 
 .control-label {
@@ -1131,6 +1141,12 @@ button.btn-danger:hover:not(:disabled) {
 .mode-switcher.engine-qsp .mode-btn.active { background: #f97316; color: #0f1115; }
 .mode-switcher.engine-twine .mode-btn.active { background: #d946ef; color: #0f1115; }
 
+.mode-switcher.engine-skyrim {
+  background: rgba(142, 200, 255, 0.04);
+  border-color: rgba(142, 200, 255, 0.25);
+}
+.mode-switcher.engine-skyrim .mode-btn.active { background: #8ec8ff; color: #0f1115; }
+
 .mode-switcher.engine-i18n, .mode-switcher.engine-none {
   background: var(--panel);
   border-color: var(--line);
@@ -1152,6 +1168,7 @@ button.btn-danger:hover:not(:disabled) {
 .key-status-msg.engine-mmf2 { color: #fb7185; }
 .key-status-msg.engine-qsp { color: #f97316; }
 .key-status-msg.engine-twine { color: #d946ef; }
+.key-status-msg.engine-skyrim { color: #8ec8ff; }
 .key-status-msg.engine-i18n, .key-status-msg.engine-none { color: #5b8cff; }
 
 /* ── Gear / proxy-settings button ─────────────────────────────────────────── */
@@ -1657,6 +1674,7 @@ input[type="range"]::-webkit-slider-thumb:active {
 .fp-modal.engine-mmf2 { --fp-accent: #fb7185; }
 .fp-modal.engine-qsp { --fp-accent: #f97316; }
 .fp-modal.engine-twine { --fp-accent: #d946ef; }
+.fp-modal.engine-skyrim { --fp-accent: #8ec8ff; }
 
 .fp-head {
   display: flex;
@@ -2300,6 +2318,7 @@ table input[type="checkbox"] {
 .filter-dropdown-btn:hover:not(.active).engine-mmf2 { border-color: #fb7185; }
 .filter-dropdown-btn:hover:not(.active).engine-qsp { border-color: #f97316; }
 .filter-dropdown-btn:hover:not(.active).engine-twine { border-color: #d946ef; }
+.filter-dropdown-btn:hover:not(.active).engine-skyrim { border-color: #8ec8ff; }
 .filter-dropdown-btn:hover:not(.active).engine-i18n,
 .filter-dropdown-btn:hover:not(.active).engine-none { border-color: #5b8cff; }
 
@@ -2315,6 +2334,7 @@ table input[type="checkbox"] {
 .filter-dropdown-btn.active.engine-mmf2 { background: #fb7185; border-color: #fb7185; color: #0f1115; }
 .filter-dropdown-btn.active.engine-qsp { background: #f97316; border-color: #f97316; color: #0f1115; }
 .filter-dropdown-btn.active.engine-twine { background: #d946ef; border-color: #d946ef; color: #0f1115; }
+.filter-dropdown-btn.active.engine-skyrim { background: #8ec8ff; border-color: #8ec8ff; color: #0f1115; }
 .filter-dropdown-btn.active.engine-i18n,
 .filter-dropdown-btn.active.engine-none { background: #5b8cff; border-color: #5b8cff; color: #ffffff; }
 
@@ -2378,6 +2398,7 @@ table input[type="checkbox"] {
 .filter-dropdown-menu.engine-mmf2 .filter-dropdown-item input[type="checkbox"] { accent-color: #fb7185; }
 .filter-dropdown-menu.engine-qsp .filter-dropdown-item input[type="checkbox"] { accent-color: #f97316; }
 .filter-dropdown-menu.engine-twine .filter-dropdown-item input[type="checkbox"] { accent-color: #d946ef; }
+.filter-dropdown-menu.engine-skyrim .filter-dropdown-item input[type="checkbox"] { accent-color: #8ec8ff; }
 .filter-dropdown-menu.engine-i18n .filter-dropdown-item input[type="checkbox"],
 .filter-dropdown-menu.engine-none .filter-dropdown-item input[type="checkbox"] { accent-color: #5b8cff; }
 

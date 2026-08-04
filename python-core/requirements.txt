@@ -4,6 +4,7 @@ uvicorn>=0.32
 pydantic>=2.9
 httpx>=0.27        # provider HTTP calls (Ollama / LM Studio / Gemini)
 pillow>=10.0
+lz4>=4.0             # Skyrim SE BSA (v105) decompression
 
 # --- engine parsers (uncomment as you implement each engine) ---
 UnityPy>=1.24.0      # Unity .assets / bundles

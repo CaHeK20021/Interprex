@@ -1206,6 +1206,7 @@ export default function App() {
           qsp: "QSP",
           twine: "Twine",
           i18n: "I18n",
+          skyrim: "Skyrim SE",
         };
         const mapped = engineNameMap[engine] || engine;
         title += ` - ${mapped}`;
@@ -3514,6 +3515,7 @@ export default function App() {
                 case "mmf2": return "#fb7185";
                 case "qsp": return "#f97316";
                 case "twine": return "#d946ef";
+                case "skyrim": return "#8ec8ff";
                 default: return "#5b8cff";
               }
             };

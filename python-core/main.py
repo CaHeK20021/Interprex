@@ -840,7 +840,10 @@ def detect_mods(req: DetectModsReq) -> dict:
     # 3. List direct subdirectories inside mods_dir
     ignore_dirs = {
         "bin", "obj", ".vs", "node_modules", "venv", ".git", ".interprex_backups",
-        "appdata", "temp"
+        "appdata", "temp",
+        # Bethesda Data/ noise — not mods, and SKSE/F4SE DLLs false-positive Unity
+        "skse", "f4se", "source", "video", "meshes", "textures", "sound", "music",
+        "scripts", "seq", "grass", "lodsettings", "tools", "modderresource",
     }
     
     mods_list = []
@@ -949,6 +952,22 @@ def detect_mods(req: DetectModsReq) -> dict:
                         count = sum(1 for _ in flatten_json(data))
                         return 0, count, False
                 return 0, 0, False
+            # Skyrim / Creation Engine plugins: count extractable text strings.
+            # `mod_rel_path` may be a folder OR a single .esp/.esm/.esl file
+            # (flat Data-style dumps list each plugin as its own "mod").
+            if mod_engine == "skyrim":
+                from parsers.skyrim import SkyrimParser
+                parser = SkyrimParser()
+                # extract with sub_paths scoped to this mod only
+                try:
+                    strs = parser.extract(root, [mod_rel_path])
+                except Exception as e:
+                    logger.error(f"skyrim count extract {mod_rel_path}: {e}")
+                    strs = []
+                n = len(strs)
+                if n:
+                    return 0, n, False
+                return 0, 0, False
             return 0, 0, False
         except Exception as e:
             logger.error(f"count_mod_strings error: {e}")
@@ -958,6 +977,30 @@ def detect_mods(req: DetectModsReq) -> dict:
         try:
             for name in os.listdir(mods_dir):
                 full_path = os.path.join(mods_dir, name)
+                # Loose Creation Engine plugins at the mods root (common when a
+                # user dumps .esp+.bsa straight into one folder instead of one
+                # subfolder per mod). Each plugin is its own selectable "mod".
+                if os.path.isfile(full_path) and name.lower().endswith(
+                    (".esp", ".esm", ".esl")
+                ):
+                    engine = detect_engine(full_path)
+                    if engine is None:
+                        # detect() on a single file: SkyrimParser.detect handles it
+                        from parsers.skyrim import SkyrimParser
+                        if SkyrimParser.detect(full_path):
+                            engine = "skyrim"
+                    rel_path = os.path.relpath(full_path, root).replace("\\", "/")
+                    x, n, already = count_mod_strings(engine, rel_path, req.target_lang)
+                    mods_list.append({
+                        "name": os.path.splitext(name)[0],
+                        "path": rel_path,
+                        "engine": engine,
+                        "translated_count": x,
+                        "total_count": n,
+                        "already_translated": already,
+                    })
+                    continue
+
                 if not os.path.isdir(full_path) or name.startswith("."):
                     continue
                 if name.lower() in ignore_dirs:
