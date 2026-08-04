@@ -21,14 +21,18 @@ Design (plan shiny-yawning-breeze):
   * Reclaim: only when a worker's KEY ultimately dies are its un-translated
     strings returned to the pool for a surviving key — guaranteed via finally so
     a crash between pop and push-back can never lose them.
-  * Pace: each request occupies at least `delay_seconds` of wall-clock; a worker
-    that finished faster sleeps the remainder before its next claim (honours a
-    provider's per-minute request limit).
+  * Pace: each request occupies at least `delay_seconds` of wall-clock since the
+    last fire (RPM). A worker that finished faster sleeps only the REMAINING
+    wall-clock time before its next claim — never a full delay restart.
   * Pause: no NEW batch is claimed (claim gate). An in-flight HTTP request is
     always finished (and on SUCCESS the translations are emitted) so we never
     drop a paid reply — mid-request cards show `finishing_batch`. On FAILURE
     while paused: do NOT auto-retry; hold the owned batch and wait for the
     user to press Continue. After drain, free workers park as `paused`.
+    Pause freezes ACTION only (no auto-retry / no new claim). Wait timers use
+    absolute wall-clock deadlines: a long pause does NOT re-arm a full 7s RPM
+    wait or a full retry backoff — if the deadline already passed, Continue
+    fires immediately (the provider's real RPM window advanced while paused).
 
 Everything a worker feeds the model is identical to the legacy Gemini path:
 per-string context, the Ren'Py per-line character limit, the glossary, adaptive
@@ -667,6 +671,10 @@ class TranslationScheduler:
         """Run provider.translate in a sub-thread so the worker keeps emitting an
         `elapsed` tick while the blocking HTTP call is in flight (its grid card
         would otherwise freeze for the whole request)."""
+        # Stamp the fire time at SEND, not at post-batch pace — RPM spacing is
+        # "since the last request left", and a long Pause must still count that
+        # wall-clock gap (see _pace_delay / _retry_sleep).
+        self.worker_last_request[worker_idx] = time.time()
         res_queue: "queue.Queue[tuple[bool, object]]" = queue.Queue()
 
         def sub_worker():
@@ -1165,28 +1173,28 @@ class TranslationScheduler:
                      stagger=0.0) -> None:
         """Back-off between retries on an OWNED batch.
 
-        Pause freezes the countdown: if the user hits Pause mid-wait we stop
-        ticking and park until Continue (same contract as post-error hold).
-        Abort interrupts. min_wait raises the floor for rate/overload; stagger
-        spreads sibling retries.
+        Uses an absolute wall-clock deadline (`ready_at`). Pause freezes ACTION
+        only (no auto-retry until Continue) — it does NOT re-arm a full backoff
+        when the user resumes after a long Pause. If the deadline already passed
+        while they were parked, Continue fires immediately. Abort interrupts.
+        min_wait raises the floor for rate/overload; stagger spreads siblings.
         """
         sleep_time = max(min_wait,
                          _RETRY_BACKOFF_FIRST if try_i == 0 else _RETRY_BACKOFF_REST)
         sleep_time += stagger
-        start_sleep = time.time()
+        ready_at = time.time() + sleep_time
         while not self._is_aborted():
-            # Pause mid-backoff: freeze the clock, wait for Continue, then
-            # re-run the full back-off from zero (don't fire the moment they
-            # unpause if a long rate-limit floor was still due — recompute).
+            # Pause mid-backoff: park until Continue, then re-check the SAME
+            # ready_at (do not restart the full wait — RPM/backoff already
+            # advanced on the wall clock while the user was away).
             if self.should_pause():
                 if not self._wait_if_paused_before_retry(
                     worker_idx, batch, try_i + 1
                 ):
                     return
-                start_sleep = time.time()
                 continue
             now = time.time()
-            remaining = sleep_time - (now - start_sleep)
+            remaining = ready_at - now
             if remaining <= 0:
                 break
             wait_left = int(max(0, math.ceil(remaining)))
@@ -1206,31 +1214,30 @@ class TranslationScheduler:
             time.sleep(min(1.0, remaining))
 
     def _pace_delay(self, worker_idx, t0, stagger_offset=0.0) -> None:
-        """Hold the request to at least delay_seconds of wall-clock. Interruptible
-        by pause (which doesn't count against the delay) and abort.
-        stagger_offset shifts this thread's pacing window so threads on the
-        same key fire at stagger, stagger+delay, stagger+2*delay, … —
-        keeping the peak RPM at threads/delay instead of threads at once."""
+        """Sleep only until last_fire + delay_seconds (wall-clock RPM spacing).
+
+        `worker_last_request` is stamped in `_send_once` when the request leaves.
+        This runs AFTER a batch finishes: if the HTTP call already ate most of
+        the delay window, remaining is small/zero — we never re-arm a full delay
+        from "now". Pause parks the worker without rewriting the deadline; after
+        a long Pause, Continue proceeds immediately if the window already passed.
+        stagger_offset is unused for post-batch pacing (initial spread is
+        `_initial_stagger`); kept for call-site compatibility.
+        """
         if self.delay_seconds <= 0:
             return
-        # target = the earliest wall-clock time this thread may fire again.
-        # On the first call target = t0 + stagger (initial spread).
-        # On subsequent calls target = last_fire + delay (constant spacing).
         last = self.worker_last_request.get(worker_idx)
-        if last is not None:
-            target = last + self.delay_seconds
-        else:
-            target = t0 + stagger_offset
-        self.worker_last_request[worker_idx] = time.time()
+        if last is None:
+            # No request stamped yet (shouldn't happen after a successful batch);
+            # fall back to batch-start + stagger so we never wait forever.
+            last = t0 + stagger_offset - self.delay_seconds
+        target = last + self.delay_seconds
         while not self._is_aborted():
-            # Don't burn the delay while the user has us paused.
+            # Pause: park only. Do NOT move `target` forward — wall-clock is the
+            # ground truth for provider RPM.
             while self.should_pause() and not self._is_aborted():
                 self._emit(worker_idx, "paused", status="Paused")
-                time.sleep(1.0)
-                # Restart pacing from the last request, preserving natural
-                # spacing instead of re-synchronizing all threads.
-                last = self.worker_last_request.get(worker_idx)
-                target = (last + self.delay_seconds) if last is not None else time.time() + self.delay_seconds
+                time.sleep(0.5)
             remaining = target - time.time()
             if remaining <= 0:
                 return

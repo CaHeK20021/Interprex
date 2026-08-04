@@ -4333,6 +4333,120 @@ def check_scheduler() -> None:
         assert out["final"] and len(out["final"]["translations"]) == 5, \
             "pause-after-error lost strings on resume"
 
+        # Long Pause mid-RPM-wait: Continue must NOT re-arm a full delay.
+        # Wall-clock already advanced past last_fire+delay while parked → next
+        # request fires immediately (production: user paused a minute, no extra 7s).
+        class CallTsProvider(FakeProvider):
+            def __init__(self):
+                super().__init__(delay=0.02)
+                self.call_ts: list[float] = []
+                self.lock = threading.Lock()
+
+            def translate(self, batch, lang, glossary, cfg, engine=""):
+                with self.lock:
+                    self.call_ts.append(time.time())
+                return super().translate(batch, lang, glossary, cfg, engine)
+
+        # max_batch_size=5 default → 2 batches. delay_seconds=1.2 so post-batch
+        # pace would wait ~1s if Continue re-armed wrongly.
+        items = [It(i, "pw%d" % i) for i in range(10)]
+        flag = {"v": False}
+        pace_prov = CallTsProvider()
+        DELAY = 1.2
+        sched, t, out = run(
+            Req(items, threads=1, delay_seconds=DELAY), pace_prov, pause_flag=flag,
+        )
+        # Wait until first request landed and worker is in waiting_delay.
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(pace_prov.call_ts) < 1:
+            time.sleep(0.05)
+        assert len(pace_prov.call_ts) >= 1, "pace-long-pause never fired first request"
+        # Enter pace window, then park longer than DELAY.
+        time.sleep(0.15)
+        flag["v"] = True
+        time.sleep(DELAY + 0.4)  # wall-clock past last_fire+delay
+        n_at = len(pace_prov.call_ts)
+        time.sleep(0.3)
+        assert len(pace_prov.call_ts) == n_at, (
+            "paced/retried while paused after successful batch"
+        )
+        flag["v"] = False
+        t.join(15)
+        assert not t.is_alive(), "pace-long-pause hung"
+        assert out["final"] and len(out["final"]["translations"]) == 10, \
+            "pace-long-pause lost strings"
+        assert len(pace_prov.call_ts) >= 2, "pace-long-pause never second request"
+        gap = pace_prov.call_ts[1] - pace_prov.call_ts[0]
+        # Gap includes the long pause (~DELAY+0.4) — that's fine. What must NOT
+        # happen: after unpause, another full DELAY before the second fire.
+        # Second fire should be shortly after unpause (not unpause + DELAY).
+        # Unpause was at ~ first + 0.15 + DELAY + 0.4; second should be ~that,
+        # not that + DELAY. So total gap should be < first_to_pause + pause + DELAY/2
+        # i.e. gap < DELAY + 0.15 + 0.4 + 0.8 ≈ 2.55, and if re-armed wrongly
+        # gap ≈ DELAY + 0.15 + DELAY+0.4 + DELAY ≈ 4+.
+        assert gap < (DELAY * 2 + 0.9), (
+            "pace-long-pause re-armed full delay after long Pause "
+            "(gap=%.2fs delay=%.2fs)" % (gap, DELAY)
+        )
+
+        # Long Pause mid-retry-backoff: Continue must NOT restart full backoff.
+        class FailOnceTs(FakeProvider):
+            def __init__(self):
+                super().__init__(delay=0.02)
+                self.calls = 0
+                self.call_ts: list[float] = []
+                self.lock = threading.Lock()
+
+            def translate(self, batch, lang, glossary, cfg, engine=""):
+                with self.lock:
+                    self.calls += 1
+                    self.call_ts.append(time.time())
+                    n = self.calls
+                if n == 1:
+                    raise RuntimeError("The read operation timed out")
+                return super().translate(batch, lang, glossary, cfg, engine)
+
+        items = [It(i, "rb%d" % i) for i in range(3)]
+        flag = {"v": False}
+        # Non-zero backoff so a re-arm would be visible; restore after.
+        saved_bo = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST)
+        scheduler._RETRY_BACKOFF_FIRST = 1.0
+        scheduler._RETRY_BACKOFF_REST = 1.0
+        try:
+            fail_once = FailOnceTs()
+            sched, t, out = run(
+                Req(items, threads=1, delay_seconds=0.0), fail_once, pause_flag=flag,
+            )
+            deadline = time.time() + 5.0
+            while time.time() < deadline and fail_once.calls < 1:
+                time.sleep(0.05)
+            assert fail_once.calls >= 1, "retry-long-pause never first attempt"
+            # Mid-backoff pause, longer than the backoff itself.
+            time.sleep(0.15)
+            flag["v"] = True
+            time.sleep(1.3)
+            calls_at = fail_once.calls
+            time.sleep(0.3)
+            assert fail_once.calls == calls_at, (
+                "auto-retried while paused mid-backoff"
+            )
+            t_unpause = time.time()
+            flag["v"] = False
+            t.join(15)
+            assert not t.is_alive(), "retry-long-pause hung"
+            assert out["final"] and len(out["final"]["translations"]) == 3, \
+                "retry-long-pause lost strings"
+            assert fail_once.calls >= 2, "retry-long-pause never second attempt"
+            # Second attempt should land soon after unpause, not unpause+full backoff.
+            after = [ts for ts in fail_once.call_ts if ts >= t_unpause - 0.05]
+            assert after, "retry-long-pause no call after unpause"
+            assert (after[0] - t_unpause) < 0.8, (
+                "retry-long-pause re-armed full backoff after long Pause "
+                "(%.2fs after unpause)" % (after[0] - t_unpause)
+            )
+        finally:
+            scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST = saved_bo
+
         # --- Hybrid fit: re-ask shorter, then record a font-shrink factor -------
         # A menu choice needs a pixel budget, which the scheduler computes only for
         # renpy + a "menu" path + a resolved source font. Drive that path with a

@@ -299,12 +299,20 @@ SAME pool drives every engine. Verified by `check_scheduler` in `selftest.py`
 - **Pause** is checked only at claim/retry-sleep boundaries, never mid-request:
   an in-flight batch always completes and EMITS its translations (frontend
   auto-saves) before the worker blocks. This is the file-integrity guarantee.
-- **Pacing** (`delay_seconds`): a request occupies ≥ delay of wall-clock; faster
-  replies sleep the remainder before the next claim. Cloud-only (UI hides it for
-  local). Retry back-off is staggered per-thread (`delay × rank/threads`) so
-  threads that all error at once don't re-fire in lockstep — the final sleep tick
-  must be the EXACT remainder, not a flat 1s, or sub-second offsets round up and
-  re-synchronize.
+  On FAILURE while paused: hold the owned batch — do NOT auto-retry until
+  Continue. Pause freezes ACTION only; wait timers use **absolute wall-clock
+  deadlines** (last request fire → `+ delay_seconds` for RPM, `ready_at` for
+  retry backoff). A long Pause does NOT re-arm a full 7s pace wait or a full
+  backoff — if the deadline already passed, Continue fires immediately.
+  `worker_last_request` is stamped in `_send_once` at SEND time (not at post-
+  batch pace start). Verified: pause-after-error + pace-long-pause +
+  retry-long-pause in `check_scheduler`.
+- **Pacing** (`delay_seconds`): each request occupies ≥ delay of wall-clock since
+  the last fire; faster replies sleep only the REMAINING time before the next
+  claim. Cloud-only (UI hides it for local). Retry back-off is staggered
+  per-thread (`delay × rank/threads`) so threads that all error at once don't
+  re-fire in lockstep — the final sleep tick must be the EXACT remainder, not a
+  flat 1s, or sub-second offsets round up and re-synchronize.
 - **Error classes** (`_classify_error`): `rate` (429/503/overload) → retry with
   back-off ≥ delay + per-key `key_cooldown` (siblings on that key wait, other
   keys keep going); `auth` (401/403/invalid key) → fail the key fast (2-try
