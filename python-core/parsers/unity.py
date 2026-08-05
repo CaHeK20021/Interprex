@@ -1,12 +1,13 @@
 """Parser for Unity.
 
-Production extract pipeline (priority order):
-  1. Game DLLs only (Assembly-CSharp* + non-middleware) via DllEditor
-  2. Addressables localization StringTables
-  3. Typetree UI fields (m_Text / m_text) when TypeTreeGenerator works
-  4. Content MonoBehaviours — VN/script/localization blobs (Naninovel, I2, Yarn, …)
-     identified by markers OR dialogue density; length-prefix with byte offsets
-  5. Small UI MonoBehaviours raw fallback (strict filter) when typetree failed
+Multi-source registry (see ``unity_sources.py``): detect capabilities → run
+only matching sources → one ``TranslationString`` contract. Sources:
+
+  dll · typetree_text · content_blob · ui_raw · yaml_prefab · string_table
+  (+ font_gap on inject)
+
+Games differ by *which* sources fire, not by per-title forks. Adding a layout
+= new source id + detect + extract/inject + selftest.
 
 Inject: typetree save when possible; otherwise rebuild MonoBehaviour raw with
 length-changing string slots + UnityPy set_raw_data (no truncate-to-EN-length).
@@ -24,6 +25,18 @@ import subprocess
 from typing import Any
 from collections.abc import Generator
 from .base import BaseParser, TranslationString, make_id
+from .unity_sources import (
+    SOURCE_CONTENT,
+    SOURCE_DLL,
+    SOURCE_FONT_GAP,
+    SOURCE_STRING_TABLE,
+    SOURCE_TYPETREE,
+    SOURCE_UI_RAW,
+    SOURCE_YAML,
+    UnityPipelineReport,
+    detect_unity_capabilities,
+    plan_sources,
+)
 
 # DEBUG: Test UnityPy import at startup and log traceback on failure
 try:
@@ -317,6 +330,29 @@ def _is_naninovel_script_blob(raw: bytes) -> bool:
     )
 
 
+def _is_valid_unity_text_string(s: str) -> bool:
+    """Accept human text stored as Unity AlignedString UTF-8.
+
+    ⚠️ ``str.isprintable()`` is WRONG here: it rejects ``\\n`` / ``\\r`` / ``\\t``,
+    so multi-paragraph dialogue never entered the slot walk. Real Touchstarved
+    miss (2026-08): character-creation backstories like
+    ``\"You were raised as an oracle…\\n\\nYou regularly…\"`` sat in
+    ``resources.assets`` but extract returned 0 hits → stayed English after a
+    full translate. Allow common whitespace; still reject NULs and other
+    control bytes (binary false-positives).
+    """
+    if not s or "\x00" in s or not s.strip():
+        return False
+    for ch in s:
+        o = ord(ch)
+        if ch in "\n\r\t":
+            continue
+        # Same idea as str.isprintable, without killing paragraph breaks.
+        if o < 32 or o == 0x7F:
+            return False
+    return True
+
+
 def _sequential_aligned_strings(raw: bytes) -> list[tuple[int, str]]:
     """Non-overlapping left-to-right Unity AlignedString walk (path-stable)."""
     out: list[tuple[int, str]] = []
@@ -328,7 +364,7 @@ def _sequential_aligned_strings(raw: bytes) -> list[tuple[int, str]]:
             chunk = raw[i + 4 : i + 4 + slen]
             try:
                 s = chunk.decode("utf-8")
-                if s.isprintable() and "\x00" not in s and s.strip():
+                if _is_valid_unity_text_string(s):
                     out.append((i, s))
                     i = _aligned_string_end(i, slen)
                     continue
@@ -735,7 +771,7 @@ def _extract_length_prefixed_at(raw: bytes) -> list[tuple[int, str]]:
             chunk = raw[i + 4 : i + 4 + slen]
             try:
                 s = chunk.decode("utf-8")
-                if s.isprintable() and len(s) > 0:
+                if _is_valid_unity_text_string(s):
                     out.append((i, s))
             except (UnicodeDecodeError, ValueError):
                 pass
@@ -865,6 +901,213 @@ def iter_files(root: str, sub_paths: list[str] | None = None) -> Generator[str, 
                 yield os.path.join(dirpath, f)
 
 
+# ── Font script coverage (TMP SDF + Unity Font) ─────────────────────────────
+# Touchstarved-class bug: text is injected as RU, but TMP static SDF atlases only
+# baked Latin (Baskervald "32-126") → in-game only punctuation renders.
+# Fix = size-preserving PPtr redirect from fonts that LACK the target script to
+# an in-file donor that HAS it. Conservative by design so other Unity games that
+# already ship proper glyphs are never touched:
+#   • Latin / unknown targets → no-op
+#   • no in-file donor with positive coverage → no-op (never invent a font)
+#   • fonts whose coverage we can't prove → leave alone
+#   • only PPtrs whose path_id is a proven-missing victim are rewritten
+
+# Sample codepoints we require for "covers this script" (not full blocks).
+_SCRIPT_SAMPLE: dict[str, str] = {
+    "cyrillic": "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+    "cjk": "的一是不了人我在有他这中大来上国",  # common CJK ideographs
+    "japanese": "あいうえおかきくけこアイウエオ日本語",
+    "korean": "가나다라마바사아자차카타파하한글",
+    "arabic": "ابجدهوزحطيكلمنسعفصقرشتثخذضظغ",
+    "hebrew": "אבגדהוזחטיכלמנסעפצקרשת",
+    "thai": "กขคงจฉชซญดตถทนบปผพฟมยรลวสหอ",
+    "greek": "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω",
+}
+
+# Display names from the UI ("Russian") + short codes + aliases → script key.
+_LANG_TO_SCRIPT: dict[str, str] = {
+    "ru": "cyrillic", "russian": "cyrillic", "uk": "cyrillic", "ukrainian": "cyrillic",
+    "be": "cyrillic", "belarusian": "cyrillic", "bg": "cyrillic", "bulgarian": "cyrillic",
+    "sr": "cyrillic", "serbian": "cyrillic", "mk": "cyrillic", "macedonian": "cyrillic",
+    "zh": "cjk", "chinese": "cjk", "chinese (simplified)": "cjk",
+    "chinese (traditional)": "cjk", "cn": "cjk",
+    "ja": "japanese", "japanese": "japanese",
+    "ko": "korean", "korean": "korean",
+    "ar": "arabic", "arabic": "arabic",
+    "he": "hebrew", "hebrew": "hebrew",
+    "th": "thai", "thai": "thai",
+    "el": "greek", "greek": "greek",
+}
+
+
+def _target_script(target_lang: str | None) -> str | None:
+    """Map UI/sidecar language string → script key, or None if no font swap needed."""
+    if not target_lang:
+        return None
+    raw = target_lang.strip().lower()
+    if not raw:
+        return None
+    if raw in _LANG_TO_SCRIPT:
+        return _LANG_TO_SCRIPT[raw]
+    # "Portuguese (Brazil)" → try full string then the part before "("
+    if raw in _LANG_TO_SCRIPT:
+        return _LANG_TO_SCRIPT[raw]
+    base = raw.split("(", 1)[0].strip()
+    if base in _LANG_TO_SCRIPT:
+        return _LANG_TO_SCRIPT[base]
+    # last resort: first token ("chinese simplified" style)
+    first = raw.split()[0] if raw.split() else raw
+    return _LANG_TO_SCRIPT.get(first)
+
+
+def _parse_charset_codepoints(charset: str) -> set[int] | None:
+    """Parse TMP character-set strings into a set of covered codepoints.
+
+    Accepts both dialects seen in real assets:
+      hex: ``0D,20-7E,A0-FF,400-4FF,2000-200F,...``
+      dec: ``32 - 126, 160, 8203, 8230`` / ``160 - 255``
+    Returns None if the string doesn't look like a charset (don't guess).
+
+    Rule: any A–F letter in the whole string → parse every token as hex;
+    otherwise every token is decimal. That matches the two real dialects
+    without misreading ``32 - 126`` as hex.
+    """
+    if not charset or not re.search(r"\d", charset):
+        return None
+    if not re.fullmatch(r"[\d\s,A-Fa-f\-–]+", charset.strip()):
+        return None
+    if not re.search(r"[-–,]", charset):
+        return None
+
+    as_hex = bool(re.search(r"[A-Fa-f]", charset))
+    covered: set[int] = set()
+    parsed_any = False
+    for part in re.split(r"\s*,\s*", charset.strip()):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"([0-9A-Fa-f]+)\s*[-–]\s*([0-9A-Fa-f]+)", part)
+        if m:
+            a_s, b_s = m.group(1), m.group(2)
+            try:
+                a = int(a_s, 16 if as_hex else 10)
+                b = int(b_s, 16 if as_hex else 10)
+            except ValueError:
+                continue
+            if 0 <= a <= b <= 0x10FFFF and (b - a) <= 0x10000:
+                covered.update(range(a, b + 1))
+                parsed_any = True
+            continue
+        if re.fullmatch(r"[0-9A-Fa-f]+", part):
+            try:
+                cp = int(part, 16 if as_hex else 10)
+            except ValueError:
+                continue
+            if 0 <= cp <= 0x10FFFF:
+                covered.add(cp)
+                parsed_any = True
+    return covered if parsed_any else None
+
+
+def _charset_covers_script(charset: str, script: str) -> bool | None:
+    """True/False if we can tell; None if unparseable (caller must not assume)."""
+    sample = _SCRIPT_SAMPLE.get(script)
+    if not sample:
+        return None
+    covered = _parse_charset_codepoints(charset)
+    if covered is None:
+        return None
+    # Require a solid majority of the sample so a stray single glyph isn't enough.
+    hits = sum(1 for ch in sample if ord(ch) in covered)
+    return hits >= max(8, len(sample) // 4)
+
+
+def _ttf_covers_script(font_data: bytes, script: str) -> bool | None:
+    """True/False via fontTools cmap; None if unreadable."""
+    sample = _SCRIPT_SAMPLE.get(script)
+    if not sample or not font_data or len(font_data) < 100:
+        return None
+    try:
+        from fontTools.ttLib import TTFont  # type: ignore
+        from io import BytesIO
+        cmap = TTFont(BytesIO(font_data)).getBestCmap() or {}
+    except Exception:
+        return None
+    hits = sum(1 for ch in sample if ord(ch) in cmap)
+    return hits >= max(8, len(sample) // 4)
+
+
+def _mb_length_prefixed_strings(raw: bytes, limit: int = 64) -> list[str]:
+    """Extract short ASCII length-prefixed strings from a MonoBehaviour blob."""
+    out: list[str] = []
+    i = 0
+    n = len(raw)
+    while i + 4 <= n and len(out) < limit:
+        ln = int.from_bytes(raw[i : i + 4], "little")
+        if 2 <= ln <= 240 and i + 4 + ln <= n:
+            chunk = raw[i + 4 : i + 4 + ln]
+            if all(32 <= b < 127 for b in chunk):
+                out.append(chunk.decode("ascii"))
+                i = i + 4 + ln
+                i = (i + 3) // 4 * 4
+                continue
+        i += 1
+    return out
+
+
+def _looks_like_tmp_font_asset(strings: list[str]) -> bool:
+    """Heuristic: TMP FontAsset blobs expose a name + version (e.g. '1.1.0')."""
+    if not strings:
+        return False
+    has_ver = any(re.fullmatch(r"\d+\.\d+\.\d+", s) for s in strings[:12])
+    has_name = any(
+        "SDF" in s or "Font Asset" in s or s.endswith(" Atlas") for s in strings[:12]
+    )
+    return has_ver and has_name
+
+
+def _tmp_font_display_name(strings: list[str]) -> str:
+    for s in strings[:8]:
+        if "SDF" in s or "Font Asset" in s:
+            return s
+    return strings[0] if strings else ""
+
+
+def _tmp_charset_from_strings(strings: list[str]) -> str | None:
+    """Pick the character-set descriptor string from a TMP FontAsset blob."""
+    for s in strings:
+        # Real examples: "32 - 126, 160, 8203" / "0D,20-7E,A0-FF,400-4FF,..."
+        if not any(c.isdigit() for c in s):
+            continue
+        if len(s) < 8:
+            continue
+        if re.search(r"\d\s*-\s*\d", s) or re.search(
+            r"[0-9A-Fa-f]{2,4}-[0-9A-Fa-f]{2,4}", s
+        ):
+            if re.fullmatch(r"[\d\s,A-Fa-f\-–]+", s.strip()):
+                return s
+    return None
+
+
+def _font_base_name(name: str) -> str:
+    """Normalize 'BaskervaldADFStd SDF' / 'Lato-Regular' → comparable base."""
+    n = name.strip()
+    for suf in (
+        " SDF - Fallback",
+        " SDF - Drop Shadow",
+        " SDF - Outline",
+        " SDF ASCII Extended",
+        " SDF",
+        " Atlas Material",
+        " Atlas",
+        " Material",
+    ):
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+            break
+    return n.strip().lower().replace(" ", "")
+
+
 class UnityParser(BaseParser):
     engine = "unity"
 
@@ -874,6 +1117,8 @@ class UnityParser(BaseParser):
         self._managed_dir_cache: dict[str, str | None] = {}
         self._generator_cache: dict[str, Any] = {}
         self._font_bytes_cache: dict[str, bytes | None] = {}
+        # Last extract/inject multi-source report (API / logs / UI honesty).
+        self.last_report: UnityPipelineReport | None = None
 
     def engine_prompt_addon(self) -> str:
         return (
@@ -1023,13 +1268,42 @@ class UnityParser(BaseParser):
         return False
 
     def extract(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
-        results = []
-        # 1. Extract DLLs
-        results.extend(self._extract_dlls(root, sub_paths))
-        # 2. Extract assets/YAML UI-text
-        results.extend(self._extract_assets(root, sub_paths))
-        # 3. Extract Addressables localization StringTables
-        results.extend(self._extract_localization(root, sub_paths))
+        """Run enabled Unity sources; stash ``last_report`` with per-source counts."""
+        caps = detect_unity_capabilities(root)
+        report = plan_sources(caps, phase="extract")
+        self.last_report = report
+        results: list[TranslationString] = []
+
+        # ── dll ────────────────────────────────────────────────────────────
+        if any(s.id == SOURCE_DLL and s.enabled for s in report.sources):
+            before = len(results)
+            results.extend(self._extract_dlls(root, sub_paths))
+            report.record(SOURCE_DLL, len(results) - before, enabled=True)
+        else:
+            report.record(SOURCE_DLL, 0, enabled=False, reason="skipped by plan")
+
+        # ── compiled assets: typetree + content_blob + conditional ui_raw ──
+        # YAML is scanned in the same helper (separate source id in report).
+        asset_counts = self._extract_assets(root, sub_paths, report=report)
+        results.extend(asset_counts["strings"])
+
+        # ── string_table (Addressables) ────────────────────────────────────
+        if any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources):
+            before = len(results)
+            results.extend(self._extract_localization(root, sub_paths))
+            report.record(SOURCE_STRING_TABLE, len(results) - before, enabled=True)
+        else:
+            report.record(
+                SOURCE_STRING_TABLE,
+                0,
+                enabled=False,
+                reason="no Addressables/Localization signal",
+            )
+
+        report.finalize(len(results))
+        print(f"[unity] {report.summary_line()}", file=sys.stderr)
+        for note in caps.notes:
+            print(f"[unity] note: {note}", file=sys.stderr)
         return results
 
     def _extract_dlls(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
@@ -1067,10 +1341,27 @@ class UnityParser(BaseParser):
 
         return results
 
-    def _extract_assets(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
+    def _extract_assets(
+        self,
+        root: str,
+        sub_paths: list[str] | None = None,
+        report: UnityPipelineReport | None = None,
+    ) -> dict[str, Any]:
+        """Extract typetree + content_blob + ui_raw + yaml; optional report counts.
+
+        Returns ``{"strings": list[TranslationString]}``. Per-source counts go
+        into ``report`` when provided (registry path). Legacy callers that
+        ignored the return shape should use ``.extract()`` only.
+        """
         self._current_root = root
-        results = []
+        results: list[TranslationString] = []
         compiled_files, source_files = self._scan_asset_files(root, sub_paths)
+
+        n_typetree = 0
+        n_content = 0
+        n_ui_raw = 0
+        n_yaml = 0
+        ui_raw_ran = False
 
         if compiled_files:
             try:
@@ -1161,6 +1452,7 @@ class UnityParser(BaseParser):
                                 context = ", ".join(parts)
                                 results.append(self._mk(rel_path, path, text, context))
                                 typetree_found += 1
+                                n_typetree += 1
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "Text":
@@ -1188,6 +1480,7 @@ class UnityParser(BaseParser):
                                 context = ", ".join(parts)
                                 results.append(self._mk(rel_path, path, text, context))
                                 typetree_found += 1
+                                n_typetree += 1
                         except Exception:
                             failed_count += 1
             except Exception as e:
@@ -1197,9 +1490,12 @@ class UnityParser(BaseParser):
             # Always try content blobs (Naninovel Script, I2, Yarn, …) — they are
             # almost never m_Text fields, so typetree success on UI does not cover them.
             if env is not None:
+                before_c = len(results)
                 content_n = self._extract_raw_from_env(
                     env, fpath, root, results, mode="content"
                 )
+                n_content += len(results) - before_c
+                # content_n is added count; keep using len(results) for accuracy
                 if typetree_found == 0 and failed_count > 0:
                     print(
                         f"Typetree failed for {failed_count} objects in "
@@ -1210,9 +1506,12 @@ class UnityParser(BaseParser):
                     # Small UI chrome only when typetree is dead; skip if content
                     # already gave us a full script game (avoids lorem placeholders
                     # from the same Naninovel default UI when scripts dominate).
+                    ui_raw_ran = True
+                    before_u = len(results)
                     self._extract_raw_from_env(
                         env, fpath, root, results, mode="ui"
                     )
+                    n_ui_raw += len(results) - before_u
                 elif failed_count > 0:
                     print(
                         f"Warning: Failed to extract {failed_count} objects in "
@@ -1240,11 +1539,39 @@ class UnityParser(BaseParser):
                             path = ["AssetYAML", "m_Text", str(start_line_idx)]
                             context = f"File: {os.path.basename(fpath)}, Line: {start_line_idx + 1}"
                             results.append(self._mk(rel_path, path, val, context))
+                            n_yaml += 1
                     line_idx += 1
             except Exception as e:
                 print(f"Error parsing source file {fpath}: {e}", file=sys.stderr)
 
-        return results
+        if report is not None:
+            if compiled_files:
+                report.record(SOURCE_TYPETREE, n_typetree, enabled=True)
+                report.record(SOURCE_CONTENT, n_content, enabled=True)
+                if ui_raw_ran:
+                    report.record(
+                        SOURCE_UI_RAW,
+                        n_ui_raw,
+                        enabled=True,
+                        detail="ran after typetree miss on at least one file",
+                    )
+                else:
+                    report.record(
+                        SOURCE_UI_RAW,
+                        0,
+                        enabled=True,
+                        detail="not needed (typetree ok or no failures)",
+                    )
+            else:
+                report.record(SOURCE_TYPETREE, 0, enabled=False, reason="no compiled assets")
+                report.record(SOURCE_CONTENT, 0, enabled=False, reason="no compiled assets")
+                report.record(SOURCE_UI_RAW, 0, enabled=False, reason="no compiled assets")
+            if source_files:
+                report.record(SOURCE_YAML, n_yaml, enabled=True)
+            else:
+                report.record(SOURCE_YAML, 0, enabled=False, reason="no YAML assets")
+
+        return {"strings": results}
 
     def _extract_raw_from_env(
         self,
@@ -1456,12 +1783,10 @@ class UnityParser(BaseParser):
                     )
 
             if objects_changed == 0:
-                # Still try font PPtr size-preserving patch on disk if needed
-                is_non_latin = target_lang and target_lang.lower() in (
-                    "ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr"
-                )
-                if is_non_latin:
-                    self._replace_font_pptrs(env, fpath)
+                # No string edits — still try a conservative font-gap patch if
+                # the target script needs glyphs the game's fonts don't have.
+                if _target_script(target_lang):
+                    self._replace_font_pptrs(env, fpath, target_lang)
                 return written
 
             self.backup_file(root, fpath)
@@ -1497,15 +1822,13 @@ class UnityParser(BaseParser):
             except Exception as e:
                 print(f"Error saving injected assets {fpath}: {e}", file=sys.stderr)
 
-            is_non_latin = target_lang and target_lang.lower() in (
-                "ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr"
-            )
-            if is_non_latin:
-                # Re-load after save for font PPtrs
+            # Font-gap patch AFTER save so we rewrite the final on-disk bytes
+            # (UnityPy save would otherwise clobber a pre-save PPtr edit).
+            if _target_script(target_lang):
                 try:
                     import UnityPy
                     env2 = UnityPy.load(fpath)
-                    self._replace_font_pptrs(env2, fpath)
+                    self._replace_font_pptrs(env2, fpath, target_lang)
                 except Exception:
                     pass
 
@@ -1578,13 +1901,39 @@ class UnityParser(BaseParser):
         return results
 
     def inject(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
+        """Run enabled Unity inject sources; stash ``last_report`` with per-source counts."""
+        caps = detect_unity_capabilities(root)
+        report = plan_sources(caps, phase="inject")
+        self.last_report = report
         written = 0
-        # 1. Inject DLLs
-        written += self._inject_dlls(root, translations, target_lang, sub_paths)
-        # 2. Inject Assets & YAML
-        written += self._inject_assets(root, translations, target_lang, sub_paths)
-        # 3. Inject Addressables localization StringTables
-        written += self._inject_localization(root, translations, target_lang, sub_paths)
+
+        if any(s.id == SOURCE_DLL and s.enabled for s in report.sources):
+            n = self._inject_dlls(root, translations, target_lang, sub_paths)
+            written += n
+            report.record(SOURCE_DLL, n, enabled=True)
+        else:
+            report.record(SOURCE_DLL, 0, enabled=False, reason="skipped by plan")
+
+        # Assets: typetree + raw (content/ui slots) + yaml + font_gap inside
+        n_assets = self._inject_assets(
+            root, translations, target_lang, sub_paths, report=report
+        )
+        written += n_assets
+
+        if any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources):
+            n = self._inject_localization(root, translations, target_lang, sub_paths)
+            written += n
+            report.record(SOURCE_STRING_TABLE, n, enabled=True)
+        else:
+            report.record(
+                SOURCE_STRING_TABLE,
+                0,
+                enabled=False,
+                reason="no Addressables/Localization signal",
+            )
+
+        report.finalize(written)
+        print(f"[unity] {report.summary_line()}", file=sys.stderr)
         return written
 
     def _inject_dlls(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
@@ -1644,9 +1993,19 @@ class UnityParser(BaseParser):
 
         return written
 
-    def _inject_assets(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
+    def _inject_assets(
+        self,
+        root: str,
+        translations: dict[str, str],
+        target_lang: str | None = None,
+        sub_paths: list[str] | None = None,
+        report: UnityPipelineReport | None = None,
+    ) -> int:
         self._current_root = root
         written = 0
+        n_typetree = 0
+        n_raw = 0
+        n_yaml = 0
         compiled_files, source_files = self._scan_asset_files(root, sub_paths)
 
         if compiled_files:
@@ -1720,6 +2079,7 @@ class UnityParser(BaseParser):
                                         changed = True
                                         written += 1
                                         typetree_found += 1
+                                        n_typetree += 1
                         except Exception:
                             failed_count += 1
 
@@ -1740,14 +2100,9 @@ class UnityParser(BaseParser):
                         except Exception:
                             failed_count += 1
 
-                is_non_latin = target_lang and target_lang.lower() in ("ru", "zh", "ja", "ko", "ar", "he", "el", "th", "uk", "be", "bg", "sr")
-
-                # Font PPtr replacement: swap non-Cyrillic font references to LiberationSans
-                # This is a SAFE size-preserving change (only 12 bytes per PPtr).
-                if is_non_latin and typetree_found > 0:
-                    self._replace_font_pptrs(env, fpath)
-
                 # Always attempt raw inject: content blobs (Naninovel/I2/…) never use m_Text.
+                # Font-gap PPtr rewrite runs INSIDE raw inject, AFTER any UnityPy
+                # save — a pre-save disk patch would be clobbered by env.file.save().
                 raw_written = self._inject_raw_fallback(
                     fpath, root, translations,
                     env=env, font_bytes=font_bytes,
@@ -1755,6 +2110,7 @@ class UnityParser(BaseParser):
                 )
                 if raw_written > 0:
                     written += raw_written
+                    n_raw += raw_written
                 elif failed_count > 0 and typetree_found == 0:
                     print(
                         f"Warning: no typetree and no raw inject hits in {os.path.basename(fpath)} "
@@ -1796,6 +2152,7 @@ class UnityParser(BaseParser):
                                     lines[i] = None
                                 changed = True
                                 written += 1
+                                n_yaml += 1
                     line_idx += 1
 
                 if changed:
@@ -1806,65 +2163,258 @@ class UnityParser(BaseParser):
             except Exception as e:
                 print(f"Error injecting into source file {fpath}: {e}", file=sys.stderr)
 
+        if report is not None:
+            if compiled_files:
+                report.record(SOURCE_TYPETREE, n_typetree, enabled=True)
+                # Raw inject covers content_blob + ui_raw slots (same walk).
+                report.record(
+                    SOURCE_CONTENT,
+                    n_raw,
+                    enabled=True,
+                    detail="raw AssetRaw slots (content + ui paths share inject walk)",
+                )
+                report.record(
+                    SOURCE_UI_RAW,
+                    0,
+                    enabled=True,
+                    detail="merged into content_blob count on inject (shared raw walk)",
+                )
+                report.record(
+                    SOURCE_FONT_GAP,
+                    0,
+                    enabled=True,
+                    detail="runs inside raw inject for non-Latin targets (not a string count)",
+                )
+            else:
+                report.record(SOURCE_TYPETREE, 0, enabled=False, reason="no compiled assets")
+                report.record(SOURCE_CONTENT, 0, enabled=False, reason="no compiled assets")
+                report.record(SOURCE_UI_RAW, 0, enabled=False, reason="no compiled assets")
+                report.record(SOURCE_FONT_GAP, 0, enabled=False, reason="no compiled assets")
+            if source_files:
+                report.record(SOURCE_YAML, n_yaml, enabled=True)
+            else:
+                report.record(SOURCE_YAML, 0, enabled=False, reason="no YAML assets")
+
         return written
 
-    def _replace_font_pptrs(self, env: Any, fpath: str) -> None:
-        """Replace PPtr references to non-Cyrillic fonts with LiberationSans.
+    def _replace_font_pptrs(
+        self, env: Any, fpath: str, target_lang: str | None = None
+    ) -> None:
+        """Fill script gaps by repointing UI font PPtrs to an in-file donor.
 
-        This is a SAFE size-preserving change: we only swap 8-byte path_ids
-        in PPtrs. No file size change, no structure corruption.
+        Conservative rules (must not break other Unity games):
+          1. Only for non-Latin target scripts (``Russian`` / ``ru`` / CJK / …).
+          2. Only rewrite PPtrs of TMP FontAssets we can PROVE lack the script.
+          3. Only when the same asset file already has a TMP donor that PROVES
+             it covers the script (never invent / inject a foreign font asset).
+          4. Fonts with unknown coverage are left alone.
+          5. Size-preserving: only the 12-byte ``(fileID=0, pathID)`` PPtr is
+             patched — no atlas rebuild, no structural rewrite.
+
+        ⚠️ LOAD-BEARING (Touchstarved black-screen, 2026-08):
+        Never do a whole-file find/replace of Font (TTF) path_ids, and never
+        rewrite hits that land *inside* Font / TMP FontAsset object bodies.
+
+        Font path_ids on real games sit in the low thousands (e.g. Inter TTF
+        ``1686``). TMP character tables store ``glyphIndex`` as a uint in the
+        *same numeric range*, often adjacent to a zero word — the 12-byte
+        pattern ``fileID=0 + pathID`` is then an exact false match for a PPtr.
+        Global rewrite flipped Inter-Regular SDF glyph indices →
+        ``KeyNotFoundException`` in ``InitializeCharacterLookupDictionary`` →
+        broken TMP → black screen after the menu. The old "pathIDs are sparse
+        int64s — accepted risk" comment was wrong for this range.
+
+        So: TMP victim → TMP donor only, and only in byte ranges of objects
+        that are neither a Font nor a TMP FontAsset (UI TextMeshProUGUI etc.).
+        Legacy ``UnityEngine.UI.Text`` Font PPtrs are left alone — Naninovel /
+        modern UI is TMP, and wrong-type Font remaps are how we ate glyphs.
         """
+        script = _target_script(target_lang)
+        if not script:
+            return
         try:
-            # Find LiberationSans path_id
-            liberation_pid = None
+            # ── 1. Catalog Unity Font assets (TTF coverage, negative signal) ─
+            # path_id → (name, covers: True/False/None). Used ONLY to mark a
+            # TMP atlas as missing when its matching TTF has no script glyphs.
+            # We never rewrite Font path_ids (glyph-index collision hazard).
+            font_cov: dict[int, tuple[str, bool | None]] = {}
+            font_by_base: dict[str, tuple[int, bool | None]] = {}
+            # Absolute [start, end) ranges that must NEVER be PPtr-patched.
+            forbidden_ranges: list[tuple[int, int]] = []
             for obj in env.objects:
-                if obj.type.name == "Font":
-                    try:
-                        data = obj.read()
-                        if data.m_Name == "LiberationSans":
-                            liberation_pid = obj.path_id
-                            break
-                    except:
-                        pass
+                if obj.type.name != "Font":
+                    continue
+                try:
+                    bs = int(getattr(obj, "byte_start", -1))
+                    bsz = int(getattr(obj, "byte_size", 0))
+                    if bs >= 0 and bsz > 0:
+                        forbidden_ranges.append((bs, bs + bsz))
+                    data = obj.read()
+                    name = getattr(data, "m_Name", None) or ""
+                    blob = bytes(getattr(data, "m_FontData", b"") or b"")
+                    cov = _ttf_covers_script(blob, script) if blob else None
+                    font_cov[obj.path_id] = (name, cov)
+                    if name:
+                        font_by_base[_font_base_name(name)] = (obj.path_id, cov)
+                except Exception:
+                    continue
 
-            if not liberation_pid:
+            # ── 2. Catalog TMP FontAsset MonoBehaviours ────────────────────
+            # path_id → (name, covers)
+            tmp_cov: dict[int, tuple[str, bool | None]] = {}
+            for obj in env.objects:
+                if obj.type.name != "MonoBehaviour":
+                    continue
+                try:
+                    raw = bytes(obj.get_raw_data())
+                except Exception:
+                    continue
+                if len(raw) < 40:
+                    continue
+                strings = _mb_length_prefixed_strings(raw)
+                if not _looks_like_tmp_font_asset(strings):
+                    continue
+                try:
+                    bs = int(getattr(obj, "byte_start", -1))
+                    bsz = int(getattr(obj, "byte_size", 0))
+                    if bs >= 0 and bsz > 0:
+                        forbidden_ranges.append((bs, bs + bsz))
+                except Exception:
+                    pass
+                name = _tmp_font_display_name(strings)
+                charset = _tmp_charset_from_strings(strings)
+                cov: bool | None = None
+                if charset:
+                    cov = _charset_covers_script(charset, script)
+                if cov is None:
+                    # No charset (or unparseable): only use the matching TTF as
+                    # a NEGATIVE signal. A TTF without the script cannot back a
+                    # static atlas that has it. A TTF WITH the script still
+                    # doesn't prove the atlas baked those glyphs (LiberationSans
+                    # SDF on Touchstarved is Latin-only despite a full TTF) —
+                    # so leave coverage unknown rather than risk a bad donor.
+                    base = _font_base_name(name)
+                    ttf = font_by_base.get(base)
+                    if ttf is not None and ttf[1] is False:
+                        cov = False
+                tmp_cov[obj.path_id] = (name, cov)
+
+            if not tmp_cov:
                 return
 
-            # Find all Font path_ids that aren't LiberationSans
-            non_cyrillic_pids = set()
-            for obj in env.objects:
-                if obj.type.name == "Font":
-                    try:
-                        data = obj.read()
-                        if data.m_Name != "LiberationSans":
-                            non_cyrillic_pids.add(obj.path_id)
-                    except:
-                        pass
+            # ── 3. Pick TMP donor (positive coverage only) ─────────────────
+            tmp_donors = [pid for pid, (_, c) in tmp_cov.items() if c is True]
 
-            if not non_cyrillic_pids:
+            # Prefer a "regular"/default-looking donor over a specialized one
+            # (e.g. Inter-Regular over a random bold). Stable: lowest path_id
+            # among names containing "regular", else lowest path_id overall.
+            def _pick_donor(cands: list[int], table: dict[int, tuple[str, bool | None]]) -> int | None:
+                if not cands:
+                    return None
+                regular = [
+                    pid for pid in cands
+                    if "regular" in (table[pid][0] or "").lower()
+                    and "fallback" not in (table[pid][0] or "").lower()
+                ]
+                pool = regular or [
+                    pid for pid in cands
+                    if "fallback" not in (table[pid][0] or "").lower()
+                ] or cands
+                return min(pool)
+
+            tmp_donor = _pick_donor(tmp_donors, tmp_cov)
+
+            # Victims = proven missing coverage. Unknown → leave alone.
+            tmp_victims = {
+                pid for pid, (_, c) in tmp_cov.items()
+                if c is False and pid != tmp_donor
+            }
+
+            if not tmp_victims:
+                return
+            if tmp_donor is None:
+                # TMP gaps but no TMP donor — refuse to point UI at a Font asset.
+                print(
+                    f"[font] {os.path.basename(fpath)}: {len(tmp_victims)} TMP font(s) "
+                    f"lack {script}, but no in-file TMP donor covers it — left untouched",
+                    file=sys.stderr,
+                )
                 return
 
-            # Read the file and replace all PPtr references
+            # Merge forbidden ranges so hit tests are O(log n) via bisect.
+            forbidden_ranges.sort()
+            merged: list[tuple[int, int]] = []
+            for start, end in forbidden_ranges:
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+
+            def _in_forbidden(offset: int) -> bool:
+                # True if [offset, offset+12) overlaps any Font/TMP FontAsset body.
+                if not merged:
+                    return False
+                lo, hi = 0, len(merged)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if merged[mid][1] <= offset:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < len(merged) and merged[lo][0] < offset + 12:
+                    return True
+                return False
+
+            # ── 4. Size-preserving PPtr rewrite on disk ────────────────────
+            # Unity PPtr (same file): int32 fileID=0 + int64 pathID.
+            # Only rewrite hits OUTSIDE Font / TMP FontAsset object bodies so
+            # glyphIndex / internal source-font fields stay byte-verbatim.
             with open(fpath, "rb") as f:
                 file_bytes = bytearray(f.read())
 
             replaced = 0
-            for old_pid in non_cyrillic_pids:
-                old_pptr = struct.pack("<Iq", 0, old_pid)
-                new_pptr = struct.pack("<Iq", 0, liberation_pid)
+            skipped_forbidden = 0
+            for vid in tmp_victims:
+                if vid == tmp_donor:
+                    continue
+                old_pptr = struct.pack("<Iq", 0, vid)
+                new_pptr = struct.pack("<Iq", 0, tmp_donor)
                 idx = 0
                 while True:
                     idx = file_bytes.find(old_pptr, idx)
                     if idx < 0:
                         break
-                    file_bytes[idx:idx + 12] = new_pptr
+                    if _in_forbidden(idx):
+                        skipped_forbidden += 1
+                        idx += 12
+                        continue
+                    file_bytes[idx : idx + 12] = new_pptr
                     replaced += 1
                     idx += 12
 
             if replaced > 0:
+                # Backup once per file via the parser's backup helper if root known
+                root = getattr(self, "_current_root", None)
+                if root:
+                    try:
+                        self.backup_file(root, fpath)
+                    except Exception:
+                        pass
                 with open(fpath, "wb") as f:
                     f.write(file_bytes)
-                print(f"Replaced {replaced} font PPtrs in {os.path.basename(fpath)}", file=sys.stderr)
+                print(
+                    f"[font] {os.path.basename(fpath)}: rewrote {replaced} PPtr(s) "
+                    f"for missing {script} glyphs (TMP→{tmp_cov[tmp_donor][0]!r}; "
+                    f"victims TMP={len(tmp_victims)}"
+                    f"{f', skipped_in_font_bodies={skipped_forbidden}' if skipped_forbidden else ''})",
+                    file=sys.stderr,
+                )
+            elif skipped_forbidden:
+                print(
+                    f"[font] {os.path.basename(fpath)}: all {skipped_forbidden} "
+                    f"PPtr hit(s) were inside Font/TMP FontAsset bodies — left untouched",
+                    file=sys.stderr,
+                )
         except Exception as e:
             print(f"Error replacing font PPtrs: {e}", file=sys.stderr)
 

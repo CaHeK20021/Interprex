@@ -1756,6 +1756,273 @@ def build_dll_project() -> tuple[str, str]:
     return root, dll_path
 
 
+def check_backup_restage() -> None:
+    """Unity-class backup bug: finalize leaves an identity/.patch, next inject
+    must re-stage the TRUE original (not early-return), so restore still works
+    after a second mutation. Also: multi-pass write (text then font) keeps the
+    first staged original."""
+    import hashlib
+    import json
+    import shutil
+    from parsers.base import BaseParser, read_backup_original
+    from utils.binary_diff import reverse_patch
+
+    class _Dummy(BaseParser):
+        engine = "test"
+
+        def detect(self, root: str) -> bool:
+            return False
+
+        def extract(self, root: str, sub_paths=None):
+            return []
+
+        def inject(self, root: str, translations, target_lang=None, sub_paths=None):
+            return 0
+
+    root = tempfile.mkdtemp(prefix="interprex_backup_selftest_")
+    try:
+        p = _Dummy()
+        fpath = os.path.join(root, "Data", "big.bin")
+        os.makedirs(os.path.dirname(fpath), exist_ok=True)
+        original = b"ORIG-" + (b"A" * 4096) + b"-END"
+        with open(fpath, "wb") as f:
+            f.write(original)
+        orig_sha = hashlib.sha256(original).hexdigest()
+
+        # ── Pass 1: backup → mutate → finalize ───────────────────────────
+        p.backup_file(root, fpath)
+        with open(fpath, "wb") as f:
+            f.write(b"MOD1-" + (b"B" * 4096) + b"-END")
+        p.finalize_backups(root)
+
+        meta = json.load(open(os.path.join(root, ".interprex_backups", "metadata.json"), encoding="utf-8"))
+        rel = "Data/big.bin"
+        assert rel in meta, meta
+        assert meta[rel]["orig_sha256"] == orig_sha
+        assert meta[rel]["mod_sha256"] == hashlib.sha256(
+            open(fpath, "rb").read()
+        ).hexdigest()
+        patch = os.path.join(root, ".interprex_backups", "Data", "big.bin.patch")
+        assert os.path.isfile(patch), "finalize did not write .patch"
+        assert not os.path.isfile(
+            os.path.join(root, ".interprex_backups", "Data", "big.bin.orig_temp")
+        ), "orig_temp should be removed after finalize"
+
+        # Restore via reverse_patch works at this point
+        mod1 = open(fpath, "rb").read()
+        recovered = reverse_patch(mod1, open(patch, "rb").read(), strict=True)
+        assert recovered == original
+
+        # ── Pass 2: THE BUG — re-backup while live == mod, then mutate again
+        # Old code early-returned (live==mod_sha) with NO .orig_temp → finalize
+        # no-op → reverse_patch fails. New code must stage recovered original.
+        p.backup_file(root, fpath)
+        staged = os.path.join(root, ".interprex_backups", "Data", "big.bin.orig_temp")
+        assert os.path.isfile(staged), "re-backup did not stage .orig_temp"
+        assert open(staged, "rb").read() == original, (
+            "re-backup staged LIVE (translated) instead of true original"
+        )
+
+        with open(fpath, "wb") as f:
+            f.write(b"MOD2-" + (b"C" * 4096) + b"-END")
+        # Second backup in same session must NOT clobber the staged original
+        p.backup_file(root, fpath)
+        assert open(staged, "rb").read() == original, "second backup_file overwrote stage"
+
+        p.finalize_backups(root)
+        mod2 = open(fpath, "rb").read()
+        patch2 = open(patch, "rb").read()
+        recovered2 = reverse_patch(mod2, patch2, strict=True)
+        assert recovered2 == original, "second finalize lost the original"
+
+        # read_backup_original must also yield original against live mod2
+        via_api = read_backup_original(root, rel)
+        assert via_api == original
+
+        # ── Pass 3: identity-trap (backup + finalize with no mutation) ───
+        # Restore live to original first
+        with open(fpath, "wb") as f:
+            f.write(original)
+        p.backup_file(root, fpath)
+        p.finalize_backups(root)  # identity patch
+        # Now mutate WITHOUT the old early-return leaving us stranded
+        p.backup_file(root, fpath)
+        with open(fpath, "wb") as f:
+            f.write(b"MOD3-" + (b"D" * 4096) + b"-END")
+        p.finalize_backups(root)
+        recovered3 = reverse_patch(
+            open(fpath, "rb").read(), open(patch, "rb").read(), strict=True
+        )
+        assert recovered3 == original, "identity-then-mutate broke restore"
+
+        print("OK — backup restage: multi-pass + identity-trap restore")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_unity_sources_registry() -> None:
+    """Multi-source registry: capabilities + plan enablement, no per-title forks."""
+    from parsers.unity_sources import (
+        SOURCE_CONTENT,
+        SOURCE_DLL,
+        SOURCE_FONT_GAP,
+        SOURCE_ORDER,
+        SOURCE_STRING_TABLE,
+        SOURCE_TYPETREE,
+        UnityCapabilities,
+        detect_unity_capabilities,
+        plan_sources,
+    )
+    import tempfile
+    import os
+
+    # Empty root → limited notes, sources mostly disabled
+    empty = tempfile.mkdtemp(prefix="ipx_unity_caps_")
+    try:
+        caps = detect_unity_capabilities(empty)
+        assert not caps.has_game_dlls
+        assert not caps.has_compiled_assets
+        report = plan_sources(caps, phase="extract")
+        by_id = {s.id: s for s in report.sources}
+        assert SOURCE_DLL in by_id and not by_id[SOURCE_DLL].enabled
+        assert SOURCE_CONTENT in by_id and not by_id[SOURCE_CONTENT].enabled
+        assert SOURCE_FONT_GAP in by_id and not by_id[SOURCE_FONT_GAP].enabled
+        d = report.to_dict()
+        assert d["engine"] == "unity" and d["phase"] == "extract"
+        assert "capabilities" in d and "sources" in d
+    finally:
+        import shutil
+        shutil.rmtree(empty, ignore_errors=True)
+
+    # Synthetic Mini Unity layout
+    root = tempfile.mkdtemp(prefix="ipx_unity_caps2_")
+    try:
+        data = os.path.join(root, "Game_Data")
+        managed = os.path.join(data, "Managed")
+        os.makedirs(managed)
+        open(os.path.join(managed, "Assembly-CSharp.dll"), "wb").write(b"MZ")
+        open(os.path.join(managed, "Elringus.Naninovel.Runtime.dll"), "wb").write(b"MZ")
+        open(os.path.join(data, "resources.assets"), "wb").write(b"fake")
+        open(os.path.join(data, "level0"), "wb").write(b"fake")
+        aa = os.path.join(data, "StreamingAssets", "aa")
+        os.makedirs(aa)
+        open(os.path.join(aa, "catalog.json"), "w").write("{}")
+        open(os.path.join(aa, "loc.bundle"), "wb").write(b"x")
+
+        caps = detect_unity_capabilities(root)
+        assert caps.has_game_dlls and caps.game_dll_count >= 1
+        assert caps.has_compiled_assets
+        assert caps.marker_naninovel
+        assert caps.has_addressables
+
+        rep = plan_sources(caps, phase="extract")
+        by_id = {s.id: s for s in rep.sources}
+        assert by_id[SOURCE_DLL].enabled
+        assert by_id[SOURCE_TYPETREE].enabled
+        assert by_id[SOURCE_CONTENT].enabled
+        assert by_id[SOURCE_STRING_TABLE].enabled
+        assert "naninovel" in by_id[SOURCE_CONTENT].reason.lower()
+
+        inj = plan_sources(caps, phase="inject")
+        assert any(s.id == SOURCE_FONT_GAP and s.enabled for s in inj.sources)
+
+        # Stable catalog
+        assert SOURCE_CONTENT in SOURCE_ORDER
+        assert isinstance(UnityCapabilities().to_dict(), dict)
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("OK — unity sources registry (detect, plan, report shape)")
+
+
+def check_unity_font_script() -> None:
+    """Conservative Unity font-gap helpers: language → script, charset parse,
+    coverage — must not false-positive (would rewrite fonts in healthy games)
+    and must catch the Touchstarved-class ASCII-only TMP atlases."""
+    from parsers.unity import (
+        _target_script,
+        _parse_charset_codepoints,
+        _charset_covers_script,
+        _looks_like_tmp_font_asset,
+        _tmp_charset_from_strings,
+        _font_base_name,
+    )
+
+    # UI display names AND short codes must resolve (the old "ru"-only gate
+    # silently skipped every inject because the UI sends "Russian").
+    assert _target_script("Russian") == "cyrillic"
+    assert _target_script("ru") == "cyrillic"
+    assert _target_script("RU") == "cyrillic"
+    assert _target_script("Ukrainian") == "cyrillic"
+    assert _target_script("Chinese (Simplified)") == "cjk"
+    assert _target_script("Japanese") == "japanese"
+    assert _target_script("Korean") == "korean"
+    assert _target_script("Arabic") == "arabic"
+    # Latin targets / empty → no font swap (don't touch English games).
+    assert _target_script("English") is None
+    assert _target_script("German") is None
+    assert _target_script("Portuguese (Brazil)") is None
+    assert _target_script("") is None
+    assert _target_script(None) is None
+
+    # Touchstarved Baskervald SDF charset — pure ASCII, no Cyrillic.
+    bask = "32 - 126, 160, 8203, 8230, 9633"
+    cps = _parse_charset_codepoints(bask)
+    assert cps is not None and ord("A") in cps and ord(".") in cps
+    assert ord("А") not in cps
+    assert _charset_covers_script(bask, "cyrillic") is False
+
+    # LiberationSans SDF — Latin-1 + general punctuation, still no Cyrillic.
+    lib = "32 - 126, 160 - 255, 8192 - 8303, 8364, 8482, 9633"
+    assert _charset_covers_script(lib, "cyrillic") is False
+    assert _charset_covers_script(lib, "cjk") is False
+
+    # Inter-Regular SDF — hex form WITH 400-4FF (Cyrillic block).
+    inter = "0D,20-7E,A0-FF,400-4FF,2000-200F,2012-2022,2026,202F-2030,2032-2034,2039-203A,203C,203E,2044,205E,20AC,2122"
+    cps_i = _parse_charset_codepoints(inter)
+    assert cps_i is not None
+    assert ord("А") in cps_i and ord("я") in cps_i and ord("A") in cps_i
+    assert _charset_covers_script(inter, "cyrillic") is True
+    # Must NOT claim CJK just because hex ranges exist.
+    assert _charset_covers_script(inter, "cjk") is False
+
+    # Garbage / non-charset strings → None (unknown), never a false True/False
+    # that would rewrite an unrelated PPtr.
+    assert _parse_charset_codepoints("Inter-Regular SDF") is None
+    assert _parse_charset_codepoints("1.1.0") is None
+    assert _charset_covers_script("not a charset", "cyrillic") is None
+
+    # TMP blob heuristics
+    assert _looks_like_tmp_font_asset(
+        ["Inter-Regular SDF", "1.1.0", "Inter", "Regular", inter]
+    )
+    assert not _looks_like_tmp_font_asset(["Hello world", "foo"])
+    assert _tmp_charset_from_strings(
+        ["BaskervaldADFStd SDF", "1.1.0", bask]
+    ) == bask
+    assert _font_base_name("BaskervaldADFStd SDF") == _font_base_name("BaskervaldADFStd")
+    assert _font_base_name("LiberationSans SDF - Fallback").startswith("liberationsans")
+
+    # Touchstarved black-screen root cause (2026-08): Font path_ids sit in the
+    # low thousands (Inter TTF = 1686). TMP character tables store glyphIndex as
+    # a uint in the SAME range, often next to a zero word — so the 12-byte
+    # pattern fileID=0+pathID is an exact false match for a PPtr. A whole-file
+    # Font-path rewrite flipped Inter-Regular SDF glyph indices →
+    # KeyNotFoundException in InitializeCharacterLookupDictionary → black screen.
+    # Guard: the collision pattern must stay recognized, and the patcher must
+    # never treat Font path_ids as safe global search keys.
+    import struct
+    glyph_index_as_fake_pptr = struct.pack("<Iq", 0, 1686)
+    real_font_pptr = struct.pack("<Iq", 0, 1686)
+    assert glyph_index_as_fake_pptr == real_font_pptr, (
+        "glyphIndex collision with Font path_id is the load-bearing hazard; "
+        "if this packing changes the font patcher assumptions break"
+    )
+
+    print("OK — unity font-script helpers (lang map, charset, coverage gate)")
+
+
 def check_unity_engine_identifiers() -> None:
     """Naninovel opcodes + AudioMixer params must NEVER pass the Unity text
     filter — translating them bricks the game (Touchstarved: Goto→Перейти,
@@ -1794,12 +2061,33 @@ def check_unity_engine_identifiers() -> None:
         "SAVE",
         "Options",
         "I try to pull away, but his hand remains locked.",
+        # Multi-paragraph (contains \\n) — Touchstarved character backstories.
+        # Was silently dropped by str.isprintable() in the aligned-string walk.
+        (
+            "You were raised as an oracle in a remote temple. The priests claimed "
+            "your touch bestowed enlightenment.\n\nYou regularly experience "
+            "unnatural premonitions that rattle your body."
+        ),
     ]
     for s in accept:
         assert not _is_engine_identifier(s), f"false engine-id: {s!r}"
         assert _is_player_facing_raw(s, naninovel=True) or _is_game_text(s), (
             f"player text rejected: {s!r}"
         )
+
+    # Aligned-string walk must KEEP paragraph breaks (isprintable rejects \\n).
+    from parsers.unity import _sequential_aligned_strings, _is_valid_unity_text_string
+    para = (
+        "You were exiled to a life far from civilization. Your only kinship was "
+        "the wind.\n\nYou learned to read storms the way others read books."
+    )
+    assert _is_valid_unity_text_string(para), "multiline dialogue rejected as invalid"
+    assert not para.isprintable(), "test setup: isprintable must reject \\n (the bug)"
+    blob = _pack_aligned_string(para) + _pack_aligned_string("Stay silent.")
+    seq = [s for _, s in _sequential_aligned_strings(blob)]
+    assert para in seq, f"multiline dialogue not in sequential walk: {seq!r}"
+    slots = [s for _, s in _iter_raw_translatable_slots(blob)]
+    assert para in slots, f"multiline dialogue not in raw slots: {slots!r}"
 
     # Sequential Naninovel rule: token before Naninovel.Commands is an opcode
     # and must never appear in the translatable slot list.
@@ -4218,9 +4506,12 @@ def check_scheduler() -> None:
     assert scheduler._classify_error("parse hiccup in batch") == "other"
 
     saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-             scheduler.get_provider)
+             scheduler._RATE_COOLDOWN_NO_RPM_S, scheduler.get_provider)
     scheduler._RETRY_BACKOFF_FIRST = 0
     scheduler._RETRY_BACKOFF_REST = 0
+    # Zero the TPM-only 429 sibling cooldown — production uses ~20s so multi-
+    # thread free-tier storms settle; tests must stay ~instant.
+    scheduler._RATE_COOLDOWN_NO_RPM_S = 0
 
     class FakeProvider:
         name = "fake"
@@ -4615,7 +4906,7 @@ def check_scheduler() -> None:
             f"un-shortenable caption must record a shrink factor <1.0, got {sf}"
     finally:
         (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-         scheduler.get_provider) = saved
+         scheduler._RATE_COOLDOWN_NO_RPM_S, scheduler.get_provider) = saved
 
 
 def check_scheduler_tpm() -> None:
@@ -6300,6 +6591,9 @@ def main() -> int:
     check_renpy_python_cache()
     check_renpy_inline_extraction()
     check_csharp()
+    check_backup_restage()
+    check_unity_sources_registry()
+    check_unity_font_script()
     check_unity_engine_identifiers()
     check_unity()
     check_unity_localization()

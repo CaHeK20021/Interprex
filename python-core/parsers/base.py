@@ -173,17 +173,29 @@ class BaseParser(ABC):
         self._pending_deltas: dict[str, bytes] = {}
 
     def backup_file(self, root: str, fpath: str) -> None:
-        """Back up the file to `root/.interprex_backups/` preserving relative path,
-        only if a backup doesn't already exist.
+        """Stage the TRUE pre-Interprex original for `fpath` before mutation.
 
-        Backups are stored EXCLUSIVELY as reverse patches (the IDXP delta format
-        in utils/binary_diff). We stage the original bytes as `<rel>.orig_temp`
-        here; `finalize_backups()` (run after inject) diffs original-vs-modified
-        into a compact `<rel>.patch` and drops the staged copy. There is no
-        zlib-`compressed` whole-file branch anymore — it stored mangled bytes that
-        a parser reading the backup couldn't tell from the original (the Fusion
-        re-extract bug). One backup path = one code path to reason about."""
+        Backups are reverse patches (IDXP in ``utils/binary_diff``):
+          1. ``backup_file`` writes ``<rel>.orig_temp`` = true original bytes
+          2. inject mutates the live game file
+          3. ``finalize_backups`` diffs orig_temp → live into ``<rel>.patch``
+
+        ⚠️ LOAD-BEARING: always stage ``.orig_temp`` for the upcoming write,
+        even when a finalized ``.patch`` already exists and live still matches
+        orig/mod. The old code early-returned in that case → inject mutated
+        live with no pending stage → finalize had nothing to update → restore's
+        ``reverse_patch`` failed because live ≠ patch.mod_sha. That is why
+        Unity backups "never worked after translate" (DLL identity patch +
+        later inject; resources.assets multi-pass raw/font writes).
+
+        Recovery order for the bytes we stage:
+          • ``.orig_temp`` already present this session → keep (first writer wins)
+          • live == metadata.orig_sha → live IS the original
+          • reverse_patch(live, .patch) yields metadata.orig_sha → use that
+          • else re-baseline on live (best effort; warn if we lost the original)
+        """
         import os
+        import sys
         import hashlib
         import json
 
@@ -197,54 +209,69 @@ class BaseParser(ABC):
             return
 
         backup_fpath = os.path.join(backup_dir, rel_path)
+        orig_temp_path = backup_fpath + ".orig_temp"
         metadata_path = os.path.join(backup_dir, "metadata.json")
 
-        # Existing backup: only skip if we can still restore THIS on-disk file
-        # back to metadata orig_sha. Identity/stale patches (Touchstarved: empty
-        # .patch + live hash ≠ mod_sha) used to block re-stage forever so the
-        # next inject had no recoverable original.
+        # Already staged for this inject session — do NOT overwrite. The first
+        # backup_file call holds the true original; later calls (font pass,
+        # second asset write) must not replace it with already-mutated live.
+        if os.path.exists(orig_temp_path):
+            return
+
+        if not os.path.exists(fpath):
+            return
+
+        try:
+            with open(fpath, "rb") as f:
+                live_bytes = f.read()
+        except Exception:
+            return
+        live_sha = hashlib.sha256(live_bytes).hexdigest()
+
+        true_orig: bytes | None = None
+        true_orig_sha = ""
+        lost_original = False
+
+        info = None
         if os.path.exists(metadata_path):
             try:
                 with open(metadata_path, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
                 info = metadata.get(rel_path)
-                if info and info.get("type") != "created":
-                    orig_sha_meta = info.get("orig_sha256") or ""
-                    mod_sha_meta = info.get("mod_sha256") or ""
-                    live_sha = ""
-                    try:
-                        with open(fpath, "rb") as lf:
-                            live_sha = hashlib.sha256(lf.read()).hexdigest()
-                    except Exception:
-                        live_sha = ""
-                    # Still pristine original, or still exactly the last known mod
-                    # → reverse_patch path works (or no-op). Keep metadata.
-                    if live_sha and (
-                        live_sha == orig_sha_meta or live_sha == mod_sha_meta
-                    ):
-                        # Identity patch (orig==mod) with live still matching is OK.
-                        return
-                    # Try reverse_patch against current live; if it yields orig, OK.
-                    recovered = read_backup_original(root, rel_path)
-                    if recovered is not None and orig_sha_meta:
-                        if hashlib.sha256(recovered).hexdigest() == orig_sha_meta:
-                            return
-                    # Stale/broken backup — fall through and re-stage CURRENT
-                    # bytes as the baseline for THIS inject (best we can do).
             except Exception:
-                pass
+                info = None
 
-        if not os.path.exists(fpath):
-            return
+        if info and info.get("type") != "created":
+            orig_sha_meta = info.get("orig_sha256") or ""
+            if orig_sha_meta and live_sha == orig_sha_meta:
+                # Pristine game file — live is the original.
+                true_orig = live_bytes
+                true_orig_sha = live_sha
+            elif orig_sha_meta:
+                # Live is translated (or mid-edit). Recover the recorded original
+                # via reverse_patch / leftover stage — NOT by snapshotting live.
+                recovered = read_backup_original(root, rel_path)
+                if recovered is not None:
+                    rec_sha = hashlib.sha256(recovered).hexdigest()
+                    if rec_sha == orig_sha_meta:
+                        true_orig = recovered
+                        true_orig_sha = orig_sha_meta
+                if true_orig is None:
+                    # Patch is stale/identity and live drifted (classic Unity
+                    # failure mode). Cannot invent the pre-Interprex bytes.
+                    lost_original = True
 
-        # Read original bytes
-        try:
-            with open(fpath, "rb") as f:
-                orig_bytes = f.read()
-        except Exception:
-            return
-
-        orig_sha = hashlib.sha256(orig_bytes).hexdigest()
+        if true_orig is None:
+            true_orig = live_bytes
+            true_orig_sha = live_sha
+            if lost_original:
+                print(
+                    f"[backup] WARNING: cannot recover pre-Interprex original for "
+                    f"{rel_path}; re-baselining on current file. 'Restore' will "
+                    f"not yield the vanilla game file for this path — verify "
+                    f"game files in Steam/GOG if you need a true original.",
+                    file=sys.stderr,
+                )
 
         # Ensure gitignore exists
         gitignore_path = os.path.join(backup_dir, ".gitignore")
@@ -256,17 +283,14 @@ class BaseParser(ABC):
             except Exception:
                 pass
 
-        # Stage the original bytes; finalize_backups() turns the staged copy into
-        # a reverse `.patch` after inject. Used for every file size — no special
-        # small-file branch.
-        orig_temp_path = backup_fpath + ".orig_temp"
-
-        def do_write_temp():
+        def do_write_temp(payload: bytes) -> None:
             import tempfile
             dir_name = os.path.dirname(orig_temp_path)
             os.makedirs(dir_name, exist_ok=True)
-            with tempfile.NamedTemporaryFile("wb", dir=dir_name, prefix="tmp_orig_", delete=False) as tf:
-                tf.write(orig_bytes)
+            with tempfile.NamedTemporaryFile(
+                "wb", dir=dir_name, prefix="tmp_orig_", delete=False
+            ) as tf:
+                tf.write(payload)
                 temp_path = tf.name
             try:
                 import time
@@ -285,19 +309,25 @@ class BaseParser(ABC):
                 raise
 
         try:
-            do_write_temp()
-            update_metadata(root, rel_path, orig_sha, "", "patch")
-        except Exception:
-            pass
+            do_write_temp(true_orig)
+            # mod_sha="" marks "pending finalize" — restore uses .orig_temp
+            # verbatim until finalize writes the reverse patch.
+            update_metadata(root, rel_path, true_orig_sha, "", "patch")
+        except Exception as e:
+            print(f"[backup] failed to stage {rel_path}: {e}", file=sys.stderr)
 
     def finalize_backups(self, root: str) -> None:
-        """Called after inject is finished. Computes delta patches for pending large files."""
+        """After inject: turn every staged ``.orig_temp`` into a reverse ``.patch``.
+
+        Verifies ``reverse_patch(live, patch) == orig`` before dropping the
+        staged original, so a bad patch can never silently replace a good stage.
+        """
         import os
         import sys
         import hashlib
         
         sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-        from utils.binary_diff import make_patch
+        from utils.binary_diff import make_patch, reverse_patch
         
         backup_dir = os.path.join(root, ".interprex_backups")
         if not os.path.isdir(backup_dir):
@@ -326,6 +356,23 @@ class BaseParser(ABC):
                         
                     try:
                         patch = make_patch(orig_bytes, mod_bytes)
+                        # Round-trip check: restore must work against CURRENT live.
+                        try:
+                            check = reverse_patch(mod_bytes, patch, strict=True)
+                            if check != orig_bytes:
+                                raise ValueError(
+                                    "reverse_patch round-trip mismatch "
+                                    f"(orig {len(orig_bytes)}B vs recovered {len(check)}B)"
+                                )
+                        except Exception as ver_err:
+                            print(
+                                f"[backup] refuse to finalize {rel_path}: patch does not "
+                                f"round-trip ({ver_err}). Keeping .orig_temp so restore "
+                                f"still works.",
+                                file=sys.stderr,
+                            )
+                            continue
+
                         patch_fpath = os.path.join(backup_dir, rel_path + ".patch")
                         
                         import tempfile
@@ -354,7 +401,7 @@ class BaseParser(ABC):
                         mod_sha = hashlib.sha256(mod_bytes).hexdigest()
                         update_metadata(root, rel_path, orig_sha, mod_sha, "patch")
                         
-                        # Remove the temporary original file
+                        # Remove the temporary original file only after a verified patch.
                         import time
                         delays = [0.1, 0.2, 0.4, 0.8]
                         for attempt, delay in enumerate(delays):
