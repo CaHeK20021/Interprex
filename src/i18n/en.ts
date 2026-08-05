@@ -192,10 +192,21 @@ const en = {
     batchNum
       ? `Batch ${batchNum} done — waiting ${waitLeft}s`
       : `Waiting ${waitLeft}s`,
-  statusWaitingTpm: (waitLeft: number, batchNum?: number) =>
-    batchNum
-      ? `Batch ${batchNum} — TPM wait ${waitLeft}s`
-      : `TPM wait ${waitLeft}s`,
+  // waitLeft=0 → sibling still holds a reserve (no honest countdown).
+  // waitLeft>0 → real 60s window drain. free/est optional context from ledger.
+  statusWaitingTpm: (
+    waitLeft: number,
+    batchNum?: number,
+    _free?: number,
+    _est?: number,
+  ) =>
+    waitLeft > 0
+      ? batchNum
+        ? `Batch ${batchNum} — TPM wait ${waitLeft}s`
+        : `TPM wait ${waitLeft}s`
+      : batchNum
+        ? `Batch ${batchNum} — waiting for TPM slot`
+        : `Waiting for TPM slot`,
   statusResting: "Resting (waiting for work)",
   statusWorkerError: "Key failed",
   pyStatusWaiting: "Waiting...",

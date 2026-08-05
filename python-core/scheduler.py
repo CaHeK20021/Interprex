@@ -670,9 +670,18 @@ class TranslationScheduler:
 
         Returns False if aborted / key died (no reserve held). Pause parks without
         burning the window; Continue rechecks immediately.
+
+        UI contract: do NOT spam `waiting_tpm` every poll tick. Micro-waits for a
+        sibling to unreserve (<0.5s ready_at) stay silent so worker cards don't
+        blink "TPM" every 150–350ms. Longer drain waits emit once per changed
+        `wait_left` (second-granularity), not 3×/s.
         """
         if self.tpm_limit <= 0 or est <= 0:
             return True
+        # (kind, wait_left_or_free_bucket) of the last waiting_tpm we emitted —
+        # re-emit only when the user-visible text would change.
+        last_emit_key: tuple | None = None
+        waiting_since: float | None = None
         while not self._is_aborted():
             while self.should_pause() and not self._is_aborted():
                 self._emit(worker_idx, "paused", status="Paused")
@@ -688,24 +697,46 @@ class TranslationScheduler:
                     self._tpm_reserve_locked(worker_idx, worker_key, est)
                     return True
                 wait_s = max(0.0, ready_at - now)
-                wait_left = int(math.ceil(wait_s))
                 bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
                 used = self._tpm_used_locked(worker_key, now)
                 free = max(0, self.tpm_limit - used)
                 spent = sum(t for _, t in self.key_token_events.get(worker_key, ()))
                 reserved = int(self.key_token_reserved.get(worker_key, 0) or 0)
-            self._emit(
-                worker_idx,
-                "waiting_tpm",
-                status=(
-                    f"TPM {used}/{self.tpm_limit} "
-                    f"(spent {spent} + R {reserved}, free {free}) — "
-                    f"wait {wait_left}s for ~{est} tok..."
-                ),
-                wait_left=wait_left,
-                batch_num=bnum,
-                tpm_est=est,
-            )
+            if waiting_since is None:
+                waiting_since = now
+            # Short poll (sibling still holding a reserve): ready_at is ~now+0.15.
+            # Real window drain has a multi-second ready_at from event timestamps.
+            is_drain = wait_s >= 0.5
+            waited = now - waiting_since
+            # Stay silent for the first half-second of a pure sibling-poll so a
+            # 200ms gap between unreserve and next send never paints "TPM wait".
+            if is_drain or waited >= 0.5:
+                if is_drain:
+                    wait_left = int(math.ceil(wait_s))
+                    emit_key: tuple = ("drain", wait_left)
+                else:
+                    # Slot wait: no honest countdown — free bucket (~1k) is enough
+                    # so the card text stays put while free wiggles a few hundred tok.
+                    wait_left = 0
+                    emit_key = ("slot", free // 1000)
+                if emit_key != last_emit_key:
+                    last_emit_key = emit_key
+                    self._emit(
+                        worker_idx,
+                        "waiting_tpm",
+                        status=(
+                            f"TPM {used}/{self.tpm_limit} "
+                            f"(spent {spent} + R {reserved}, free {free}) — "
+                            + (
+                                f"wait {wait_left}s for ~{est} tok..."
+                                if is_drain
+                                else f"waiting slot for ~{est} tok (free {free})..."
+                            )
+                        ),
+                        wait_left=wait_left,
+                        batch_num=bnum,
+                        tpm_est=est,
+                    )
             # Sleep the remainder (capped) so we recheck soon when a sibling
             # unreserves; never a flat 1s that would re-lockstep threads.
             time.sleep(min(0.35, max(0.05, wait_s)))

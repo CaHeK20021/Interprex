@@ -220,6 +220,72 @@ _KNOWN_CODE = frozenset({
     "rigidbody", "animator", "audiosource", "canvas",
 })
 
+# Naninovel CommandScriptLine type names as they appear in raw MonoBehaviour
+# blobs (no leading @). Translating these renames the opcode — the player then
+# can't resolve commands/scripts. Real shipped crash (Touchstarved 2026-08):
+#   Goto → "Перейти"  ⇒  "script with name `Title_Script` not found"
+# Keep the set of bare identifiers only (not multi-word UI like "Save Game").
+_NANINOVEL_COMMANDS = frozenset({
+    # flow
+    "goto", "gosub", "return", "stop", "wait", "break", "continue",
+    "if", "else", "elseif", "endif", "while", "endwhile", "set",
+    "processinput", "skipinput", "lockinput", "unlockinput",
+    "random", "randomset", "randomstop",
+    # text / printer
+    "print", "resettext", "append", "clearbacklog", "style",
+    # actors / scene
+    "char", "back", "hide", "show", "arrange", "look", "move", "slide",
+    "scale", "rotate", "tint", "animate", "shake", "spawn", "despawn",
+    "hideactors", "showactors", "hideall", "showall",
+    "hideprinter", "showprinter", "hideui", "showui",
+    "camera", "shakeCamera", "shakecamera", "zoom", "ortho", "rollup",
+    # audio / video (command ids, NOT mixer params — those are separate)
+    "sfx", "bgm", "voice", "playsfx", "stopsfx", "playbgm", "stopbgm",
+    "playvoice", "stopvoice", "playmovie", "stopmovie", "movie",
+    # fx / choice / misc
+    "choice", "addchoice", "overlay", "blur", "glitch", "rain", "snow",
+    "sun", "toast", "addtoast", "removealltoast", "waitinput",
+    "complete", "title", "mainmenu", "loadgame", "savegame",
+    "openurl", "debug", "lipmap", "lipSync", "lipsync",
+})
+
+# AudioMixer.SetFloat exposed parameter names. These are CODE keys, not labels.
+# Translating them → "Exposed name does not exist: Общая громкость" (Touchstarved).
+_VOLUME_PARAM_RE = re.compile(
+    r"^(?:Master|Music|BGM|SFX|Voice|Voices|Effects|Effect|Ambient|UI|"
+    r"Dialog|Dialogue|System|Movie|Video|Foley|Env|Environment)"
+    r"\s+[Vv]olume$",
+)
+# Broader: any "Word Volume" / "Word volume" token pair used as a mixer param.
+_VOLUME_PARAM_LOOSE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9/&+.-]*\s+[Vv]olume$")
+
+
+def _is_engine_identifier(plain: str) -> bool:
+    """True for Naninovel opcodes / AudioMixer params / similar — NEVER translate.
+
+    Load-bearing for Unity VN inject safety: a wrong positive here only leaves
+    a string in English; a wrong negative bricks the game (script player /
+    mixer lookups are exact-name).
+    """
+    p = (plain or "").strip()
+    if not p:
+        return False
+    low = p.lower()
+    # Strip spaces for camelCase command variants already lowercased as one word
+    compact = low.replace(" ", "")
+    if low in _NANINOVEL_COMMANDS or compact in _NANINOVEL_COMMANDS:
+        return True
+    if _VOLUME_PARAM_RE.match(p) or _VOLUME_PARAM_LOOSE_RE.match(p):
+        return True
+    # CultureInfo table entries: "Spanish (El Salvador)" — region in parens.
+    # Translating them breaks culture-code lookups; language-picker UI usually
+    # uses short codes or separate display strings without this shape.
+    if "(" in p and ")" in p and re.match(
+        r"^[A-Za-z][A-Za-z\s.'-]*\([A-Za-z][A-Za-z\s.'-]*\)$", p
+    ):
+        return True
+    return False
+
 
 def _is_game_text(text: str) -> bool:
     t = text.strip()
@@ -250,6 +316,9 @@ def _is_game_text(text: str) -> bool:
     if _NANO_ID_RE.match(t):        return False
     if _TYPE_NAME_RE.match(t):      return False
     if "lorem ipsum" in t.lower():  return False
+    # BEFORE the multi-word / Title-case accept rules — "Goto", "Master Volume"
+    # look like normal text but are engine identifiers.
+    if _is_engine_identifier(plain): return False
 
     # ── Быстрый пропуск: очевидно человеческий текст ───────────────────────
     if " " in plain or "\n" in plain: return True   # многословный / диалог
@@ -371,6 +440,9 @@ def _is_game_text_raw(text: str) -> bool:
     if _ASSEMBLY_NAME_RE.search(t):    return False
     if _NANO_ID_RE.match(t):           return False
     if _TYPE_NAME_RE.match(t):         return False
+    # Naninovel opcodes / AudioMixer params — must run before multi-word accept.
+    # (Goto / Master Volume look human but brick ScriptPlayer / mixer.)
+    if _is_engine_identifier(plain):   return False
 
     low = t.lower()
     plain_low = plain.lower()

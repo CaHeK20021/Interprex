@@ -1574,15 +1574,22 @@ input[type="range"]::-webkit-slider-thumb:active {
   background: color-mix(in srgb, var(--line) 80%, transparent);
   overflow: hidden;
   min-width: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
 }
 .tpm-meter-fill {
   height: 100%;
-  border-radius: 999px;
-  background: #41c98a;
-  transition: width 0.25s ease;
+  /* No border-radius on segments — the bar clips; avoids a gap when both show. */
+  flex: 0 0 auto;
+  transition: width 0.35s ease;
+  min-width: 0;
 }
-.tpm-meter-row.tone-high .tpm-meter-fill { background: #e0a64b; }
-.tpm-meter-row.tone-full .tpm-meter-fill { background: #e0564b; }
+/* Spent = committed in the 60s window (stable). Reserved = in-flight estimate. */
+.tpm-meter-fill.tpm-meter-spent { background: #41c98a; }
+.tpm-meter-fill.tpm-meter-reserved { background: #e0a64b; opacity: 0.85; }
+.tpm-meter-row.tone-full .tpm-meter-fill.tpm-meter-spent { background: #e0564b; }
+.tpm-meter-row.tone-full .tpm-meter-fill.tpm-meter-reserved { background: #e0564b; opacity: 0.65; }
 .tpm-meter-row.tone-idle .tpm-meter-fill { background: var(--muted); }
 .tpm-meter-nums {
   font-variant-numeric: tabular-nums;

@@ -190,10 +190,21 @@ const ru: Strings = {
     batchNum
       ? `Пакет ${batchNum} переведен — ожидание ${waitLeft} сек`
       : `Ожидание ${waitLeft} сек`,
-  statusWaitingTpm: (waitLeft: number, batchNum?: number) =>
-    batchNum
-      ? `Пакет ${batchNum} — ждём TPM ${waitLeft} сек`
-      : `Ждём TPM ${waitLeft} сек`,
+  // waitLeft=0 → sibling still holds a reserve (no honest countdown).
+  // waitLeft>0 → real 60s window drain. free/est optional context from ledger.
+  statusWaitingTpm: (
+    waitLeft: number,
+    batchNum?: number,
+    _free?: number,
+    _est?: number,
+  ) =>
+    waitLeft > 0
+      ? batchNum
+        ? `Пакет ${batchNum} — ждём TPM ${waitLeft} сек`
+        : `Ждём TPM ${waitLeft} сек`
+      : batchNum
+        ? `Пакет ${batchNum} — ждём слот TPM`
+        : `Ждём слот TPM`,
   statusResting: "Отдыхает (ждёт работу)",
   statusWorkerError: "Ключ не сработал",
   pyStatusWaiting: "Ожидание...",

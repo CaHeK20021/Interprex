@@ -1756,6 +1756,46 @@ def build_dll_project() -> tuple[str, str]:
     return root, dll_path
 
 
+def check_unity_engine_identifiers() -> None:
+    """Naninovel opcodes + AudioMixer params must NEVER pass the Unity text
+    filter — translating them bricks the game (Touchstarved: Goto→Перейти,
+    Master Volume→Общая громкость → Title_Script not found / mixer missing)."""
+    from parsers.unity import _is_game_text, _is_game_text_raw, _is_engine_identifier
+
+    # Must be rejected (engine identifiers)
+    reject = [
+        "Goto", "Gosub", "Print", "Overlay", "Spawn", "Despawn",
+        "PlaySfx", "StopBgm", "ProcessInput", "SkipInput", "ResetText",
+        "Master Volume", "BGM Volume", "SFX Volume", "Voice Volume",
+        "Music volume", "Effects volume", "Master volume",
+        "Spanish (El Salvador)", "English (United States)",
+    ]
+    for s in reject:
+        assert _is_engine_identifier(s), f"engine-id miss: {s!r}"
+        assert not _is_game_text(s), f"_is_game_text accepted engine id: {s!r}"
+        assert not _is_game_text_raw(s), f"_is_game_text_raw accepted engine id: {s!r}"
+
+    # Must still be accepted (real player-facing text)
+    accept = [
+        "Stay silent.",
+        "Click Start",
+        "Welcome to the modded game!",
+        "SAVE",
+        "Load",
+        "Options",
+        "I try to pull away, but his hand remains locked.",
+    ]
+    for s in accept:
+        assert not _is_engine_identifier(s), f"false engine-id: {s!r}"
+        # raw filter requires len>=3; "Load" is 4 and Title-case UI
+        ok = _is_game_text(s) or _is_game_text_raw(s)
+        assert ok, f"player text rejected: {s!r}"
+    print(
+        "OK — unity engine-id filter: Naninovel commands + mixer params rejected, "
+        "dialogue/UI kept"
+    )
+
+
 def check_unity() -> None:
     import shutil
     root, dll_path = build_dll_project()
@@ -6212,6 +6252,7 @@ def main() -> int:
     check_renpy_python_cache()
     check_renpy_inline_extraction()
     check_csharp()
+    check_unity_engine_identifiers()
     check_unity()
     check_unity_localization()
     check_i18n()

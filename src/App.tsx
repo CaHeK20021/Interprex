@@ -1809,12 +1809,15 @@ export default function App() {
             // Live TPM meter ONLY when this run actually has a cap. Empty TPM
             // field → tpm_limit 0 → never show a bar (was polluting NVIDIA Build
             // runs and crowding the main progress numbers).
+            // IMPORTANT: do NOT clear meters on events that omit tpm_* (e.g. the
+            // initial "initializing" line) — that unmounted the panel every time
+            // a non-ledger event won the race and made the TPM lines blink.
             const runTpm =
               providerInfo.needsKey && tpmLimitK > 0 ? tpmLimitK * 1000 : 0;
             if (runTpm > 0 && p.tpm_limit && p.tpm_limit > 0) {
               if (p.tpm_keys && p.tpm_keys.length > 0) {
                 const rows = p.tpm_keys.filter((k) => (k.limit ?? 0) > 0);
-                setTpmMeters(rows.length ? rows : null);
+                if (rows.length) setTpmMeters(rows);
               } else if (p.tpm_used !== undefined) {
                 setTpmMeters([
                   {
@@ -1828,8 +1831,6 @@ export default function App() {
                   },
                 ]);
               }
-            } else {
-              setTpmMeters(null);
             }
             // OpenRouter daily budget: today's total = pre-run baseline + this
             // run's server-side request count (absolute, so no double counting).
@@ -2590,7 +2591,9 @@ export default function App() {
     } else if (p.phase === "waiting_tpm") {
       return t("statusWaitingTpm")(
         p.wait_left ?? 0,
-        p.batch_num
+        p.batch_num,
+        p.tpm_free,
+        p.tpm_est
       ) as string;
     } else if (p.phase === "resting") {
       return t("statusResting") as string;
@@ -3332,16 +3335,19 @@ export default function App() {
                 <div className="tpm-meter-panel" title={t("tpmMeterHint") as string}>
                   <div className="tpm-meter-head">{t("tpmMeterTitle") as string}</div>
                   {tpmMeters.map((m) => {
-                    const pct =
-                      m.limit > 0
-                        ? Math.min(100, Math.round((m.used / m.limit) * 100))
-                        : 0;
+                    const lim = m.limit > 0 ? m.limit : 1;
+                    const spentPct = Math.min(100, Math.round((m.spent / lim) * 100));
+                    const resPct = Math.min(
+                      100 - spentPct,
+                      Math.round((m.reserved / lim) * 100),
+                    );
+                    const usedPct = Math.min(100, spentPct + resPct);
                     const tone =
-                      pct >= 95
+                      usedPct >= 95
                         ? "full"
-                        : pct >= 70
+                        : usedPct >= 70
                           ? "high"
-                          : pct > 0
+                          : usedPct > 0
                             ? "ok"
                             : "idle";
                     const fmtTok = (n: number) =>
@@ -3351,10 +3357,16 @@ export default function App() {
                     return (
                       <div key={m.key_idx} className={`tpm-meter-row tone-${tone}`}>
                         <span className="tpm-meter-label">{m.label}</span>
+                        {/* Spent (stable) + reserved (in-flight) as two segments so
+                            unreserve/reserve does not empty the whole bar every send. */}
                         <div className="tpm-meter-bar">
                           <div
-                            className="tpm-meter-fill"
-                            style={{ width: `${pct}%` }}
+                            className="tpm-meter-fill tpm-meter-spent"
+                            style={{ width: `${spentPct}%` }}
+                          />
+                          <div
+                            className="tpm-meter-fill tpm-meter-reserved"
+                            style={{ width: `${resPct}%` }}
                           />
                         </div>
                         <span className="tpm-meter-nums">
