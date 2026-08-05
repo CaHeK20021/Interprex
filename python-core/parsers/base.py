@@ -199,13 +199,38 @@ class BaseParser(ABC):
         backup_fpath = os.path.join(backup_dir, rel_path)
         metadata_path = os.path.join(backup_dir, "metadata.json")
 
-        # Check if backup entry already exists in metadata
+        # Existing backup: only skip if we can still restore THIS on-disk file
+        # back to metadata orig_sha. Identity/stale patches (Touchstarved: empty
+        # .patch + live hash ≠ mod_sha) used to block re-stage forever so the
+        # next inject had no recoverable original.
         if os.path.exists(metadata_path):
             try:
                 with open(metadata_path, "r", encoding="utf-8") as f:
                     metadata = json.load(f)
-                if rel_path in metadata:
-                    return
+                info = metadata.get(rel_path)
+                if info and info.get("type") != "created":
+                    orig_sha_meta = info.get("orig_sha256") or ""
+                    mod_sha_meta = info.get("mod_sha256") or ""
+                    live_sha = ""
+                    try:
+                        with open(fpath, "rb") as lf:
+                            live_sha = hashlib.sha256(lf.read()).hexdigest()
+                    except Exception:
+                        live_sha = ""
+                    # Still pristine original, or still exactly the last known mod
+                    # → reverse_patch path works (or no-op). Keep metadata.
+                    if live_sha and (
+                        live_sha == orig_sha_meta or live_sha == mod_sha_meta
+                    ):
+                        # Identity patch (orig==mod) with live still matching is OK.
+                        return
+                    # Try reverse_patch against current live; if it yields orig, OK.
+                    recovered = read_backup_original(root, rel_path)
+                    if recovered is not None and orig_sha_meta:
+                        if hashlib.sha256(recovered).hexdigest() == orig_sha_meta:
+                            return
+                    # Stale/broken backup — fall through and re-stage CURRENT
+                    # bytes as the baseline for THIS inject (best we can do).
             except Exception:
                 pass
 

@@ -1760,20 +1760,31 @@ def check_unity_engine_identifiers() -> None:
     """Naninovel opcodes + AudioMixer params must NEVER pass the Unity text
     filter — translating them bricks the game (Touchstarved: Goto→Перейти,
     Master Volume→Общая громкость → Title_Script not found / mixer missing)."""
-    from parsers.unity import _is_game_text, _is_game_text_raw, _is_engine_identifier
+    from parsers.unity import (
+        _is_game_text,
+        _is_game_text_raw,
+        _is_engine_identifier,
+        _is_player_facing_raw,
+        _iter_raw_translatable_slots,
+        _pack_aligned_string,
+    )
+    import struct
 
     # Must be rejected (engine identifiers)
     reject = [
-        "Goto", "Gosub", "Print", "Overlay", "Spawn", "Despawn",
+        "Goto", "Gosub", "Print", "PrintText", "Overlay", "Spawn", "Despawn",
         "PlaySfx", "StopBgm", "ProcessInput", "SkipInput", "ResetText",
+        "SetCustomVariable", "ModifyCharacter", "BeginIf", "EndIf",
         "Master Volume", "BGM Volume", "SFX Volume", "Voice Volume",
-        "Music volume", "Effects volume", "Master volume",
+        "Music volume", "Effects volume", "Master volume", "Master",
         "Spanish (El Salvador)", "English (United States)",
+        "Title_Script", "Vere_Choice", "V_patience=0", "V_patience++",
     ]
     for s in reject:
         assert _is_engine_identifier(s), f"engine-id miss: {s!r}"
         assert not _is_game_text(s), f"_is_game_text accepted engine id: {s!r}"
         assert not _is_game_text_raw(s), f"_is_game_text_raw accepted engine id: {s!r}"
+        assert not _is_player_facing_raw(s, naninovel=True), f"player_facing accepted: {s!r}"
 
     # Must still be accepted (real player-facing text)
     accept = [
@@ -1781,18 +1792,55 @@ def check_unity_engine_identifiers() -> None:
         "Click Start",
         "Welcome to the modded game!",
         "SAVE",
-        "Load",
         "Options",
         "I try to pull away, but his hand remains locked.",
     ]
     for s in accept:
         assert not _is_engine_identifier(s), f"false engine-id: {s!r}"
-        # raw filter requires len>=3; "Load" is 4 and Title-case UI
-        ok = _is_game_text(s) or _is_game_text_raw(s)
-        assert ok, f"player text rejected: {s!r}"
+        assert _is_player_facing_raw(s, naninovel=True) or _is_game_text(s), (
+            f"player text rejected: {s!r}"
+        )
+
+    # Sequential Naninovel rule: token before Naninovel.Commands is an opcode
+    # and must never appear in the translatable slot list.
+    def _blob(*parts: str) -> bytes:
+        b = bytearray(b"\x00" * 16)
+        b += b"GenericTextScriptLine"  # mark as naninovel script blob
+        for p in parts:
+            b.extend(_pack_aligned_string(p))
+        return bytes(b)
+
+    dialogue = "Of all the people I've met, only one left me with more questions."
+    choice = "Stay silent."
+    # Pack as real Unity AlignedStrings (incl. the blob-type marker).
+    raw = b"".join(
+        _pack_aligned_string(p)
+        for p in (
+            "GenericTextScriptLine",
+            dialogue,
+            "Goto",
+            "Naninovel.Commands",
+            "Elringus.Naninovel.Runtime",
+            "Vere_Choice",
+            choice,
+            "SetCustomVariable",
+            "Naninovel.Commands",
+            "V_patience=0",
+        )
+    )
+    slots = [s for _, s in _iter_raw_translatable_slots(raw)]
+    assert dialogue in slots, slots
+    assert choice in slots, slots
+    assert "Goto" not in slots, slots
+    assert "SetCustomVariable" not in slots, slots
+    assert "Vere_Choice" not in slots, slots
+    assert "V_patience=0" not in slots, slots
+    assert "Naninovel.Commands" not in slots, slots
+    assert "GenericTextScriptLine" not in slots, slots
+
     print(
-        "OK — unity engine-id filter: Naninovel commands + mixer params rejected, "
-        "dialogue/UI kept"
+        "OK — unity engine-id + Naninovel slot walk: opcodes/mixer/script ids "
+        "rejected, dialogue kept, Commands-lookahead strips Goto"
     )
 
 

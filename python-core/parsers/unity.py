@@ -220,71 +220,186 @@ _KNOWN_CODE = frozenset({
     "rigidbody", "animator", "audiosource", "canvas",
 })
 
-# Naninovel CommandScriptLine type names as they appear in raw MonoBehaviour
-# blobs (no leading @). Translating these renames the opcode — the player then
-# can't resolve commands/scripts. Real shipped crash (Touchstarved 2026-08):
-#   Goto → "Перейти"  ⇒  "script with name `Title_Script` not found"
-# Keep the set of bare identifiers only (not multi-word UI like "Save Game").
+# Naninovel command type names as serialized next to "Naninovel.Commands".
+# Translating renames the opcode → ScriptPlayer dies (Touchstarved: Goto→RU
+# ⇒ Title_Script not found, black title screen). Prefer the sequential
+# lookahead rule in `_iter_raw_translatable_slots`; this set is the belt.
 _NANINOVEL_COMMANDS = frozenset({
     # flow
     "goto", "gosub", "return", "stop", "wait", "break", "continue",
     "if", "else", "elseif", "endif", "while", "endwhile", "set",
-    "processinput", "skipinput", "lockinput", "unlockinput",
+    "beginif", "endif", "processinput", "skipinput", "lockinput", "unlockinput",
     "random", "randomset", "randomstop",
     # text / printer
-    "print", "resettext", "append", "clearbacklog", "style",
+    "print", "printtext", "resettext", "append", "clearbacklog", "style",
     # actors / scene
     "char", "back", "hide", "show", "arrange", "look", "move", "slide",
     "scale", "rotate", "tint", "animate", "shake", "spawn", "despawn",
-    "hideactors", "showactors", "hideall", "showall",
+    "hideactors", "showactors", "hideall", "showall", "modifycharacter",
     "hideprinter", "showprinter", "hideui", "showui",
-    "camera", "shakeCamera", "shakecamera", "zoom", "ortho", "rollup",
-    # audio / video (command ids, NOT mixer params — those are separate)
+    "camera", "shakecamera", "zoom", "ortho", "rollup",
+    # audio / video
     "sfx", "bgm", "voice", "playsfx", "stopsfx", "playbgm", "stopbgm",
     "playvoice", "stopvoice", "playmovie", "stopmovie", "movie",
-    # fx / choice / misc
+    # fx / choice / vars
     "choice", "addchoice", "overlay", "blur", "glitch", "rain", "snow",
     "sun", "toast", "addtoast", "removealltoast", "waitinput",
     "complete", "title", "mainmenu", "loadgame", "savegame",
-    "openurl", "debug", "lipmap", "lipSync", "lipsync",
+    "openurl", "debug", "lipmap", "lipsync", "setcustomvariable",
 })
 
-# AudioMixer.SetFloat exposed parameter names. These are CODE keys, not labels.
-# Translating them → "Exposed name does not exist: Общая громкость" (Touchstarved).
+# AudioMixer.SetFloat keys + bare bus names (LLM once mapped Master→«Общая громкость»).
 _VOLUME_PARAM_RE = re.compile(
     r"^(?:Master|Music|BGM|SFX|Voice|Voices|Effects|Effect|Ambient|UI|"
     r"Dialog|Dialogue|System|Movie|Video|Foley|Env|Environment)"
     r"\s+[Vv]olume$",
 )
-# Broader: any "Word Volume" / "Word volume" token pair used as a mixer param.
 _VOLUME_PARAM_LOOSE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9/&+.-]*\s+[Vv]olume$")
+_MIXER_BUS_BARE = frozenset({
+    "master", "bgm", "sfx", "voice", "voices", "music", "effects", "ambient",
+})
+# Naninovel script/label/var ids: Vere_Choice, Title_Script, V_patience, EXT_Foo
+_NANO_IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+$")
+_NANO_VAR_EXPR_RE = re.compile(
+    r"[=;]|\+\+|--|^\.|^~"  # V_x=1, a;b, ++, .V_nose, ~hex
+)
+_NANO_ASSEMBLY_RE = re.compile(
+    r"^(?:Naninovel|Elringus)(?:\.|$)|ScriptLine$",
+    re.I,
+)
 
 
 def _is_engine_identifier(plain: str) -> bool:
-    """True for Naninovel opcodes / AudioMixer params / similar — NEVER translate.
+    """True for opcodes / mixer keys / script ids — NEVER translate.
 
-    Load-bearing for Unity VN inject safety: a wrong positive here only leaves
-    a string in English; a wrong negative bricks the game (script player /
-    mixer lookups are exact-name).
+    Wrong positive → string stays English. Wrong negative → bricked game.
     """
     p = (plain or "").strip()
     if not p:
         return False
     low = p.lower()
-    # Strip spaces for camelCase command variants already lowercased as one word
     compact = low.replace(" ", "")
     if low in _NANINOVEL_COMMANDS or compact in _NANINOVEL_COMMANDS:
         return True
+    if low in _MIXER_BUS_BARE:
+        return True
     if _VOLUME_PARAM_RE.match(p) or _VOLUME_PARAM_LOOSE_RE.match(p):
         return True
-    # CultureInfo table entries: "Spanish (El Salvador)" — region in parens.
-    # Translating them breaks culture-code lookups; language-picker UI usually
-    # uses short codes or separate display strings without this shape.
+    if _NANO_ASSEMBLY_RE.search(p):
+        return True
+    if "ScriptLine" in p:
+        return True
+    # CultureInfo table: "Spanish (El Salvador)"
     if "(" in p and ")" in p and re.match(
         r"^[A-Za-z][A-Za-z\s.'-]*\([A-Za-z][A-Za-z\s.'-]*\)$", p
     ):
         return True
+    # Script / label / flag ids (Vere_Choice, Title_Script, EXT_LowtownNight)
+    if _NANO_IDENT_RE.match(p) and " " not in p:
+        return True
+    # Variable expressions / nano-ids baked into command args (no spaces)
+    if " " not in p and (
+        "=" in p or "++" in p or p.startswith(".") or p.startswith("~")
+        or ";" in p
+    ):
+        return True
+    if p in ("true", "false", "True", "False"):
+        return True
     return False
+
+
+def _is_naninovel_script_blob(raw: bytes) -> bool:
+    """Naninovel Script MonoBehaviour (story lines), not generic UI."""
+    return (
+        b"GenericTextScriptLine" in raw
+        or b"CommandScriptLine" in raw
+        or b"LabelScriptLine" in raw
+    )
+
+
+def _sequential_aligned_strings(raw: bytes) -> list[tuple[int, str]]:
+    """Non-overlapping left-to-right Unity AlignedString walk (path-stable)."""
+    out: list[tuple[int, str]] = []
+    i = 0
+    n = len(raw)
+    while i + 4 < n:
+        slen = struct.unpack_from("<I", raw, i)[0]
+        if 1 <= slen <= 8000 and i + 4 + slen <= n:
+            chunk = raw[i + 4 : i + 4 + slen]
+            try:
+                s = chunk.decode("utf-8")
+                if s.isprintable() and "\x00" not in s and s.strip():
+                    out.append((i, s))
+                    i = _aligned_string_end(i, slen)
+                    continue
+            except (UnicodeDecodeError, ValueError):
+                pass
+        i += 1
+    return out
+
+
+def _is_player_facing_raw(text: str, *, naninovel: bool) -> bool:
+    """Strict player-facing gate. Under-extract > brick.
+
+    Naninovel: multi-word / rich-text / ALL-CAPS UI only — never bare Title-case
+    actor names (those double as command targets). Other content blobs: same
+    multi-word bias; ALL-CAPS UI still ok.
+    """
+    t = text.strip()
+    if not t or not _is_game_text_raw(t):
+        return False
+    if _is_engine_identifier(t):
+        return False
+    plain = _strip_rich_tags(t).strip()
+    if not plain:
+        return False
+    # Multi-word or multi-line = dialogue / sentence UI
+    if " " in plain or "\n" in plain:
+        return True
+    # ALL-CAPS button chrome (SAVE, LOAD) — display only
+    if plain.isupper() and 2 <= len(plain) <= 20 and "_" not in plain:
+        return True
+    if plain.lower() in _KNOWN_UI:
+        return True
+    # Punctuated short choice / interjection ("About...?", "Shame.")
+    if any(c in plain for c in "?!…") and len(plain) >= 3:
+        return True
+    # Naninovel: refuse bare single tokens (Vere, MC, Goto-lookalikes)
+    if naninovel:
+        return False
+    # Non-naninovel content: still refuse short Title-case (was sucking Master/Goto)
+    if plain[0].isupper() and plain[1:].islower() and len(plain) <= 24:
+        return False
+    return False
+
+
+def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
+    """Production raw-slot picker: same walk for extract AND inject.
+
+    Naninovel Script blobs: sequential strings; skip any token whose *next*
+    string is ``Naninovel.Commands`` (that token IS the command type name —
+    ground truth from Touchstarved dumps). Also skip assembly / ScriptLine /
+    ids / var exprs.
+
+    Other content: sequential slots that pass the player-facing gate.
+    """
+    nano = _is_naninovel_script_blob(raw)
+    seq = _sequential_aligned_strings(raw)
+    out: list[tuple[int, str]] = []
+    for i, (offset, s) in enumerate(seq):
+        t = s.strip()
+        if not t:
+            continue
+        nxt = seq[i + 1][1].strip() if i + 1 < len(seq) else ""
+        # Opcode sits immediately before the Commands assembly marker.
+        if nxt == "Naninovel.Commands" or nxt.startswith("Naninovel.Commands"):
+            continue
+        if nxt.startswith("Naninovel.") and "Command" in nxt:
+            continue
+        if not _is_player_facing_raw(t, naninovel=nano):
+            continue
+        out.append((offset, s))
+    return out
 
 
 def _is_game_text(text: str) -> bool:
@@ -332,10 +447,7 @@ def _is_game_text(text: str) -> bool:
     if plain.isupper() and len(plain) <= 20 and "_" not in plain:
         return True
 
-    # Title-case слово нормальной длины -> название предмета/локации
-    if plain[0].isupper() and plain[1:].islower() and 4 <= len(plain) <= 30:
-        return True
-
+    # Title-case singles: no auto-accept (Goto / Master / actor ids).
     return False
 
 
@@ -596,10 +708,9 @@ def _is_game_text_raw(text: str) -> bool:
     if plain.isupper() and len(plain) <= 20 and "_" not in plain:
         return True
 
-    # Title-case normal word
-    if plain[0].isupper() and plain[1:].islower() and 3 <= len(plain) <= 30:
-        return True
-
+    # Title-case single word: DO NOT auto-accept here. That rule sucked in
+    # Naninovel opcodes (Goto) and mixer bus names (Master) on Touchstarved.
+    # Player-facing singles go through `_is_player_facing_raw` / UI whitelist.
     return False
 
 
@@ -1195,20 +1306,10 @@ class UnityParser(BaseParser):
                 else:
                     continue
 
-                # Non-overlapping left-to-right scan (skip nested false hits)
-                candidates: list[tuple[int, str]] = []
-                cursor = 0
-                for offset, s in _extract_length_prefixed_at(raw):
-                    if offset < cursor:
-                        continue
-                    t = s.strip()
-                    if not t or not _is_game_text_raw(t):
-                        continue
-                    # Keep original bytes (not stripped) for inject fidelity
-                    candidates.append((offset, s))
-                    slen = struct.unpack_from("<I", raw, offset)[0]
-                    cursor = _aligned_string_end(offset, slen)
-
+                # Production slot walk (shared with inject). Naninovel scripts
+                # skip opcodes via Naninovel.Commands lookahead; never vacuum
+                # every length-prefix hit.
+                candidates = _iter_raw_translatable_slots(raw)
                 if not candidates:
                     continue
 
@@ -1306,27 +1407,28 @@ class UnityParser(BaseParser):
                 if len(raw) < 20:
                     continue
 
-                # Collect replacements: offset -> new_text (only for slots we own)
+                # Same slot set as extract. Extra belt: never write engine ids
+                # even if a stale project.json still maps them to RU.
                 replacements: dict[int, str] = {}
-                cursor = 0
-                for offset, s in _extract_length_prefixed_at(raw):
-                    if offset < cursor:
-                        continue
+                for offset, s in _iter_raw_translatable_slots(raw):
                     t = s.strip()
-                    slen = struct.unpack_from("<I", raw, offset)[0]
-                    end = _aligned_string_end(offset, slen)
-                    cursor = end
-                    if not t or not _is_game_text_raw(t):
+                    if not t or _is_engine_identifier(t):
                         continue
-
                     path_new = ["AssetRaw", obj.type.name, str(obj.path_id), str(offset)]
                     path_old = ["RawFallback", obj.type.name, str(obj.path_id), "length_prefix"]
                     sid_new = make_id(self.engine, rel_path, path_new, t)
                     sid_old = make_id(self.engine, rel_path, path_old, t)
+                    new_text = None
                     if sid_new in translations:
-                        replacements[offset] = translations[sid_new]
+                        new_text = translations[sid_new]
                     elif sid_old in translations:
-                        replacements[offset] = translations[sid_old]
+                        new_text = translations[sid_old]
+                    if new_text is None or new_text == s:
+                        continue
+                    # Refuse to inject empty / pure-control garbage
+                    if not str(new_text).strip():
+                        continue
+                    replacements[offset] = new_text
 
                 if not replacements:
                     continue
