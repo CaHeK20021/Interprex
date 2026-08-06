@@ -2126,9 +2126,39 @@ def check_unity_engine_identifiers() -> None:
     assert "Naninovel.Commands" not in slots, slots
     assert "GenericTextScriptLine" not in slots, slots
 
+    # UnityEvent PersistentCall method name after assembly-qualified type must
+    # never extract — Touchstarved Confirm button: Play → «Играть» → onClick
+    # no longer invokes Naninovel.PlayScript.Play (button dead). A real
+    # player-facing "Play" label elsewhere still passes via _KNOWN_UI when it
+    # is NOT sandwiched after a type/assembly string.
+    ue_raw = b"".join(
+        _pack_aligned_string(p)
+        for p in (
+            "Normal",
+            "Highlighted",
+            "Pressed",
+            "Selected",
+            "Disabled",
+            "Naninovel.PlayScript, Elringus.Naninovel.Runtime",
+            "Play",
+            "UnityEngine.Object, UnityEngine",
+            "Confirm",  # real UI label — still wanted
+        )
+    )
+    ue_slots = [s for _, s in _iter_raw_translatable_slots(ue_raw)]
+    assert "Play" not in ue_slots, (
+        f"UnityEvent method name 'Play' must not extract: {ue_slots!r}"
+    )
+    assert "Confirm" in ue_slots, f"UI label Confirm dropped: {ue_slots!r}"
+    # Standalone Play label (no assembly-qualified prev) stays extractable.
+    play_label_raw = _pack_aligned_string("Play") + _pack_aligned_string("Quit")
+    play_slots = [s for _, s in _iter_raw_translatable_slots(play_label_raw)]
+    assert "Play" in play_slots, f"standalone Play label should extract: {play_slots!r}"
+
     print(
         "OK — unity engine-id + Naninovel slot walk: opcodes/mixer/script ids "
-        "rejected, dialogue kept, Commands-lookahead strips Goto"
+        "rejected, dialogue kept, Commands-lookahead strips Goto, "
+        "UnityEvent method names skipped"
     )
 
 

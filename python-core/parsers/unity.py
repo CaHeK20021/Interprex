@@ -281,6 +281,22 @@ _NANO_ASSEMBLY_RE = re.compile(
     re.I,
 )
 
+# UnityEvent PersistentCall target type, e.g.
+# "Naninovel.PlayScript, Elringus.Naninovel.Runtime" or
+# "UnityEngine.Object, UnityEngine". The *next* aligned string is the method
+# name (Play / set_text / …) — translating it bricks onClick (Touchstarved:
+# Confirm → Play became «Играть» → button no longer invokes PlayScript.Play).
+_ASSEMBLY_QUALIFIED_TYPE_RE = re.compile(
+    r"^[A-Za-z_][\w.+`\[\]]*,\s*[A-Za-z_][\w.]*"
+)
+
+
+def _looks_like_assembly_qualified_type(s: str) -> bool:
+    t = (s or "").strip()
+    if not t or "," not in t:
+        return False
+    return bool(_ASSEMBLY_QUALIFIED_TYPE_RE.match(t))
+
 
 def _is_engine_identifier(plain: str) -> bool:
     """True for opcodes / mixer keys / script ids — NEVER translate.
@@ -417,6 +433,9 @@ def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
     ground truth from Touchstarved dumps). Also skip assembly / ScriptLine /
     ids / var exprs.
 
+    UnityEvent PersistentCall method names (string after an assembly-qualified
+    type) are never translatable — see ``_looks_like_assembly_qualified_type``.
+
     Other content: sequential slots that pass the player-facing gate.
     """
     nano = _is_naninovel_script_blob(raw)
@@ -426,11 +445,22 @@ def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
         t = s.strip()
         if not t:
             continue
+        prev = seq[i - 1][1].strip() if i > 0 else ""
         nxt = seq[i + 1][1].strip() if i + 1 < len(seq) else ""
         # Opcode sits immediately before the Commands assembly marker.
         if nxt == "Naninovel.Commands" or nxt.startswith("Naninovel.Commands"):
             continue
         if nxt.startswith("Naninovel.") and "Command" in nxt:
+            continue
+        # UnityEvent PersistentCall: method name is sandwiched between the
+        # target type ("Naninovel.PlayScript, Elringus…") and the Object type
+        # ("UnityEngine.Object, UnityEngine"). "Play" is in _KNOWN_UI (valid
+        # button *label* elsewhere), but as a method name it must stay English
+        # or onClick silently no-ops (Touchstarved Confirm → «Играть»).
+        if (
+            _looks_like_assembly_qualified_type(prev)
+            and nxt.startswith("UnityEngine.Object")
+        ):
             continue
         if not _is_player_facing_raw(t, naninovel=nano):
             continue
