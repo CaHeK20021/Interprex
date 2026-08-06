@@ -1125,17 +1125,50 @@ export default function App() {
     setEditedModPaths(new Set());
   }, [root, modsDir, translationMode, clearJustTranslated]);
 
+  // Sidecar health: poll until up, then keep a slow heartbeat.
+  // After an update the UI mounts while Rust is still extracting/spawning
+  // sidecar.exe (PyInstaller onefile unpack + uvicorn can take several
+  // seconds). A one-shot ping on mount races that start and freezes the
+  // "движок не запущен" badge forever even though every later call works.
   useEffect(() => {
-    ping().then((up) => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let sawUp = false;
+    let proxyChecked = false;
+
+    const schedule = (ms: number) => {
+      if (cancelled) return;
+      timer = setTimeout(tick, ms);
+    };
+
+    const tick = async () => {
+      if (cancelled) return;
+      const up = await ping();
+      if (cancelled) return;
       setSidecarUp(up);
       if (up) {
-        // Re-check the proxy on startup if a URL is already saved: provider
-        // reachability (geo-blocks, proxy uptime) can change between sessions, so
-        // re-decide direct-vs-proxy silently and re-apply per provider.
-        const savedProxy = loadSetting("proxyUrl", "");
-        if (savedProxy) void runProxyAutocheck(savedProxy, true);
+        sawUp = true;
+        if (!proxyChecked) {
+          proxyChecked = true;
+          // Re-check the proxy on first successful connect: provider
+          // reachability (geo-blocks, proxy uptime) can change between sessions.
+          const savedProxy = loadSetting("proxyUrl", "");
+          if (savedProxy) void runProxyAutocheck(savedProxy, true);
+        }
+        // Alive: slow heartbeat so a mid-session crash is still noticed.
+        schedule(5000);
+      } else {
+        // Not up yet (or died): retry fast after launch, slower once we
+        // already saw it alive (crash recovery).
+        schedule(sawUp ? 2000 : 500);
       }
-    });
+    };
+
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {

@@ -32,13 +32,22 @@ export async function callPython<T>(
 
 // --- Typed wrappers over the raw calls. Components use these, not callPython. -
 
-/** Is the sidecar up? */
+/** Is the sidecar up? Short timeout so a half-dead socket can't hang the badge. */
 export async function ping(): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1500);
   try {
-    await callPython("ping");
-    return true;
+    const res = await fetch(`${BASE}/ping`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal: ctrl.signal,
+    });
+    return res.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
