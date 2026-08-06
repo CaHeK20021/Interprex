@@ -298,6 +298,25 @@ def _looks_like_assembly_qualified_type(s: str) -> bool:
     return bool(_ASSEMBLY_QUALIFIED_TYPE_RE.match(t))
 
 
+# Pronoun / pair button labels: "They/Them", "She/Her", "He/Him", "Yes/No".
+# Exactly one slash, letters on both sides, no path-like multi-segment junk.
+_SLASH_PAIR_LABEL_RE = re.compile(
+    r"^[A-Za-z][A-Za-z'.-]*(?:/[A-Za-z][A-Za-z'.-]*)+$"
+)
+
+
+def _is_slash_pair_label(plain: str) -> bool:
+    t = (plain or "").strip()
+    if not t or "/" not in t or " " in t or "\\" in t:
+        return False
+    # Exactly one slash: They/Them. Paths like Naninovel/UI/Foo have 2+.
+    if t.count("/") != 1 or "." in t:
+        return False
+    if len(t) > 32:
+        return False
+    return bool(_SLASH_PAIR_LABEL_RE.match(t))
+
+
 def _is_engine_identifier(plain: str) -> bool:
     """True for opcodes / mixer keys / script ids — NEVER translate.
 
@@ -408,6 +427,9 @@ def _is_player_facing_raw(text: str, *, naninovel: bool) -> bool:
     # Multi-word or multi-line = dialogue / sentence UI
     if " " in plain or "\n" in plain:
         return True
+    # Slash-pair captions (They/Them, She/Her) — player-facing UI, not opcodes
+    if _is_slash_pair_label(plain):
+        return True
     # ALL-CAPS button chrome (SAVE, LOAD) — display only
     if plain.isupper() and 2 <= len(plain) <= 20 and "_" not in plain:
         return True
@@ -503,6 +525,9 @@ def _is_game_text(text: str) -> bool:
 
     # ── Быстрый пропуск: очевидно человеческий текст ───────────────────────
     if " " in plain or "\n" in plain: return True   # многословный / диалог
+    # Slash-pair UI labels (pronoun buttons): "They/Them", "She/Her", "He/Him".
+    # No space → old multi-word gate missed them → buttons stayed English.
+    if _is_slash_pair_label(plain): return True
     if plain.lower() in _KNOWN_UI:  return True   # известная UI-метка
 
     # ── Одно слово: усиленный фильтр ────────────────────────────────────────
@@ -768,6 +793,9 @@ def _is_game_text_raw(text: str) -> bool:
 
     # ── Standard pass-through ───────────────────────────────────────────────
     if " " in plain or "\n" in plain:      return True   # multi-word → likely dialogue/UI
+    # "They/Them" / "She/Her" / "He/Him" — real button captions (Touchstarved
+    # pronoun picker). Slash is not a space, so the multi-word gate missed them.
+    if _is_slash_pair_label(plain):        return True
     if plain_low in _KNOWN_UI:             return True
 
     # ALL CAPS button label

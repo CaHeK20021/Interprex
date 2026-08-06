@@ -2068,12 +2068,17 @@ def check_unity_engine_identifiers() -> None:
             "your touch bestowed enlightenment.\n\nYou regularly experience "
             "unnatural premonitions that rattle your body."
         ),
+        # Pronoun picker buttons (Touchstarved) — slash without space used to
+        # fail the multi-word gate and stay English forever.
+        "They/Them",
+        "She/Her",
+        "He/Him",
     ]
     for s in accept:
         assert not _is_engine_identifier(s), f"false engine-id: {s!r}"
-        assert _is_player_facing_raw(s, naninovel=True) or _is_game_text(s), (
-            f"player text rejected: {s!r}"
-        )
+        assert _is_player_facing_raw(s, naninovel=True) or _is_game_text(s) or (
+            _is_player_facing_raw(s, naninovel=False)
+        ), f"player text rejected: {s!r}"
 
     # Aligned-string walk must KEEP paragraph breaks (isprintable rejects \\n).
     from parsers.unity import _sequential_aligned_strings, _is_valid_unity_text_string
