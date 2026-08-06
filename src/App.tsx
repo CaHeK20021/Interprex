@@ -1761,6 +1761,20 @@ export default function App() {
       const todoKeys = new Set(todo.map((s) => `${s.original}\x00${s.context}`));
       const initialDone = totalUnique - todoKeys.size;
 
+      // Threads/pacing apply to cloud backends only; local servers have one model
+      // in VRAM, so parallel requests there just contend. Send 1 / 0 for them.
+      // The pacing delay is derived from the user's RPM cap and the thread count.
+      const effThreads = providerInfo.needsKey ? threads : 1;
+      const effDelay = providerInfo.needsKey ? rpmToDelay(rpmLimit, effThreads) : 0;
+      // Snapshot TPM for THIS run (closure-stable). Re-read storage as a belt-
+      // and-suspenders: provider switch + typed "16" can race a stale state
+      // tick; loadTpmK is the same source the field uses after switch.
+      // UI is in K (16 → 16000 tok/min); sidecar wants absolute tokens.
+      const runTpmK = providerInfo.needsKey
+        ? Math.max(0, tpmLimitK || loadTpmK(provider) || 0)
+        : 0;
+      const runTpmLimit = runTpmK * 1000;
+
       setProgress({
         done: initialDone,
         total: totalUnique,
@@ -1770,13 +1784,27 @@ export default function App() {
       });
       setKeyStatuses({ 0: "Initializing..." });
       setWorkerPhases({ 0: "initializing" });
-      setTpmMeters(null);
+      // Seed the TPM panel IMMEDIATELY when a cap is set for this run — do not
+      // wait for the first NDJSON event. Empty field → null (no bars on NVIDIA
+      // with TPM off). Without this seed, a slow first event / old sidecar that
+      // never echoed tpm_* left the panel blank while requests still fired.
+      if (runTpmLimit > 0) {
+        const nKeys = Math.max(1, nonEmptyKeys.length);
+        setTpmMeters(
+          Array.from({ length: nKeys }, (_, i) => ({
+            key_idx: i,
+            label: `K${i + 1}`,
+            spent: 0,
+            reserved: 0,
+            used: 0,
+            free: runTpmLimit,
+            limit: runTpmLimit,
+          })),
+        );
+      } else {
+        setTpmMeters(null);
+      }
 
-      // Threads/pacing apply to cloud backends only; local servers have one model
-      // in VRAM, so parallel requests there just contend. Send 1 / 0 for them.
-      // The pacing delay is derived from the user's RPM cap and the thread count.
-      const effThreads = providerInfo.needsKey ? threads : 1;
-      const effDelay = providerInfo.needsKey ? rpmToDelay(rpmLimit, effThreads) : 0;
       // Snapshot today's OpenRouter usage so the run's absolute request count adds
       // onto it (and resets cleanly if midnight UTC passed since the last run).
       orUsageBaseRef.current = readOrUsageCount();
@@ -1801,22 +1829,32 @@ export default function App() {
             maxBatchSize: maxBatchSize,
             threads: effThreads,
             delaySeconds: effDelay,
-            // UI is in K (16 → 16000 tok/min); sidecar wants absolute tokens.
-            tpmLimit: providerInfo.needsKey ? tpmLimitK * 1000 : 0,
+            tpmLimit: runTpmLimit,
             root: activeRoot ?? undefined,
             fontStyle,
             extraInstruction: extraInstruction ?? "",
           },
           (p) => {
-            // Do NOT spread the whole event into progress state — tpm_keys / etc.
-            // are unrelated and a fat payload was crowding the live progress UI.
-            setProgress({
-              done: initialDone + (p.done ?? 0),
+            // LOAD-BEARING: `done` is MONOTONIC. Concurrent workers emit NDJSON
+            // out of order; a late event can carry a STALE lower len(result)
+            // than a peer already reported (esp. when completed_batch used to
+            // fire BEFORE finish_batch). Without max(), the main bar jumped
+            // 15→40→89→15 as each thread's event landed. Per-worker batch_num
+            // still updates below for the grid cards only.
+            const incomingDone = Math.min(
+              totalUnique,
+              initialDone + (p.done ?? 0),
+            );
+            setProgress((prev) => ({
+              done: Math.max(prev?.done ?? 0, incomingDone),
               total: totalUnique,
-              batches: p.batches ?? 0,
+              batches: Math.max(prev?.batches ?? 0, p.batches ?? 0),
               translations: p.translations ?? {},
               status: p.status,
               phase: p.phase,
+              // batch_num etc. are for local single-worker status text only;
+              // cloud multi-thread hides them on the main bar (needsKey branch)
+              // and shows them on worker cards via setKeyStatuses below.
               batch_num: p.batch_num,
               batch_size: p.batch_size,
               try_i: p.try_i,
@@ -1824,9 +1862,12 @@ export default function App() {
               worker_idx: p.worker_idx ?? p.key_idx,
               key_idx: p.key_idx,
               wait_left: p.wait_left,
-              requests_sent: p.requests_sent,
+              requests_sent: Math.max(
+                prev?.requests_sent ?? 0,
+                p.requests_sent ?? 0,
+              ),
               last_error: p.last_error,
-            });
+            }));
             const wi = p.worker_idx ?? p.key_idx;
             if (wi !== undefined) {
               setKeyStatuses((prev) => ({
@@ -1842,12 +1883,10 @@ export default function App() {
             // Live TPM meter ONLY when this run actually has a cap. Empty TPM
             // field → tpm_limit 0 → never show a bar (was polluting NVIDIA Build
             // runs and crowding the main progress numbers).
-            // IMPORTANT: do NOT clear meters on events that omit tpm_* (e.g. the
-            // initial "initializing" line) — that unmounted the panel every time
-            // a non-ledger event won the race and made the TPM lines blink.
-            const runTpm =
-              providerInfo.needsKey && tpmLimitK > 0 ? tpmLimitK * 1000 : 0;
-            if (runTpm > 0 && p.tpm_limit && p.tpm_limit > 0) {
+            // IMPORTANT: do NOT clear meters on events that omit tpm_* (e.g. a
+            // mid-run event without ledger) — that unmounted the panel and made
+            // the TPM lines blink. Seeded meters stay until a real ledger lands.
+            if (runTpmLimit > 0 && p.tpm_limit && p.tpm_limit > 0) {
               if (p.tpm_keys && p.tpm_keys.length > 0) {
                 const rows = p.tpm_keys.filter((k) => (k.limit ?? 0) > 0);
                 if (rows.length) setTpmMeters(rows);
@@ -3359,10 +3398,11 @@ export default function App() {
                 );
               })}
             </div>
-            {/* Compact TPM readout under the worker grid — only when the user set
-                a TPM cap for this run. Never above the main progress bar. */}
-            {tpmLimitK > 0 &&
-              tpmMeters &&
+            {/* Compact TPM readout under the worker grid — when this run has a
+                cap (seeded at Translate press and/or live from sidecar). Never
+                above the main progress bar. Gate on meters.limit, not the live
+                input field: clearing the field mid-run must not hide the panel. */}
+            {tpmMeters &&
               tpmMeters.length > 0 &&
               tpmMeters.some((m) => m.limit > 0) && (
                 <div className="tpm-meter-panel" title={t("tpmMeterHint") as string}>

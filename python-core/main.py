@@ -1198,6 +1198,15 @@ def extract(req: ExtractReq) -> dict:
             
     # 3. Кэш промахнулся — выполняем реальное тяжелое извлечение
     strings = [s.to_dict() for s in parser.extract(req.root, req.sub_paths)]
+
+    # Unity multi-source report (which backends fired). Optional for other engines.
+    unity_sources = None
+    last_rep = getattr(parser, "last_report", None)
+    if last_rep is not None and hasattr(last_rep, "to_dict"):
+        try:
+            unity_sources = last_rep.to_dict()
+        except Exception:
+            unity_sources = None
     
     # 4. Записываем результат в кэш (только если извлекали всё, без sub_paths, и есть строки)
     if current_hash and not req.sub_paths and strings:
@@ -1228,8 +1237,11 @@ def extract(req: ExtractReq) -> dict:
                     time.sleep(delay)
         except Exception as e:
             logger.warning(f"Failed to save extract cache: {e}")
-            
-    return {"strings": strings}
+
+    out: dict = {"strings": strings}
+    if unity_sources is not None:
+        out["unity_sources"] = unity_sources
+    return out
 
 
 def _mod_cache_path(root: str) -> str:
@@ -1765,16 +1777,67 @@ def backup_restore(req: BackupRestoreReq) -> dict:
     # After deleting those files we prune any that ended up empty, bottom-up, so a
     # restore doesn't leave behind orphan empty folders (e.g. tl/russian/tl/None/).
     touched_dirs: set[str] = set()
+    # Per-file errors: one broken Unity DLL identity patch must not abort the
+    # whole restore and leave every other file still translated.
+    file_errors: list[str] = []
+    restored = 0
 
     try:
         for rel_path, info in metadata.items():
             target_file = os.path.join(req.root, rel_path)
             orig_sha = info.get("orig_sha256")
 
-            if info.get("type") == "created" or not orig_sha:
-                if os.path.exists(target_file):
-                    run_with_retry(os.remove, target_file)
-                    touched_dirs.add(os.path.dirname(target_file))
+            try:
+                if info.get("type") == "created" or not orig_sha:
+                    if os.path.exists(target_file):
+                        run_with_retry(os.remove, target_file)
+                        touched_dirs.add(os.path.dirname(target_file))
+                        restored += 1
+                    if target_file.endswith(".rpy"):
+                        rpyc_file = target_file + "c"
+                        if os.path.exists(rpyc_file):
+                            try:
+                                run_with_retry(os.remove, rpyc_file)
+                            except Exception:
+                                pass
+                    continue
+
+                # Backups are reverse patches. Two on-disk states (mirrors
+                # parsers.base.read_backup_original):
+                #   staged    <rel>.orig_temp  -> verbatim original (pre-finalize)
+                #   finalized <rel>.patch      -> reverse-patch the current file
+                # Prefer .orig_temp: it survives a stale/identity .patch (Unity
+                # multi-pass inject used to leave both on disk).
+                orig_temp = os.path.join(backup_dir, rel_path + ".orig_temp")
+                patch_file = os.path.join(backup_dir, rel_path + ".patch")
+
+                if os.path.exists(orig_temp):
+                    with open(orig_temp, "rb") as f:
+                        orig_bytes = f.read()
+                elif os.path.exists(patch_file):
+                    if not os.path.exists(target_file):
+                        logger.warning(f"Modified file not found to revert: {rel_path}. Skipping.")
+                        continue
+                    with open(patch_file, "rb") as f:
+                        patch_bytes = f.read()
+                    with open(target_file, "rb") as f:
+                        mod_bytes = f.read()
+                    orig_bytes = reverse_patch(mod_bytes, patch_bytes, strict=True)
+                else:
+                    raise FileNotFoundError(
+                        f"No backup (patch or staged) found for {rel_path}"
+                    )
+
+                # Verify SHA256 of restored bytes before writing.
+                actual_sha = hashlib.sha256(orig_bytes).hexdigest()
+                if actual_sha != orig_sha:
+                    raise ValueError(
+                        f"SHA256 mismatch for restored file {rel_path}: "
+                        f"expected {orig_sha}, got {actual_sha}"
+                    )
+
+                atomic_write_file(target_file, orig_bytes)
+                restored += 1
                 if target_file.endswith(".rpy"):
                     rpyc_file = target_file + "c"
                     if os.path.exists(rpyc_file):
@@ -1782,43 +1845,9 @@ def backup_restore(req: BackupRestoreReq) -> dict:
                             run_with_retry(os.remove, rpyc_file)
                         except Exception:
                             pass
-                continue
-
-            # Backups are reverse patches. Two on-disk states (mirrors
-            # parsers.base.read_backup_original):
-            #   staged    <rel>.orig_temp  -> verbatim original (pre-finalize)
-            #   finalized <rel>.patch      -> reverse-patch the current file
-            orig_temp = os.path.join(backup_dir, rel_path + ".orig_temp")
-            patch_file = os.path.join(backup_dir, rel_path + ".patch")
-
-            if os.path.exists(orig_temp):
-                with open(orig_temp, "rb") as f:
-                    orig_bytes = f.read()
-            elif os.path.exists(patch_file):
-                if not os.path.exists(target_file):
-                    logger.warning(f"Modified file not found to revert: {rel_path}. Skipping.")
-                    continue
-                with open(patch_file, "rb") as f:
-                    patch_bytes = f.read()
-                with open(target_file, "rb") as f:
-                    mod_bytes = f.read()
-                orig_bytes = reverse_patch(mod_bytes, patch_bytes, strict=True)
-            else:
-                raise FileNotFoundError(f"No backup (patch or staged) found for {rel_path}")
-
-            # Verify SHA256 of restored bytes before writing.
-            actual_sha = hashlib.sha256(orig_bytes).hexdigest()
-            if actual_sha != orig_sha:
-                raise ValueError(f"SHA256 mismatch for restored file {rel_path}: expected {orig_sha}, got {actual_sha}")
-
-            atomic_write_file(target_file, orig_bytes)
-            if target_file.endswith(".rpy"):
-                rpyc_file = target_file + "c"
-                if os.path.exists(rpyc_file):
-                    try:
-                        run_with_retry(os.remove, rpyc_file)
-                    except Exception:
-                        pass
+            except Exception as file_err:
+                logger.error("Restore failed for %s: %s", rel_path, file_err)
+                file_errors.append(f"{rel_path}: {file_err}")
 
         # Prune directories emptied by the restore (deepest first), so orphan
         # empty folders like tl/russian/tl/None/ don't linger. Walk upward from
@@ -1836,10 +1865,22 @@ def backup_restore(req: BackupRestoreReq) -> dict:
                 except OSError:
                     break
 
+        if file_errors:
+            # Keep the backup folder so the user can retry / Steam-verify the
+            # broken paths; successful files are already restored on disk.
+            detail = (
+                f"Restored {restored} file(s), but {len(file_errors)} failed. "
+                f"Close the game and retry, or verify game files for the failed "
+                f"paths. First error: {file_errors[0]}"
+            )
+            raise HTTPException(status_code=500, detail=detail)
+
         # Delete the backup folder since all files were successfully restored.
         retry_rmtree(backup_dir)
-        return {"success": True}
+        return {"success": True, "restored": restored}
         
+    except HTTPException:
+        raise
     except (PermissionError, OSError) as e:
         raise HTTPException(
             status_code=400,

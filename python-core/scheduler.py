@@ -90,8 +90,15 @@ DEFAULT_CONTEXT_TOKENS = 8192
 # rolling 60s bucket). Events older than this are dropped from the per-key ledger.
 _TPM_WINDOW_S = 60.0
 # Small safety margin on pre-send estimates so a slightly dense tokenizer doesn't
-# overshoot the real TPM cap before usage comes back.
+# overshoot the real TPM cap before usage comes back. Pre-calibration (0 samples)
+# uses a higher margin — default chars/token under-counts Gemini/OpenAI denser
+# tokenizers and would let N fat batches reserve "cheap" then blow the real TPM.
 _TPM_EST_SAFETY = 1.08
+_TPM_EST_SAFETY_COLD = 1.35
+# When the user set TPM but left RPM empty (delay_seconds=0), a 429 still needs
+# a real multi-thread cooldown. Without this, only the failing worker backs off
+# 8s while siblings keep firing → "TPM on, still hammering errors".
+_RATE_COOLDOWN_NO_RPM_S = 20.0
 
 
 def _classify_error(msg: str) -> str:
@@ -501,7 +508,11 @@ class TranslationScheduler:
         )
         prompt_tok = max(1, cal.est_tokens(prompt))
         out_ratio = max(0.1, float(cal.out_ratio))
-        return max(1, int(prompt_tok * (1.0 + out_ratio) * _TPM_EST_SAFETY))
+        # Cold start (no usage samples yet): pad harder so concurrent threads
+        # cannot under-reserve and dump the free-tier TPM in one burst.
+        samples = int(getattr(cal, "_samples", 0) or 0)
+        safety = _TPM_EST_SAFETY_COLD if samples <= 0 else _TPM_EST_SAFETY
+        return max(1, int(prompt_tok * (1.0 + out_ratio) * safety))
 
     @staticmethod
     def _tpm_key_label(key: str, key_idx: int) -> str:
@@ -1223,15 +1234,27 @@ class TranslationScheduler:
                     # every cloud API, so wait at least the pacing delay before
                     # re-sending — and record a per-key cooldown so siblings on
                     # this key wait too while other keys keep working.
-                    floor = self.delay_seconds if kind == "rate" else 0.0
-                    if kind == "rate" and self.delay_seconds > 0:
-                        # The failed request still consumed an RPM slot, so
-                        # the cooldown starts from NOW — the next request must
-                        # wait a full delay_seconds from this point.
+                    #
+                    # CRITICAL: delay_seconds==0 (user set only TPM, left RPM
+                    # empty) must NOT skip the multi-thread cooldown. Without
+                    # it, only this worker backs off 8s while siblings keep
+                    # firing → 429 storm, "TPM ignored" symptom. Floor to a
+                    # fixed no-RPM cooldown (or the RPM-derived delay).
+                    rate_floor = 0.0
+                    if kind == "rate":
+                        rate_floor = (
+                            self.delay_seconds
+                            if self.delay_seconds > 0
+                            else _RATE_COOLDOWN_NO_RPM_S
+                        )
+                    floor = rate_floor
+                    if kind == "rate" and rate_floor > 0:
+                        # The failed request still consumed a quota slot, so
+                        # the cooldown starts from NOW — siblings honour it.
                         with self.cond:
                             self.key_cooldown[worker_key] = max(
                                 self.key_cooldown.get(worker_key, 0.0),
-                                time.time() + self.delay_seconds,
+                                time.time() + rate_floor,
                             )
                     # Stagger sibling retries so threads that all hit an error at
                     # once don't re-fire in lockstep (which would just re-trigger
@@ -1240,9 +1263,9 @@ class TranslationScheduler:
                     # second, keeping the peak RPM at N/delay ≤ 1 request per
                     # thread-period.
                     stagger = 0.0
-                    if self.delay_seconds > 0 and self.threads > 1:
+                    if rate_floor > 0 and self.threads > 1:
                         rank = worker_idx % self.threads
-                        stagger = self.delay_seconds * rank / self.threads
+                        stagger = rate_floor * rank / self.threads
                     self._retry_sleep(worker_idx, batch, try_i, start_time,
                                       min_wait=floor, stagger=stagger)
 
@@ -1650,18 +1673,24 @@ class TranslationScheduler:
                 tr_map, key_died, _safety = self._translate_with_retries(
                     batch, cal, worker_idx, worker_key
                 )
-                # Emit the batch's translations BEFORE any pause/next-claim so the
-                # frontend merges + auto-saves the project file for this batch.
-                if tr_map:
-                    self._emit(
-                        worker_idx,
-                        "completed_batch",
-                        status="Completed batch!",
-                        translations=self._fan_out(tr_map),
-                        batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq),
-                    )
             finally:
+                # Fold into result FIRST, then emit completed_batch. Emitting
+                # before finish_batch made `done=len(result)` lag this batch AND
+                # race sibling workers: a late completed event could carry a
+                # STALE lower done than a peer already reported → main progress
+                # bar jumped 89→15→40 as NDJSON reordered concurrent emits.
                 self.finish_batch(worker_idx, batch, tr_map, key_died)
+
+            # Emit translations after result is updated so `done` includes this
+            # batch. Frontend still monotonic-maxes done as a belt-and-suspenders.
+            if tr_map:
+                self._emit(
+                    worker_idx,
+                    "completed_batch",
+                    status="Completed batch!",
+                    translations=self._fan_out(tr_map),
+                    batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq),
+                )
 
             if key_died:
                 with self.cond:
@@ -1691,7 +1720,11 @@ class TranslationScheduler:
     def stream(self):
         """Generator of NDJSON lines: progress events, then one final `done`."""
         try:
-            yield json.dumps({
+            # First paint MUST carry the TPM ledger when a cap is set — the UI
+            # seeds bars from this event. Omitting tpm_* here left the panel
+            # blank until a worker emitted (and never showed if an old sidecar
+            # path never paced), which read as "TPM ignored".
+            init_evt: dict = {
                 "type": "progress",
                 "done": self._done_count(),
                 "total": self.total,
@@ -1699,7 +1732,21 @@ class TranslationScheduler:
                 "status": "Initializing translator...",
                 "phase": "initializing",
                 "translations": {},
-            }, ensure_ascii=False) + "\n"
+                "worker_idx": 0,
+                "key_idx": 0,
+            }
+            if self.tpm_limit > 0:
+                with self.cond:
+                    tpm_snap = self._tpm_snapshot_locked(now=time.time())
+                init_evt["tpm_limit"] = tpm_snap["limit"]
+                init_evt["tpm_keys"] = tpm_snap["keys"]
+                if tpm_snap["keys"]:
+                    row0 = tpm_snap["keys"][0]
+                    init_evt["tpm_used"] = row0["used"]
+                    init_evt["tpm_spent"] = row0["spent"]
+                    init_evt["tpm_reserved"] = row0["reserved"]
+                    init_evt["tpm_free"] = row0["free"]
+            yield json.dumps(init_evt, ensure_ascii=False) + "\n"
 
             # Fill the pool (fresh mutable copy of the prepared, file-ordered reps).
             with self.cond:

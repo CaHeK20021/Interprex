@@ -50,7 +50,7 @@ Tauri (thin Rust shell)         src-tauri/    window + launches the sidecar
 | `src/lib/settings.ts` | persisted prefs (localStorage): UI lang, target lang, provider config, max context |
 | `src/i18n/` | UI localization: `en.ts`/`ru.ts` (same keys, enforced by `Strings` type), `index.ts` store + `t()` |
 | `python-core/main.py` | sidecar endpoints: ping, detect, extract, inject, detect_mods (with game_root resolution), providers, translate, validate, autofix, backup/*, fs/* |
-| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity`, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`, `unreal4_5`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
+| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity` + `unity_sources` multi-source registry, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`, `unreal4_5`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
 | `python-core/providers/` | `base.py` (provider ABC, prompt, parse, **Calibrator**, batching), `openai_compat.py` (Ollama + LM Studio), `gemini.py`, registry |
 | `python-core/validators/` | post-translation validators (`get_validator(engine)`); `renpy.py` `ast.parse`-checks `python:`/`$` blocks — catches a broken translated literal WITHOUT the `renpy` binary (works on a Steam player's machine) |
 | `python-core/uasset-extractor/` | C# tool (`Program.cs`, UAssetAPI) compiled to `python-core/bin/UAssetExtractor.exe`. Extracts translatable strings from `.uasset` files for ContentLib patching. |
@@ -326,11 +326,20 @@ SAME pool drives every engine. Verified by `check_scheduler` in `selftest.py`
   tpm=0 unrestricted, window drain).
 - **Error classes** (`_classify_error`): `rate` (429/503/overload) → retry with
   back-off ≥ delay + per-key `key_cooldown` (siblings on that key wait, other
-  keys keep going); `auth` (401/403/invalid key) → fail the key fast (2-try
+  keys keep going). **If RPM is empty (`delay_seconds=0`) but the user only set
+  TPM**, still apply `_RATE_COOLDOWN_NO_RPM_S` (~20s) as the sibling cooldown —
+  otherwise only the failing worker backs off 8s while siblings keep firing
+  (real free-tier Gemini bug: "TPM 16 stood, bars never showed / requests
+  hammered into 429"). `auth` (401/403/invalid key) → fail the key fast (2-try
   grace) so work fails over instead of burning ~26 min of retries; `other` →
   normal retry. **On every cloud API an error RESPONSE still spends quota** — only
   a request that never reached the server is free (`_reached_server`); the
   OpenRouter daily counter ticks per request that got an HTTP status.
+- **TPM UI contract**: meters seed at Translate press when `tpmLimitK > 0` (do
+  not wait for NDJSON); the first `initializing` progress event ALSO carries
+  `tpm_keys` when `tpm_limit > 0`. Cold-start token estimate uses a higher
+  safety (`_TPM_EST_SAFETY_COLD`) so concurrent threads cannot under-reserve
+  before the calibrator has samples.
 
 OpenRouter daily free-request budget: the API gives the cap (50 free tier / 1000
 once ≥$10 bought, via `OpenRouterProvider.key_limits` → `/auth/key`) but NOT
