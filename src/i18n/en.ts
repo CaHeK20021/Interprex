@@ -91,6 +91,11 @@ const en = {
     "your quota, so retries respect the same pace.)",
   tpmLimit: "TPM, K/min",
   tpmNoLimit: "none",
+  httpTimeout: "Wait, s",
+  httpTimeoutHint:
+    "How long we wait for ONE API reply before we abort the socket (seconds). " +
+    "This is our cut, not theirs — NVIDIA free Gemma can sit in queue for minutes. " +
+    "Default 200. Range 10–3600.",
   tpmLimitHint:
     "Tokens-per-minute cap PER KEY in thousands (K). Type 16 for 16 000 tok/min " +
     "(free Gemini). The app estimates each batch from the text it will send; " +
@@ -175,18 +180,20 @@ const en = {
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} strings`,
   statusInitializing: "Initializing translator...",
-  statusTranslatingBatch: (num: number, size: number, elapsed: number, retry?: number) =>
-    `Translating batch ${num} (${size} strings) — ${elapsed}s elapsed` +
-    (retry && retry > 1 ? ` (retry ${retry - 1}/100)` : "") +
-    (elapsed > 15 ? " (waiting for model response)" : ""),
+  statusTranslatingBatch: (_num: number, size: number, elapsed: number, retry?: number) =>
+    `Translating (${size} strings)` +
+    (elapsed > 0 ? ` — ${elapsed}s` : "") +
+    (retry && retry > 1 ? ` (retry ${retry}/100)` : "") +
+    (elapsed > 15 ? " (waiting for model)" : ""),
   // Always free at the claim gate — owned batches finish before parking here.
   statusPaused: (_num: number, _size: number) => "Paused — waiting to resume",
-  statusFinishingBatch: (num: number, size: number, elapsed: number) =>
-    `Finishing batch ${num} (${size} strings) before pause — ${elapsed}s`,
-  statusWaitingRetry: (num: number, size: number, retry: number, waitLeft: number) =>
-    `Translating batch ${num} (${size} strings) — Waiting before retry ${waitLeft}s` +
-    (retry && retry > 0 ? ` (retry ${retry}/100)` : ""),
-  statusCompletedBatch: (num: number) => `Completed batch ${num}!`,
+  statusFinishingBatch: (_num: number, size: number, elapsed: number) =>
+    `Finishing in-flight request (${size} strings) — ${elapsed}s`,
+  statusWaitingRetry: (_num: number, _size: number, _retry: number, waitLeft: number) =>
+    `Failed. Retry in ${waitLeft}s — strings kept`,
+  statusNetworkRetry: (_tryN: number, _size: number) =>
+    `Network drop. Retrying — strings kept`,
+  statusCompletedBatch: (_num: number) => `Batch done`,
   // After a successful batch: keep that fact + show RPM pacing countdown.
   statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
     batchNum

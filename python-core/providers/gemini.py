@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import httpx
 
-from .base import BaseProvider, CompletionResult, ProviderConfig, Usage
+from .base import BaseProvider, CompletionResult, ProviderConfig, Usage, http_timeout_s
 
 logger = logging.getLogger("interprex")
 
@@ -143,7 +143,7 @@ class GeminiProvider(BaseProvider):
             ]
         }
         resp = None
-        timeout = httpx.Timeout(200.0, connect=20.0)
+        timeout = httpx.Timeout(http_timeout_s(cfg), connect=20.0)
         try:
             resp = httpx.post(url, json=body, headers=headers, timeout=timeout)
             if resp.is_error:

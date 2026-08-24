@@ -43,6 +43,28 @@ class TranslateItem:
     max_lines: int = 0
 
 
+# How long we wait for one completion before WE abort the socket. 0 in config
+# means this default. NVIDIA free NIM can sit in queue past 200s — the UI
+# exposes this as "Wait, s" so the user can raise it without a rebuild.
+DEFAULT_HTTP_TIMEOUT_S = 200.0
+_MIN_HTTP_TIMEOUT_S = 10.0
+_MAX_HTTP_TIMEOUT_S = 3600.0
+
+
+def http_timeout_s(cfg: "ProviderConfig | None" = None) -> float:
+    """Read timeout for one provider POST. Connect stays short (20s) at the
+    call site; this number is how long we wait for the BODY."""
+    raw = 0.0
+    if cfg is not None:
+        try:
+            raw = float(getattr(cfg, "timeout_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            raw = 0.0
+    if raw <= 0:
+        return DEFAULT_HTTP_TIMEOUT_S
+    return max(_MIN_HTTP_TIMEOUT_S, min(_MAX_HTTP_TIMEOUT_S, raw))
+
+
 @dataclass
 class ProviderConfig:
     """Per-request config sent by the frontend. Fields used depend on provider."""
@@ -52,6 +74,8 @@ class ProviderConfig:
     model: str = ""
     num_ctx: int = 0     # Ollama: context window to allocate (0 = server default)
     free_only: bool = False
+    # Seconds to wait for one completion body. 0 = DEFAULT_HTTP_TIMEOUT_S.
+    timeout_seconds: float = 0.0
 
 
 @dataclass

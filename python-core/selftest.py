@@ -4411,9 +4411,16 @@ def check_prompt_width() -> None:
 
 def check_providers() -> None:
     from providers.openai_compat import OpenRouterProvider
-    from providers.base import ProviderConfig
+    from providers.base import ProviderConfig, http_timeout_s, DEFAULT_HTTP_TIMEOUT_S
     from unittest.mock import patch, MagicMock
     import httpx
+
+    assert http_timeout_s(None) == DEFAULT_HTTP_TIMEOUT_S
+    assert http_timeout_s(ProviderConfig()) == DEFAULT_HTTP_TIMEOUT_S
+    assert http_timeout_s(ProviderConfig(timeout_seconds=0)) == DEFAULT_HTTP_TIMEOUT_S
+    assert http_timeout_s(ProviderConfig(timeout_seconds=600)) == 600.0
+    assert http_timeout_s(ProviderConfig(timeout_seconds=5)) == 10.0  # floor
+    assert http_timeout_s(ProviderConfig(timeout_seconds=99999)) == 3600.0  # cap
 
     provider = OpenRouterProvider()
     cfg = ProviderConfig(api_key="test-key")

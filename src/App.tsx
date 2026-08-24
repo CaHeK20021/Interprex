@@ -687,6 +687,14 @@ export default function App() {
     Math.max(0, Number(loadProviderSetting("providerRpm", provider, "0")) || 0),
   );
   const [tpmLimitK, setTpmLimitK] = useState(() => loadTpmK(provider));
+  // Seconds to wait for one API reply body before WE abort. Default 200 matches
+  // the sidecar; NVIDIA free NIM can need 600–900. Per-provider.
+  const DEFAULT_HTTP_TIMEOUT = 200;
+  const [httpTimeoutS, setHttpTimeoutS] = useState(() =>
+    Math.min(3600, Math.max(10,
+      Number(loadProviderSetting("providerTimeout", provider, String(DEFAULT_HTTP_TIMEOUT))) || DEFAULT_HTTP_TIMEOUT,
+    )),
+  );
   // Live TPM ledger from the scheduler (sliding 60s, per key). Null when TPM off
   // or before the first progress event of a run.
   const [tpmMeters, setTpmMeters] = useState<
@@ -729,6 +737,7 @@ export default function App() {
     threads: number;
     baseUrl: string;
     apiKeys: string[];
+    httpTimeoutS: number;
   } | null>(null);
   const shouldRestartRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -1030,7 +1039,12 @@ export default function App() {
         p === "done" ||
         p === "error" ||
         p === "idle" ||
-        p === "resting",
+        p === "resting" ||
+        // Just-landed batch / RPM wait: worker is not starting new work.
+        // Without these, the header flipped пауза ↔ останавливаюсь every
+        // time a finishing request emitted completed_batch then parked.
+        p === "completed_batch" ||
+        p === "waiting_delay",
     );
   }, [isPaused, workerPhases]);
   const isPausing = isPaused && !isFullyPaused;
@@ -1674,6 +1688,7 @@ export default function App() {
           runSettingsRef.current.model !== model ||
           runSettingsRef.current.threads !== threads ||
           runSettingsRef.current.baseUrl !== baseUrl ||
+          runSettingsRef.current.httpTimeoutS !== httpTimeoutS ||
           JSON.stringify(runSettingsRef.current.apiKeys) !== JSON.stringify(apiKeys)
         );
         if (settingsChanged) {
@@ -1708,6 +1723,7 @@ export default function App() {
       threads,
       baseUrl,
       apiKeys: [...apiKeys],
+      httpTimeoutS,
     };
     shouldRestartRef.current = false;
     let ok = true;
@@ -1830,6 +1846,9 @@ export default function App() {
             threads: effThreads,
             delaySeconds: effDelay,
             tpmLimit: runTpmLimit,
+            timeoutSeconds: providerInfo.needsKey
+              ? Math.min(3600, Math.max(10, httpTimeoutS || DEFAULT_HTTP_TIMEOUT))
+              : 0,
             root: activeRoot ?? undefined,
             fontStyle,
             extraInstruction: extraInstruction ?? "",
@@ -2282,6 +2301,9 @@ export default function App() {
         dry_run: dryRun,
         threads: effThreads,
         delay_seconds: effDelay,
+        timeout_seconds: providerInfo.needsKey
+          ? Math.min(3600, Math.max(10, httpTimeoutS || DEFAULT_HTTP_TIMEOUT))
+          : 0,
         apply_cached_only: applyCachedOnly,
       }, (line) => {
         setPythonLogs((prev) => [...prev, line]);
@@ -2644,6 +2666,20 @@ export default function App() {
         p.try_i !== undefined ? p.try_i + 1 : 1
       ) as string;
     } else if (p.phase === "batch_error") {
+      const klass = p.error_class;
+      const raw = (p.last_error || p.status || "").toLowerCase();
+      const isNet =
+        klass === "network" ||
+        raw.includes("network") ||
+        raw.includes("connection") ||
+        raw.includes("failed to fetch") ||
+        raw.includes("не удалось подключиться");
+      if (isNet) {
+        return t("statusNetworkRetry")(
+          (p.try_i !== undefined ? p.try_i + 1 : 1),
+          p.batch_size ?? 0,
+        ) as string;
+      }
       // Live attempt failure — keep the card readable (full text is in session log).
       return (p.status || t("statusWorkerError")) as string;
     } else if (p.phase === "waiting_retry") {
@@ -3393,7 +3429,9 @@ export default function App() {
                       <span className={`worker-dot tone-${tone}`} />
                       {t("workerLabel")(i + 1)}
                     </span>
-                    <span className="worker-card-status">{msg || t("statusResting")}</span>
+                    <span className="worker-card-status" title={msg || (t("statusResting") as string)}>
+                      {msg || t("statusResting")}
+                    </span>
                   </div>
                 );
               })}
@@ -3506,6 +3544,9 @@ export default function App() {
               setThreads(Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", next, "1")) || 1)));
               setRpmLimit(Math.max(0, Number(loadProviderSetting("providerRpm", next, "0")) || 0));
               setTpmLimitK(loadTpmK(next));
+              setHttpTimeoutS(Math.min(3600, Math.max(10,
+                Number(loadProviderSetting("providerTimeout", next, String(DEFAULT_HTTP_TIMEOUT))) || DEFAULT_HTTP_TIMEOUT,
+              )));
               
               // Synchronously restore freeOnly for openrouter
               const isOp = next === "openrouter";
@@ -3671,6 +3712,26 @@ export default function App() {
                   const v = Math.min(10_000, Number(digits) || 0);
                   setTpmLimitK(v);
                   saveProviderSetting("providerTpm", provider, String(v));
+                }}
+                disabled={busy && !isFullyPaused}
+              />
+            </label>
+            <label className="field" title={t("httpTimeoutHint") as string}>
+              <span className={`control-label engine-${engine || "none"}`}>
+                <strong>{t("httpTimeout")}</strong>
+              </span>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={httpTimeoutS || ""}
+                placeholder={String(DEFAULT_HTTP_TIMEOUT)}
+                className="no-spin"
+                style={{ width: 56 }}
+                onChange={(e) => {
+                  const digits = e.target.value.replace(/[^\d]/g, "");
+                  const v = Math.min(3600, Number(digits) || 0);
+                  setHttpTimeoutS(v);
+                  if (v >= 10) saveProviderSetting("providerTimeout", provider, String(v));
                 }}
                 disabled={busy && !isFullyPaused}
               />

@@ -16,7 +16,7 @@ import httpx
 
 logger = logging.getLogger("interprex")
 
-from .base import BaseProvider, CompletionResult, ProviderConfig, Usage
+from .base import BaseProvider, CompletionResult, ProviderConfig, Usage, http_timeout_s
 
 
 class _OpenAICompat(BaseProvider):
@@ -78,8 +78,12 @@ class _OpenAICompat(BaseProvider):
             # level and under options to cover both Ollama API shapes.
             body["num_ctx"] = cfg.num_ctx
             body["options"] = {"num_ctx": cfg.num_ctx}
-        # Local models can be slow on first load; give them room.
-        resp = httpx.post(url, json=body, headers=self._headers(cfg), timeout=200)
+        # Read wait is user-tunable (NVIDIA free queue can exceed the 200s
+        # default). Connect stays 20s so a dead host fails fast.
+        resp = httpx.post(
+            url, json=body, headers=self._headers(cfg),
+            timeout=httpx.Timeout(http_timeout_s(cfg), connect=20.0),
+        )
         if resp.is_error:
             try:
                 err_data = resp.json()

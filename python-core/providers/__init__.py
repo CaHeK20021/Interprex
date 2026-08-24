@@ -27,6 +27,8 @@ from .base import (
     TranslateItem,
     TranslateResult,
     Usage,
+    http_timeout_s,
+    DEFAULT_HTTP_TIMEOUT_S,
 )
 from .openai_compat import (
     OllamaProvider,
@@ -67,6 +69,8 @@ __all__ = [
     "TranslateItem",
     "TranslateResult",
     "Usage",
+    "http_timeout_s",
+    "DEFAULT_HTTP_TIMEOUT_S",
     "REGISTRY",
     "get_provider",
     "list_providers",

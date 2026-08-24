@@ -275,6 +275,8 @@ export interface SidecarTranslateReq {
   delay_seconds?: number;
   // Tokens-per-minute cap PER KEY (0 = off). Shared by threads on that key.
   tpm_limit?: number;
+  // Seconds to wait for one completion body before WE abort. 0 = sidecar default (200).
+  timeout_seconds?: number;
   root?: string;
   engine?: string;
   // "smooth" | "pixel" — measure UI-fit against the same font inject will write.
@@ -321,6 +323,8 @@ export interface TranslateProgress {
   requests_sent?: number;
   /** Live error text for the session log (batch attempt failures). */
   last_error?: string;
+  /** "network" | "rate" | "auth" | "other" — from the sidecar retry bucket. */
+  error_class?: string;
   // Live TPM ledger (tokens/min PER KEY, sliding 60s). Present when tpm_limit > 0.
   tpm_limit?: number;
   tpm_used?: number; // spent + reserved on this worker's key
@@ -575,6 +579,8 @@ export interface TranslatePythonReq {
   threads?: number;
   /** Per-key pacing seconds (derived from RPM); 0 = none. */
   delay_seconds?: number;
+  /** Seconds to wait for one API reply body; 0 = sidecar default (200). */
+  timeout_seconds?: number;
   /** No-API: apply inline-Python translations from the cache only. Used by the
    *  writeBack path so "Write translation" lays down inline-Python from a prior
    *  full run without spending any API quota. */

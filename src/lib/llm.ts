@@ -69,6 +69,8 @@ export interface TranslateOptions {
   delaySeconds?: number;
   /** Tokens-per-minute cap PER KEY (0 = off). Threads on one key share it. */
   tpmLimit?: number;
+  /** Seconds to wait for one API reply body before we abort. 0 = sidecar default (200). */
+  timeoutSeconds?: number;
   root?: string;
   /** Font style for UI-width fitting — measure against the same font inject will
    *  write ("smooth" Noto vs "pixel" bitmap). Ren'Py menu choices only. */
@@ -108,6 +110,7 @@ export async function translateBatch(
       threads: opts.threads ?? 1,
       delay_seconds: opts.delaySeconds ?? 0,
       tpm_limit: opts.tpmLimit ?? 0,
+      timeout_seconds: opts.timeoutSeconds ?? 0,
       root: opts.root ?? "",
       engine: strings[0]?.engine ?? "",
       font_style: opts.fontStyle ?? "smooth",

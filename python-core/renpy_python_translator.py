@@ -817,6 +817,11 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
     return merged
 
 
+# How long one completion POST waits for a body. Set from --timeout-seconds in
+# main() so NVIDIA-queue hangs use the same wait as /translate.
+_HTTP_TIMEOUT_S = 200.0
+
+
 def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = None, base_url: str = None, provider: str = None) -> dict:
     # Decide the wire format. When the caller tells us the provider (the normal
     # path now does), trust it: only "gemini" speaks the native generateContent
@@ -882,7 +887,10 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
     
     for attempt in range(max_retries):
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=200)
+            resp = httpx.post(
+                url, json=body, headers=headers,
+                timeout=httpx.Timeout(_HTTP_TIMEOUT_S, connect=20.0),
+            )
             if resp.status_code == 429:
                 delay = initial_delay * (backoff_factor ** attempt)
                 logger.warning("Rate limit hit (429). Retrying in %.1f seconds...", delay)
@@ -1926,9 +1934,17 @@ def main(args_list=None):
     parser.add_argument("--provider", type=str, default=None, help="Provider id (gemini / openrouter / ollama / ...); decides the wire format, not the URL")
     parser.add_argument("--threads", type=int, default=4, help="Parallel workers PER KEY (total = threads x keys)")
     parser.add_argument("--delay-seconds", type=float, default=0.0, help="Per-key pacing: a request occupies at least this many seconds")
+    parser.add_argument("--timeout-seconds", type=float, default=0.0, help="Seconds to wait for one API reply body; 0 = 200")
     parser.add_argument("--apply-cached-only", action="store_true", help="No API: apply inline-Python translations from the cache only (used by writeBack)")
 
     args = parser.parse_args(args_list)
+
+    global _HTTP_TIMEOUT_S
+    try:
+        _to = float(args.timeout_seconds or 0)
+    except (TypeError, ValueError):
+        _to = 0.0
+    _HTTP_TIMEOUT_S = 200.0 if _to <= 0 else max(10.0, min(3600.0, _to))
 
     # Parse the key list: prefer --api-keys (JSON array, else comma-split), falling
     # back to the legacy single --api-key. Deduped/collapsed by _build_key_list.

@@ -210,6 +210,9 @@ class TranslateReq(BaseModel):
     # the prompt text + output reserve and shares a 60s window across threads on
     # that key so a free-tier 16k TPM model is not blown by parallel fat batches.
     tpm_limit: int = 0
+    # Seconds to wait for one completion body before WE abort the socket.
+    # 0 = sidecar default (200). NVIDIA free NIM can sit in queue longer.
+    timeout_seconds: float = 0.0
     free_only: bool = False
     # Font style for UI-width fitting: the translation is measured against the
     # SAME font inject will write ("smooth" Noto vs "pixel" bitmap) so the budget
@@ -2068,6 +2071,8 @@ class RenpyPythonReq(BaseModel):
     threads: int = 4
     # Per-key pacing seconds (derived from RPM in the UI); 0 = no pacing.
     delay_seconds: float = 0.0
+    # Seconds to wait for one completion body; 0 = sidecar default (200).
+    timeout_seconds: float = 0.0
     # No-API: apply inline-Python translations from the cache only. Used by the
     # writeBack path so "Write translation" lays down inline-Python (blog, status,
     # search history) from a prior full run without spending any API quota.
@@ -2094,6 +2099,7 @@ def renpy_translate_python(req: RenpyPythonReq) -> StreamingResponse:
         "--target-lang", req.target_lang,
         "--threads", str(req.threads),
         "--delay-seconds", str(req.delay_seconds),
+        "--timeout-seconds", str(req.timeout_seconds),
     ]
     # Pass ALL keys as a JSON array (survives keys containing commas); fall back to
     # the legacy single key for old callers.

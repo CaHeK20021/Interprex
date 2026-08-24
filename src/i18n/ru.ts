@@ -89,6 +89,11 @@ const ru: Strings = {
     "поэтому повторы соблюдают тот же темп.)",
   tpmLimit: "TPM, K/мин",
   tpmNoLimit: "нет",
+  httpTimeout: "Ждать, сек",
+  httpTimeoutHint:
+    "Сколько секунд ждать ОДИН ответ API, потом обрываем сокет сами. " +
+    "Это наш лимит, не их — NVIDIA free Gemma может висеть в очереди минутами. " +
+    "По умолчанию 200. От 10 до 3600.",
   tpmLimitHint:
     "Лимит токенов в минуту НА КЛЮЧ в тысячах (K). Пиши 16 = 16 000 ток/мин " +
     "(бесплатный Gemini). Приложение оценивает пакет по тексту; потоки одного " +
@@ -173,18 +178,20 @@ const ru: Strings = {
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} строк`,
   statusInitializing: "Инициализация переводчика...",
-  statusTranslatingBatch: (num: number, size: number, elapsed: number, retry?: number) =>
-    `Перевод пакета ${num} (${size} строк) — прошло ${elapsed} сек.` +
+  statusTranslatingBatch: (_num: number, size: number, elapsed: number, retry?: number) =>
+    `Перевод (${size} строк)` +
+    (elapsed > 0 ? ` — ${elapsed} сек` : "") +
     (retry && retry > 1 ? ` (попытка ${retry}/100)` : "") +
-    (elapsed > 15 ? " (ожидание ответа модели)" : ""),
+    (elapsed > 15 ? " (ждём модель)" : ""),
   // Always free at the claim gate — owned batches finish before parking here.
   statusPaused: (_num: number, _size: number) => "Пауза — жду продолжения",
-  statusFinishingBatch: (num: number, size: number, elapsed: number) =>
-    `Дописываю пакет ${num} (${size} строк) перед паузой — ${elapsed} сек.`,
-  statusWaitingRetry: (num: number, size: number, retry: number, waitLeft: number) =>
-    `Перевод пакета ${num} (${size} строк) — Ожидание перед повтором ${waitLeft} сек.` +
-    (retry && retry > 0 ? ` (попытка ${retry}/100)` : ""),
-  statusCompletedBatch: (num: number) => `Пакет ${num} успешно переведен!`,
+  statusFinishingBatch: (_num: number, size: number, elapsed: number) =>
+    `Дописываю текущий запрос (${size} строк) — ${elapsed} сек`,
+  statusWaitingRetry: (_num: number, _size: number, _retry: number, waitLeft: number) =>
+    `Сбой. Повтор через ${waitLeft}с — строки целы`,
+  statusNetworkRetry: (_tryN: number, _size: number) =>
+    `Сеть отвалилась. Повтор — строки целы`,
+  statusCompletedBatch: (_num: number) => `Пакет готов`,
   // After a successful batch: keep that fact + show RPM pacing countdown.
   statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
     batchNum

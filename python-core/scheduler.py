@@ -148,6 +148,8 @@ def _reached_server(msg: str) -> bool:
         "connect timeout", "connecterror", "name or service not known",
         "getaddrinfo", "dns", "ssl", "max retries exceeded",
         "terminated without result",
+        "network", "winerror", "10054", "10053", "10060",
+        "reset by peer", "broken pipe", "unreachable",
     )
     return not any(k in m for k in connection_markers)
 
@@ -373,6 +375,10 @@ class TranslationScheduler:
         # Tokens-per-minute cap PER KEY (0 = off). Shared by all threads on that
         # key via a sliding 60s ledger; independent across keys.
         self.tpm_limit = max(0, int(getattr(req, "tpm_limit", 0) or 0))
+        # ONE calibrator for the whole run. A per-worker Calibrator left every
+        # thread "cold" on the first burst (5× default chars/token) so TPM
+        # reserved 2k while Gemini billed 5k → 429 with the cap "respected".
+        self.cal = Calibrator(req.target_lang)
 
         # --- shared state, all guarded by self.cond -----------------------------
         self.cond = threading.Condition()
@@ -404,14 +410,13 @@ class TranslationScheduler:
         self.tok_in = 0
         self.tok_out = 0
         self.batches = 0
-        # Per-worker batch numbering for the UI grid. `batch_seq` is a monotonic
-        # ticket handed out at each claim; `worker_batch_no[worker_idx]` is the
-        # number the worker currently owns, so each thread's card shows ITS batch
-        # (thread 1 → batch 1, thread 2 → batch 2, …) instead of all cards sharing
-        # one global count. A reclaimed/failed-over batch gets a fresh higher
-        # number when another worker re-claims it.
+        # Per-worker batch numbering for the UI grid. `batch_seq` is a global
+        # monotonic ticket (logging). `worker_batch_no` is THIS worker's Nth
+        # claim (1, 2, 3…) — a global 4→81 on the same card looked like the
+        # thread was jumping around. Failover re-claim just increments again.
         self.batch_seq = 0
         self.worker_batch_no: dict[int, int] = {}
+        self.worker_claim_n: dict[int, int] = {}
         # Count of requests that REACHED the provider (success + error responses),
         # for the OpenRouter daily-quota readout. Connection failures don't count.
         self.requests_sent = 0
@@ -494,23 +499,27 @@ class TranslationScheduler:
 
     # -- TPM (tokens-per-minute) pacing, per key --------------------------------
 
-    def _est_batch_tokens(self, batch: list, cal: Calibrator) -> int:
+    def _est_batch_tokens(self, batch: list, cal: Calibrator | None = None) -> int:
         """Pre-send estimate of total tokens this batch will cost (input+output).
 
         Built from the exact prompt we will send: Calibrator chars/token (refined
         from real usage after the first batch) × (1 + out_ratio) with a small
         safety margin. Output is reserved, never measured — the translation does
         not exist yet. Used only for TPM gating; packing still uses input_budget.
+        Always reads the SHARED run calibrator so thread 5 inherits thread 1's
+        first usage sample instead of staying on language defaults.
         """
         prompt = build_prompt(
             batch, self.req.target_lang, self.req.glossary,
             self.req.engine, getattr(self.req, "extra_instruction", "") or "",
         )
-        prompt_tok = max(1, cal.est_tokens(prompt))
-        out_ratio = max(0.1, float(cal.out_ratio))
+        c = cal if cal is not None else self.cal
+        with self.cond:
+            prompt_tok = max(1, c.est_tokens(prompt))
+            out_ratio = max(0.1, float(c.out_ratio))
+            samples = int(getattr(c, "_samples", 0) or 0)
         # Cold start (no usage samples yet): pad harder so concurrent threads
         # cannot under-reserve and dump the free-tier TPM in one burst.
-        samples = int(getattr(cal, "_samples", 0) or 0)
         safety = _TPM_EST_SAFETY_COLD if samples <= 0 else _TPM_EST_SAFETY
         return max(1, int(prompt_tok * (1.0 + out_ratio) * safety))
 
@@ -565,6 +574,12 @@ class TranslationScheduler:
         """Wall-clock time when `est` tokens fit under this key's TPM, or `now`."""
         if self.tpm_limit <= 0:
             return now
+        # Cold start: serialize the FIRST send per key until we have a real
+        # usage sample. Five threads each reserving a default estimate is how
+        # 16k TPM still 429'd on Gemini's denser tokenizer.
+        if int(getattr(self.cal, "_samples", 0) or 0) <= 0:
+            if int(self.key_token_reserved.get(key, 0) or 0) > 0:
+                return now + 0.15
         used = self._tpm_used_locked(key, now)
         # A single batch larger than the whole minute budget: only fire when the
         # key is idle — we cannot stay under the cap, but we can avoid stacking.
@@ -694,10 +709,7 @@ class TranslationScheduler:
         last_emit_key: tuple | None = None
         waiting_since: float | None = None
         while not self._is_aborted():
-            while self.should_pause() and not self._is_aborted():
-                self._emit(worker_idx, "paused", status="Paused")
-                time.sleep(0.5)
-            if self._is_aborted():
+            if not self._park_while_paused(worker_idx):
                 return False
             with self.cond:
                 if worker_key in self.dead_keys:
@@ -817,14 +829,12 @@ class TranslationScheduler:
                 with self.cond:
                     if self.aborted or worker_key in self.dead_keys:
                         return (_DONE, None)
-                self._emit(
+                if not self._park_while_paused(
                     worker_idx,
-                    "paused",
-                    status="Paused",
                     batch_num=self.worker_batch_no.get(worker_idx, 0),
                     batch_size=0,
-                )
-                time.sleep(0.5)
+                ):
+                    return (_DONE, None)
                 continue
 
             with self.cond:
@@ -929,10 +939,12 @@ class TranslationScheduler:
                             pass
                     self.in_flight += 1
                     self.in_flight_workers.add(worker_idx)
-                    # Hand this worker its own batch ticket so its grid card shows a
-                    # distinct number (not the shared global `self.batches`).
+                    # Per-worker Nth claim (1, 2, 3…) for the card. Global
+                    # batch_seq jumps 4→81 on one thread and looks like a bug.
                     self.batch_seq += 1
-                    self.worker_batch_no[worker_idx] = self.batch_seq
+                    n = self.worker_claim_n.get(worker_idx, 0) + 1
+                    self.worker_claim_n[worker_idx] = n
+                    self.worker_batch_no[worker_idx] = n
                     return (_CLAIM, (fname, batch))
             # Inner loop broke only for pause re-check → outer gate.
 
@@ -945,6 +957,7 @@ class TranslationScheduler:
             api_key=worker_key,
             model=self.req.model,
             num_ctx=self.req.max_context_tokens,
+            timeout_seconds=float(getattr(self.req, "timeout_seconds", 0) or 0),
         )
         exact = self.provider.count_tokens(
             build_prompt(batch, self.req.target_lang, self.req.glossary,
@@ -1078,6 +1091,7 @@ class TranslationScheduler:
             api_key=worker_key,
             model=req.model,
             num_ctx=req.max_context_tokens,
+            timeout_seconds=float(getattr(req, "timeout_seconds", 0) or 0),
         )
         prompt_chars = len(build_prompt(batch, req.target_lang, req.glossary,
                                         req.engine, req.extra_instruction))
@@ -1135,7 +1149,6 @@ class TranslationScheduler:
                 # the main batch.
                 reask_tok = self._enforce_char_limits(batch, batch_tr, cfg)
 
-                cal.observe(prompt_chars, tr.usage)
                 actual_tok = int(tr.usage.billed_tokens() or 0) + int(reask_tok or 0)
                 if tpm_held:
                     # Prefer exact usage; fall back to the pre-send estimate if
@@ -1146,6 +1159,8 @@ class TranslationScheduler:
                     )
                     tpm_held = False
                 with self.cond:
+                    # Observe under the lock: this is the SHARED calibrator.
+                    cal.observe(prompt_chars, tr.usage)
                     self.tok_in += tr.usage.prompt_tokens
                     self.tok_out += tr.usage.completion_tokens
                     self.batches += 1
@@ -1170,11 +1185,21 @@ class TranslationScheduler:
                 # only terminal ones (so 429 spam / auth / parse fail is visible
                 # mid-run without opening interprex.log).
                 bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
+                reached = _reached_server(err_str)
+                kind = _classify_error(err_str)
+                err_class = "network" if not reached else kind
+                net_status = (
+                    f"Network drop (try {try_i + 1}/{BATCH_TRIES}) — "
+                    f"same batch will retry, strings are kept"
+                    if err_class == "network"
+                    else f"Batch error (try {try_i + 1}): {err_str[:220]}"
+                )
                 self._emit(
                     worker_idx,
                     "batch_error",
-                    status=f"Batch error (try {try_i + 1}): {err_str[:220]}",
+                    status=net_status,
                     last_error=err_str[:800],
+                    error_class=err_class,
                     batch_num=bnum,
                     batch_size=len(batch),
                     try_i=try_i,
@@ -1201,7 +1226,6 @@ class TranslationScheduler:
                         self.batches += 1
                     return ({}, False, True)
 
-                kind = _classify_error(err_str)
                 if kind == "auth":
                     # An invalid/expired key won't fix itself this run. Give it a
                     # couple of grace tries (a 401 can be a transient edge blip),
@@ -1503,6 +1527,24 @@ class TranslationScheduler:
 
     # -- pause / pacing helpers -------------------------------------------------
 
+    def _park_while_paused(self, worker_idx: int, **extra) -> bool:
+        """Emit `paused` ONCE, then sleep until Continue/abort.
+
+        Spamming the event every 0.5s made every card (and the header) flip
+        пауза ↔ дописываю ↔ resting as React reapplied the same phase. Sleep
+        still ticks so Continue is noticed immediately.
+        Returns False if aborted.
+        """
+        if not self.should_pause() or self._is_aborted():
+            return not self._is_aborted()
+        extra.setdefault("status", "Paused")
+        extra.setdefault("batch_num", self.worker_batch_no.get(worker_idx, 0))
+        extra.setdefault("batch_size", extra.get("batch_size", 0))
+        self._emit(worker_idx, "paused", **extra)
+        while self.should_pause() and not self._is_aborted():
+            time.sleep(0.5)
+        return not self._is_aborted()
+
     def _wait_if_paused_before_retry(self, worker_idx, batch, next_try_i: int) -> bool:
         """If pause is on after a batch failure, hold until Continue (or abort).
 
@@ -1513,22 +1555,17 @@ class TranslationScheduler:
         """
         if not self.should_pause() or self._is_aborted():
             return not self._is_aborted()
-        bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
-        while self.should_pause() and not self._is_aborted():
-            self._emit(
-                worker_idx,
-                "paused",
-                status=(
-                    f"Paused after error — press Continue to retry "
-                    f"(try {next_try_i + 1}/{BATCH_TRIES})"
-                ),
-                batch_num=bnum,
-                batch_size=len(batch),
-                try_i=max(0, next_try_i - 1),
-                last_error=None,
-            )
-            time.sleep(0.5)
-        return not self._is_aborted()
+        return self._park_while_paused(
+            worker_idx,
+            status=(
+                f"Paused after error — press Continue to retry "
+                f"(try {next_try_i + 1}/{BATCH_TRIES})"
+            ),
+            batch_num=self.worker_batch_no.get(worker_idx, self.batch_seq + 1),
+            batch_size=len(batch),
+            try_i=max(0, next_try_i - 1),
+            last_error=None,
+        )
 
     def _retry_sleep(self, worker_idx, batch, try_i, start_time, min_wait=0.0,
                      stagger=0.0) -> None:
@@ -1596,9 +1633,8 @@ class TranslationScheduler:
         while not self._is_aborted():
             # Pause: park only. Do NOT move `target` forward — wall-clock is the
             # ground truth for provider RPM.
-            while self.should_pause() and not self._is_aborted():
-                self._emit(worker_idx, "paused", status="Paused")
-                time.sleep(0.5)
+            if not self._park_while_paused(worker_idx):
+                return
             remaining = target - time.time()
             if remaining <= 0:
                 return
@@ -1623,13 +1659,17 @@ class TranslationScheduler:
 
     def _initial_stagger(self, worker_idx: int) -> None:
         """Sleep before the very first claim so threads on the same key don't
-        all fire at t=0. Each thread gets a small offset (≤1s per thread) to
-        spread the initial burst, but never more than 2s total."""
+        all fire at t=0.
+
+        Spacing = delay_seconds / threads — the same interval the UI's RPM cap
+        implies (5 threads, 40 RPM, delay=7.5s → 0 / 1.5 / 3 / 4.5 / 6s).
+        A 2s cap used to bunch threads 2..N at t=2, which is a 3-request burst
+        and the usual "I set 40 RPM and still 429" first-second.
+        """
         if self.delay_seconds <= 0 or self.threads <= 1:
             return
         rank = worker_idx % self.threads
-        # Cap stagger at 2s total so the last thread doesn't wait ages.
-        offset = min(2.0, rank * min(1.0, self.delay_seconds / self.threads))
+        offset = self.delay_seconds * rank / self.threads
         if offset <= 0:
             return
         start = time.time()
@@ -1640,7 +1680,9 @@ class TranslationScheduler:
             time.sleep(min(1.0, remaining))
 
     def worker_loop(self, worker_idx: int, worker_key: str) -> None:
-        cal = Calibrator(self.req.target_lang)
+        # Shared run calibrator — see self.cal. Do NOT construct a per-thread
+        # one: the first burst then all use language defaults and under-reserve.
+        cal = self.cal
         # Per-thread stagger offset within the key group. Threads on the same
         # key fire at stagger, stagger+delay, stagger+2*delay, … so they're
         # always spaced by delay/threads seconds — not all at once.
