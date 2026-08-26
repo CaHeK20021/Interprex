@@ -180,19 +180,24 @@ const en = {
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} strings`,
   statusInitializing: "Initializing translator...",
+  // Attempt sits BEFORE seconds so a 1-digit→2-digit tick / ellipsis can't
+  // swallow "retry N" every other second (it used to hang off the end).
   statusTranslatingBatch: (_num: number, size: number, elapsed: number, retry?: number) =>
     `Translating (${size} strings)` +
-    (elapsed > 0 ? ` — ${elapsed}s` : "") +
-    (retry && retry > 1 ? ` (retry ${retry}/100)` : "") +
-    (elapsed > 15 ? " (waiting for model)" : ""),
+    (retry && retry > 1 ? ` · retry ${retry}` : "") +
+    (elapsed > 0 ? ` · ${elapsed}s` : ""),
   // Always free at the claim gate — owned batches finish before parking here.
   statusPaused: (_num: number, _size: number) => "Paused — waiting to resume",
   statusFinishingBatch: (_num: number, size: number, elapsed: number) =>
     `Finishing in-flight request (${size} strings) — ${elapsed}s`,
-  statusWaitingRetry: (_num: number, _size: number, _retry: number, waitLeft: number) =>
-    `Failed. Retry in ${waitLeft}s — strings kept`,
-  statusNetworkRetry: (_tryN: number, _size: number) =>
-    `Network drop. Retrying — strings kept`,
+  statusWaitingRetry: (_num: number, _size: number, retry: number, waitLeft: number) =>
+    `Failed. Retry in ${waitLeft}s` +
+    (retry && retry > 1 ? ` · retry ${retry}` : "") +
+    ` — strings kept`,
+  statusNetworkRetry: (tryN: number, _size: number) =>
+    `Network drop. Retrying` +
+    (tryN && tryN > 1 ? ` · retry ${tryN}` : "") +
+    ` — strings kept`,
   statusCompletedBatch: (_num: number) => `Batch done`,
   // After a successful batch: keep that fact + show RPM pacing countdown.
   statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
@@ -206,14 +211,17 @@ const en = {
     batchNum?: number,
     _free?: number,
     _est?: number,
-  ) =>
-    waitLeft > 0
+    retry?: number,
+  ) => {
+    const attempt = retry && retry > 1 ? ` · retry ${retry}` : "";
+    return waitLeft > 0
       ? batchNum
-        ? `Batch ${batchNum} — TPM wait ${waitLeft}s`
-        : `TPM wait ${waitLeft}s`
+        ? `Batch ${batchNum} — TPM wait ${waitLeft}s${attempt}`
+        : `TPM wait ${waitLeft}s${attempt}`
       : batchNum
-        ? `Batch ${batchNum} — waiting for TPM slot`
-        : `Waiting for TPM slot`,
+        ? `Batch ${batchNum} — waiting for TPM slot${attempt}`
+        : `Waiting for TPM slot${attempt}`;
+  },
   statusResting: "Resting (waiting for work)",
   statusWorkerError: "Key failed",
   pyStatusWaiting: "Waiting...",

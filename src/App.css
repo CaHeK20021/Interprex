@@ -1497,12 +1497,9 @@ input[type="range"]::-webkit-slider-thumb:active {
 .worker-card-status {
   font-size: 12px;
   line-height: 1.25;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  white-space: nowrap;
   overflow: hidden;
-  white-space: normal;
-  word-break: break-word;
+  text-overflow: ellipsis;
 }
 /* Status dot — the at-a-glance traffic light per thread. */
 .worker-dot {

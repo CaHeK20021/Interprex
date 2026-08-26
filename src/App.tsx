@@ -176,9 +176,20 @@ function classifySessionError(raw: string): { key: string; label: string } {
   if (
     m.includes("connect") ||
     m.includes("timeout") ||
+    m.includes("timed out") ||
     m.includes("network") ||
     m.includes("dns") ||
-    m.includes("не удалось подключиться")
+    m.includes("не удалось подключиться") ||
+    m.includes("winerror") ||
+    m.includes("10054") ||
+    m.includes("10053") ||
+    m.includes("10060") ||
+    m.includes("ssl") ||
+    m.includes("handshake") ||
+    m.includes("unexpected_eof") ||
+    m.includes("reset by peer") ||
+    m.includes("broken pipe") ||
+    m.includes("принудительно")
   ) {
     return { key: "network", label: "Network / timeout — request never completed" };
   }
@@ -219,6 +230,36 @@ function writeOrUsageCount(total: number): number {
   saveSetting("openrouterUsageDate", utcDay());
   saveSetting("openrouterUsageCount", String(safe));
   return safe;
+}
+
+/** Phases that mean "this worker is done with the owned batch" — drop try_i so
+ *  the next claim doesn't inherit "попытка 2" from the previous one. */
+const WORKER_TRY_RESET = new Set([
+  "completed_batch",
+  "resting",
+  "done",
+  "waiting_delay",
+  "error",
+  "idle",
+]);
+
+/** Merge a live NDJSON event into the last snapshot for THAT worker.
+ *  Elapsed ticks and TPM/retry waits often omit try_i; rebuilding the card
+ *  from the raw event made "попытка 2" blink off every other second. */
+function mergeWorkerEvent(
+  prev: TranslateProgress | undefined,
+  p: TranslateProgress,
+): TranslateProgress {
+  const resetTry = p.phase ? WORKER_TRY_RESET.has(p.phase) : false;
+  return {
+    ...prev,
+    ...p,
+    try_i: resetTry ? p.try_i : (p.try_i ?? prev?.try_i),
+    batch_size: p.batch_size ?? prev?.batch_size,
+    batch_num: p.batch_num ?? prev?.batch_num,
+    elapsed: p.elapsed ?? (resetTry ? undefined : prev?.elapsed),
+    error_class: p.error_class ?? prev?.error_class,
+  };
 }
 
 // Rows per page. A big game has thousands of strings; putting them all in the
@@ -1020,6 +1061,9 @@ export default function App() {
   // Live translation progress (strings done / total), null when not translating.
   const [progress, setProgress] = useState<TranslateProgress | null>(null);
   const [keyStatuses, setKeyStatuses] = useState<Record<number, string>>({});
+  // Last per-worker progress snapshot. Status text is formatted FROM this, not
+  // from the raw event, so omitted try_i/elapsed on a tick can't blink the card.
+  const workerSnapRef = useRef<Record<number, TranslateProgress>>({});
   // Models the chosen backend can serve, and which one it has loaded right now.
   // Populated from the sidecar so the user picks instead of typing the name.
   const [models, setModels] = useState<string[]>([]);
@@ -1351,6 +1395,7 @@ export default function App() {
     setPhase("idle");
     setProgress(null);
     setInjectProgress(null);
+    workerSnapRef.current = {};
     setKeyStatuses({});
     setWorkerPhases({});
     setIsPaused(false);
@@ -1798,6 +1843,7 @@ export default function App() {
         translations: {},
         status: "Initializing...",
       });
+      workerSnapRef.current = {};
       setKeyStatuses({ 0: "Initializing..." });
       setWorkerPhases({ 0: "initializing" });
       // Seed the TPM panel IMMEDIATELY when a cap is set for this run — do not
@@ -1864,40 +1910,47 @@ export default function App() {
               totalUnique,
               initialDone + (p.done ?? 0),
             );
+            const wi = p.worker_idx ?? p.key_idx;
+            const snap = wi !== undefined
+              ? mergeWorkerEvent(workerSnapRef.current[wi], p)
+              : p;
+            if (wi !== undefined) {
+              workerSnapRef.current[wi] = snap;
+            }
             setProgress((prev) => ({
               done: Math.max(prev?.done ?? 0, incomingDone),
               total: totalUnique,
               batches: Math.max(prev?.batches ?? 0, p.batches ?? 0),
               translations: p.translations ?? {},
-              status: p.status,
-              phase: p.phase,
+              status: snap.status,
+              phase: snap.phase,
               // batch_num etc. are for local single-worker status text only;
               // cloud multi-thread hides them on the main bar (needsKey branch)
               // and shows them on worker cards via setKeyStatuses below.
-              batch_num: p.batch_num,
-              batch_size: p.batch_size,
-              try_i: p.try_i,
-              elapsed: p.elapsed,
-              worker_idx: p.worker_idx ?? p.key_idx,
-              key_idx: p.key_idx,
-              wait_left: p.wait_left,
+              batch_num: snap.batch_num,
+              batch_size: snap.batch_size,
+              try_i: snap.try_i,
+              elapsed: snap.elapsed,
+              worker_idx: snap.worker_idx ?? snap.key_idx,
+              key_idx: snap.key_idx,
+              wait_left: snap.wait_left,
               requests_sent: Math.max(
                 prev?.requests_sent ?? 0,
                 p.requests_sent ?? 0,
               ),
-              last_error: p.last_error,
+              last_error: snap.last_error,
+              error_class: snap.error_class,
             }));
-            const wi = p.worker_idx ?? p.key_idx;
             if (wi !== undefined) {
               setKeyStatuses((prev) => ({
                 ...prev,
-                [wi]: getProgressStatusText(p),
+                [wi]: getProgressStatusText(snap),
               }));
-              if (p.phase) {
-                setWorkerPhases((prev) => ({ ...prev, [wi]: p.phase! }));
+              if (snap.phase) {
+                setWorkerPhases((prev) => ({ ...prev, [wi]: snap.phase! }));
               }
-            } else if (p.status) {
-              setKeyStatuses({ 0: p.status });
+            } else if (snap.status) {
+              setKeyStatuses({ 0: snap.status });
             }
             // Live TPM meter ONLY when this run actually has a cap. Empty TPM
             // field → tpm_limit 0 → never show a bar (was polluting NVIDIA Build
@@ -1985,6 +2038,7 @@ export default function App() {
           controller.signal,
         );
         setProgress(null);
+        workerSnapRef.current = {};
         setKeyStatuses({});
         setWorkerPhases({});
         setIsPaused(false);
@@ -2079,6 +2133,7 @@ export default function App() {
         setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
         setProgress(null);
         setInjectProgress(null);
+        workerSnapRef.current = {};
         setKeyStatuses({});
         setWorkerPhases({});
         setIsPaused(false);
@@ -2663,7 +2718,7 @@ export default function App() {
         p.batch_num ?? 1,
         p.batch_size ?? 0,
         p.elapsed ?? 0,
-        p.try_i !== undefined ? p.try_i + 1 : 1
+        p.try_i !== undefined ? p.try_i + 1 : undefined
       ) as string;
     } else if (p.phase === "batch_error") {
       const klass = p.error_class;
@@ -2701,7 +2756,8 @@ export default function App() {
         p.wait_left ?? 0,
         p.batch_num,
         p.tpm_free,
-        p.tpm_est
+        p.tpm_est,
+        p.try_i !== undefined ? p.try_i + 1 : undefined,
       ) as string;
     } else if (p.phase === "resting") {
       return t("statusResting") as string;

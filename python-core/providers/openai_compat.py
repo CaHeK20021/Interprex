@@ -16,7 +16,10 @@ import httpx
 
 logger = logging.getLogger("interprex")
 
-from .base import BaseProvider, CompletionResult, ProviderConfig, Usage, http_timeout_s
+from .base import (
+    BaseProvider, CompletionResult, ProviderConfig, Usage,
+    get_http_client, http_timeout_s,
+)
 
 
 class _OpenAICompat(BaseProvider):
@@ -80,7 +83,9 @@ class _OpenAICompat(BaseProvider):
             body["options"] = {"num_ctx": cfg.num_ctx}
         # Read wait is user-tunable (NVIDIA free queue can exceed the 200s
         # default). Connect stays 20s so a dead host fails fast.
-        resp = httpx.post(
+        # Pooled client: reuse the TLS session (httpx.post() handshakes every
+        # call — OpenRouter then shows handshake timeout / 10054 / EOF).
+        resp = get_http_client().post(
             url, json=body, headers=self._headers(cfg),
             timeout=httpx.Timeout(http_timeout_s(cfg), connect=20.0),
         )
@@ -242,6 +247,12 @@ class OpenRouterProvider(_OpenAICompat):
     name = "openrouter"
     default_base_url = "https://openrouter.ai/api/v1"
     sends_num_ctx = False
+    # OpenRouter ranks unidentified traffic lower / tighter. These are the
+    # headers they document (HTTP-Referer + X-Title); real APIs ignore extras.
+    extra_headers = {
+        "HTTP-Referer": "https://github.com/CaHeK20021/interprex",
+        "X-Title": "Interprex",
+    }
 
     def list_models(self, cfg: ProviderConfig) -> list[str]:
         import re

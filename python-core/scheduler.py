@@ -150,6 +150,11 @@ def _reached_server(msg: str) -> bool:
         "terminated without result",
         "network", "winerror", "10054", "10053", "10060",
         "reset by peer", "broken pipe", "unreachable",
+        # Handshake / TLS drop — never a completed HTTP response. Do NOT add
+        # a bare "timed out": httpx ReadTimeout means the POST already left
+        # and OpenRouter still bills the daily free request.
+        "handshake", "unexpected_eof",
+        "принудительно",
     )
     return not any(k in m for k in connection_markers)
 
@@ -691,7 +696,8 @@ class TranslationScheduler:
         )
         return kept
 
-    def _wait_tpm(self, worker_idx: int, worker_key: str, est: int) -> bool:
+    def _wait_tpm(self, worker_idx: int, worker_key: str, est: int,
+                  try_i: int | None = None) -> bool:
         """Block until this key's TPM window can absorb `est` tokens, then reserve.
 
         Returns False if aborted / key died (no reserve held). Pause parks without
@@ -744,6 +750,13 @@ class TranslationScheduler:
                     emit_key = ("slot", free // 1000)
                 if emit_key != last_emit_key:
                     last_emit_key = emit_key
+                    extra = dict(
+                        wait_left=wait_left,
+                        batch_num=bnum,
+                        tpm_est=est,
+                    )
+                    if try_i is not None:
+                        extra["try_i"] = try_i
                     self._emit(
                         worker_idx,
                         "waiting_tpm",
@@ -756,9 +769,7 @@ class TranslationScheduler:
                                 else f"waiting slot for ~{est} tok (free {free})..."
                             )
                         ),
-                        wait_left=wait_left,
-                        batch_num=bnum,
-                        tpm_est=est,
+                        **extra,
                     )
             # Sleep the remainder (capped) so we recheck soon when a sibling
             # unreserves; never a flat 1s that would re-lockstep threads.
@@ -1116,7 +1127,7 @@ class TranslationScheduler:
             # wait until this key's 60s window has room, reserve so siblings on
             # the same key cannot over-book. Other keys are unaffected.
             est_tokens = self._est_batch_tokens(batch, cal)
-            if not self._wait_tpm(worker_idx, worker_key, est_tokens):
+            if not self._wait_tpm(worker_idx, worker_key, est_tokens, try_i=try_i):
                 return ({}, False, False)
             tpm_held = self.tpm_limit > 0
             self._emit(
@@ -1271,10 +1282,20 @@ class TranslationScheduler:
                             if self.delay_seconds > 0
                             else _RATE_COOLDOWN_NO_RPM_S
                         )
+                    elif not reached:
+                        # 10054 / SSL handshake drop recovers, but N threads
+                        # retrying in lockstep 8s later re-slam a dying path
+                        # (and often the next error is 429). Same stagger as
+                        # rate; shorter floor than the TPM-only 20s.
+                        rate_floor = (
+                            self.delay_seconds
+                            if self.delay_seconds > 0
+                            else float(_RETRY_BACKOFF_FIRST)
+                        )
                     floor = rate_floor
-                    if kind == "rate" and rate_floor > 0:
-                        # The failed request still consumed a quota slot, so
-                        # the cooldown starts from NOW — siblings honour it.
+                    if rate_floor > 0:
+                        # Rate: the failed request spent a quota slot.
+                        # Network: the path is sick — siblings wait too.
                         with self.cond:
                             self.key_cooldown[worker_key] = max(
                                 self.key_cooldown.get(worker_key, 0.0),

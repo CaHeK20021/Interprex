@@ -406,6 +406,7 @@ export async function translateViaSidecar(
         wait_left: evt.wait_left,
         requests_sent: evt.requests_sent,
         last_error: evt.last_error,
+        error_class: evt.error_class,
         tpm_limit: evt.tpm_limit,
         tpm_used: evt.tpm_used,
         tpm_spent: evt.tpm_spent,

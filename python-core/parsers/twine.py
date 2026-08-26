@@ -42,6 +42,39 @@ def get_attr(attrs_str, attr_name):
 def escape_twine(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
 
+
+# SugarCube macros whose quoted args we inspect. Which index is actually
+# translatable is decided by _macro_quote_translatable — passage names and
+# CSS selectors must stay verbatim or the engine looks up a missing passage.
+_QUOTE_MACROS = (
+    "button", "dialog", "link", "print", "notify",
+    "append", "prepend", "replace",
+)
+
+
+def _macro_quote_translatable(macro_name: str, q_idx: int) -> bool:
+    """Return whether quoted-arg `q_idx` of `<<macro_name ...>>` is display text.
+
+    Load-bearing: SugarCube `<<button "Leave" "Downtown">>` / `<<link "Go" "Home">>`
+    take the FIRST quoted string as the visible caption and the SECOND as a
+    passage identifier. Translating the second makes the engine look up a
+    passage that does not exist (Clean Slate: "Downtown" → "Центр города").
+    Inject must refuse those slots even if a stale translation exists.
+    `<<replace "#sel">>` / append / prepend take a CSS selector, not prose.
+    """
+    name = macro_name.lower()
+    if name in ("button", "link"):
+        return q_idx == 0
+    if name in ("append", "prepend", "replace"):
+        return False
+    if name == "dialog":
+        # First quoted arg is the title; a second one is classNames.
+        return q_idx == 0
+    if name in ("print", "notify"):
+        return True
+    return False
+
+
 class TwineParser(BaseParser):
     engine = "twine"
 
@@ -49,7 +82,10 @@ class TwineParser(BaseParser):
         return (
             "ENGINE RULES:\n"
             "This is a Twine/SugarCube game. You will translate story text and UI choices.\n"
-            "DO NOT translate target link names, variables (starting with $), or macro code.\n"
+            "DO NOT translate passage names, link targets, variables (starting with $), or macro code.\n"
+            "In <<button \"label\" \"passage\">> and <<link \"label\" \"passage\">> only the first "
+            "string is visible text; the second is a passage identifier and must stay unchanged.\n"
+            "Same for [[Label|Passage]] — translate Label only, never Passage.\n"
             "Keep formatting, tags, and special characters exactly intact.\n"
         )
 
@@ -129,9 +165,11 @@ class TwineParser(BaseParser):
                         words = body_unescaped.split()
                         if words:
                             macro_name = words[0].lower()
-                            if macro_name in ("button", "dialog", "link", "print", "notify", "append", "prepend", "replace"):
+                            if macro_name in _QUOTE_MACROS:
                                 quotes = re.findall(r'"([^"]*)"|\'([^\']*)\'', body_unescaped)
                                 for q_idx, (q1, q2) in enumerate(quotes):
+                                    if not _macro_quote_translatable(macro_name, q_idx):
+                                        continue
                                     val = q1 or q2
                                     val = val.strip()
                                     if val and re.search(r'[a-zA-Zа-яА-Я]', val) and not val.startswith('$'):
@@ -259,11 +297,13 @@ class TwineParser(BaseParser):
                         words = body_unescaped.split()
                         if words:
                             macro_name = words[0].lower()
-                            if macro_name in ("button", "dialog", "link", "print", "notify", "append", "prepend", "replace"):
+                            if macro_name in _QUOTE_MACROS:
                                 quotes = list(re.finditer(r'"([^"]*)"|\'([^\']*)\'', body_unescaped))
                                 new_body = body_unescaped
                                 has_macro_changes = False
                                 for q_idx in reversed(range(len(quotes))):
+                                    if not _macro_quote_translatable(macro_name, q_idx):
+                                        continue
                                     m = quotes[q_idx]
                                     val = m.group(1) or m.group(2)
                                     str_id = make_id(self.engine, rel_file, [f"passage:{name}", f"token:{idx}", f"macro_str:{q_idx}"], val.strip())

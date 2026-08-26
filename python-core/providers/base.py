@@ -16,6 +16,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+
+import httpx
 
 logger = logging.getLogger("interprex")
 from abc import ABC, abstractmethod
@@ -49,6 +52,30 @@ class TranslateItem:
 DEFAULT_HTTP_TIMEOUT_S = 200.0
 _MIN_HTTP_TIMEOUT_S = 10.0
 _MAX_HTTP_TIMEOUT_S = 3600.0
+
+
+# Shared pool so cloud POSTs reuse TLS sessions. Bare httpx.post() does a NEW
+# TCP+TLS handshake every call — that is handshake timeout / UNEXPECTED_EOF /
+# WinError 10054 under OpenRouter load (and from flaky/DPI networks).
+_http_lock = threading.Lock()
+_http_client: httpx.Client | None = None
+
+
+def get_http_client() -> httpx.Client:
+    """Process-wide httpx client (thread-safe). trust_env is forced False by
+    the Client.__init__ patch in providers/__init__.py."""
+    global _http_client
+    with _http_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.Client(
+                transport=httpx.HTTPTransport(retries=2),
+                limits=httpx.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=40,
+                    keepalive_expiry=30.0,
+                ),
+            )
+        return _http_client
 
 
 def http_timeout_s(cfg: "ProviderConfig | None" = None) -> float:

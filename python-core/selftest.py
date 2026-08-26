@@ -3113,6 +3113,104 @@ def check_qsp() -> None:
     assert parity == "f12b6e6f", f"qsp id parity drifted: {parity}"
 
 
+def build_twine_project() -> str:
+    """Tiny SugarCube HTML: a Start passage with a two-arg <<button>> whose
+    second argument is a passage name, a 1-arg button, a <<link>>, a bare
+    [[Passage]] link, a [[Label|Passage]] link, a <<replace>> selector, and
+    a <<goto>>. Real Tweego HTML-escapes macro bodies; we do the same.
+    """
+    root = tempfile.mkdtemp(prefix="interprex_twine_selftest_")
+    html = (
+        "<!DOCTYPE html><html><body>\n"
+        '<tw-storydata name="CleanTest" startnode="1" creator="Tweego" '
+        'format="SugarCube" format-version="2.36.1">\n'
+        '<tw-passagedata pid="1" name="Start" tags="">Hello there\n'
+        "&lt;&lt;button &quot;Skip intro&quot; &quot;Downtown&quot;&gt;&gt;\n"
+        "[[City Park]]\n"
+        "[[Go home|Home]]\n"
+        "&lt;&lt;replace &quot;#box&quot;&gt;&gt;inside&lt;&lt;/replace&gt;&gt;\n"
+        "&lt;&lt;link &quot;Open&quot; &quot;Downtown&quot;&gt;&gt;\n"
+        "&lt;&lt;button &quot;Just a label&quot;&gt;&gt;\n"
+        "&lt;&lt;goto &quot;Downtown&quot;&gt;&gt;\n"
+        "</tw-passagedata>\n"
+        '<tw-passagedata pid="2" name="Downtown" tags="">You are downtown.</tw-passagedata>\n'
+        '<tw-passagedata pid="3" name="City Park" tags="">Park text.</tw-passagedata>\n'
+        '<tw-passagedata pid="4" name="Home" tags="">Home text.</tw-passagedata>\n'
+        "</tw-storydata>\n"
+        "</body></html>\n"
+    )
+    with open(os.path.join(root, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+    return root
+
+
+def check_twine() -> None:
+    root = build_twine_project()
+    src = os.path.join(root, "index.html")
+
+    assert detect_engine(root) == "twine", f"twine detect failed: {detect_engine(root)}"
+    p = get_parser("twine")
+
+    strings = p.extract(root)
+    originals = [s.original for s in strings]
+    # Passage names, button/link 2nd args, CSS selectors, and <<goto>> targets
+    # are identifiers — they must never be extracted.
+    assert "Downtown" not in originals, originals
+    assert "Home" not in originals, originals
+    assert "#box" not in originals, originals
+    for must in (
+        "Hello there", "Skip intro", "City Park", "Go home",
+        "inside", "Open", "Just a label",
+        "You are downtown.", "Park text.", "Home text.",
+    ):
+        assert must in originals, f"missing {must!r} in {originals}"
+
+    skip = next(s for s in strings if s.original == "Skip intro")
+    assert skip.path[-1] == "macro_str:0", skip.path
+    open_s = next(s for s in strings if s.original == "Open")
+    assert open_s.path[-1] == "macro_str:0", open_s.path
+    go = next(s for s in strings if s.original == "Go home")
+    assert go.path[-1] == "link_label", go.path
+    park = next(s for s in strings if s.original == "City Park")
+    assert park.path[-1] == "link_target", park.path
+
+    ids1 = {s.id for s in strings}
+    ids2 = {s.id for s in p.extract(root)}
+    assert ids1 == ids2, "twine ids not stable across runs"
+
+    tr = {s.id: s.original.upper() for s in strings}
+    # Stale translation of the passage name (the Clean Slate bug): inject
+    # must refuse it even if project.json still has the row.
+    poison_id = make_id(
+        "twine", skip.file, skip.path[:-1] + ["macro_str:1"], "Downtown",
+    )
+    tr[poison_id] = "Центр города"
+    written = p.inject(root, tr)
+    assert written == 4, f"twine written={written}"
+
+    after = open(src, encoding="utf-8").read()
+    assert 'name="Downtown"' in after, after
+    assert "&quot;Downtown&quot;" in after, after
+    assert "Центр города" not in after, after
+    assert "&quot;SKIP INTRO&quot;" in after, after
+    assert "&quot;JUST A LABEL&quot;" in after, after
+    assert "&quot;OPEN&quot;" in after, after
+    assert "[[CITY PARK|City Park]]" in after, after
+    assert "[[GO HOME|Home]]" in after, after
+    assert "&quot;#box&quot;" in after, after
+    assert "&lt;&lt;goto &quot;Downtown&quot;&gt;&gt;" in after, after
+    assert "HELLO THERE" in after, after
+    assert "YOU ARE DOWNTOWN." in after, after
+
+    assert skip.path == ["passage:Start", "token:1", "macro_str:0"], skip.path
+    parity = make_id(
+        "twine", "index.html", ["passage:Start", "token:1", "macro_str:0"],
+        "Skip intro",
+    )
+    assert skip.id == parity, f"twine skip id {skip.id} != {parity}"
+    assert parity == "544e1102", f"twine id parity drifted: {parity}"
+
+
 def build_unreal_project() -> str:
     root = tempfile.mkdtemp(prefix="interprex_unreal_selftest_")
     loc_dir = os.path.join(root, "Localization", "INT")
@@ -4411,7 +4509,7 @@ def check_prompt_width() -> None:
 
 def check_providers() -> None:
     from providers.openai_compat import OpenRouterProvider
-    from providers.base import ProviderConfig, http_timeout_s, DEFAULT_HTTP_TIMEOUT_S
+    from providers.base import ProviderConfig, http_timeout_s, DEFAULT_HTTP_TIMEOUT_S, get_http_client
     from unittest.mock import patch, MagicMock
     import httpx
 
@@ -4424,6 +4522,15 @@ def check_providers() -> None:
 
     provider = OpenRouterProvider()
     cfg = ProviderConfig(api_key="test-key")
+    # OpenRouter ranks unidentified traffic lower; we send the documented
+    # app headers on every request (via extra_headers → _headers).
+    hdrs = provider._headers(cfg)
+    assert hdrs.get("HTTP-Referer", "").startswith("https://github.com/"), \
+        "OpenRouter HTTP-Referer missing"
+    assert hdrs.get("X-Title") == "Interprex"
+    c1 = get_http_client()
+    c2 = get_http_client()
+    assert c1 is c2 and not c1.is_closed, "provider HTTP client must be reused"
 
     mock_resp1 = MagicMock()
     mock_resp1.status_code = 200
@@ -4546,6 +4653,28 @@ def check_scheduler() -> None:
     assert scheduler._classify_error("Error code: 401 - Unauthorized") == "auth"
     assert scheduler._classify_error("429 Too Many Requests") == "rate"
     assert scheduler._classify_error("parse hiccup in batch") == "other"
+
+    # Quota vs free: an HTTP error response spent the request; a TCP/TLS drop
+    # never arrived. Real OpenRouter log: 429 mixed with 10054 / handshake / EOF.
+    assert scheduler._reached_server("429 Too Many Requests") is True
+    assert scheduler._reached_server(
+        "API error (429): Provider returned error"
+    ) is True
+    assert scheduler._reached_server(
+        "[WinError 10054] Удаленный хост принудительно разорвал "
+        "существующее подключение"
+    ) is False
+    assert scheduler._reached_server(
+        "_ssl.c:1063: The handshake operation timed out"
+    ) is False
+    assert scheduler._reached_server(
+        "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation "
+        "of protocol (_ssl.c:1081)"
+    ) is False
+    # ReadTimeout: the POST already left — still counts as reached.
+    assert scheduler._reached_server(
+        "httpx.ReadTimeout: The read operation timed out"
+    ) is True
 
     saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
              scheduler._RATE_COOLDOWN_NO_RPM_S, scheduler.get_provider)
@@ -6645,6 +6774,7 @@ def main() -> int:
     check_fusion()
     check_mmf2()
     check_qsp()
+    check_twine()
     root = build_project()
     data_map = os.path.join(root, "data", "Map001.json")
 
@@ -6696,7 +6826,7 @@ def main() -> int:
     check_unreal4_5_inherited()
     check_unreal4_5_bytepatch()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
     return 0
 
 

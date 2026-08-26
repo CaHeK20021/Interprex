@@ -50,7 +50,7 @@ Tauri (thin Rust shell)         src-tauri/    window + launches the sidecar
 | `src/lib/settings.ts` | persisted prefs (localStorage): UI lang, target lang, provider config, max context |
 | `src/i18n/` | UI localization: `en.ts`/`ru.ts` (same keys, enforced by `Strings` type), `index.ts` store + `t()` |
 | `python-core/main.py` | sidecar endpoints: ping, detect, extract, inject, detect_mods (with game_root resolution), providers, translate, validate, autofix, backup/*, fs/* |
-| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity` + `unity_sources` multi-source registry, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`, `unreal4_5`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
+| `python-core/parsers/` | `base.py` (`BaseParser`, `make_id`, `read_backup_original`), per-engine modules (`rpgmaker`, `renpy`, `csharp`, `unity` + `unity_sources` multi-source registry, `i18n`, `fusion`, `mmf2`, `qsp`, `unreal`, `unreal4`, `unreal4_5`, `twine`), container readers (`rpa` for Ren'Py archives, `pak` for UE4/5), `__init__.py` registry |
 | `python-core/providers/` | `base.py` (provider ABC, prompt, parse, **Calibrator**, batching), `openai_compat.py` (Ollama + LM Studio), `gemini.py`, registry |
 | `python-core/validators/` | post-translation validators (`get_validator(engine)`); `renpy.py` `ast.parse`-checks `python:`/`$` blocks — catches a broken translated literal WITHOUT the `renpy` binary (works on a Steam player's machine) |
 | `python-core/uasset-extractor/` | C# tool (`Program.cs`, UAssetAPI) compiled to `python-core/bin/UAssetExtractor.exe`. Extracts translatable strings from `.uasset` files for ContentLib patching. |
@@ -621,6 +621,14 @@ the full app only to *see* it.
     loose plugins at folder root AND foldered mods. Verified on
     Apocalypse/Ordinator/RDO/Wyrmstooth/RaceMenu + synthetic selftest.
     FO4/`.ba2` is a separate future engine.
+  - **Twine/SugarCube** (`twine`, compiled `index.html` with `<tw-passagedata>`):
+    extract story text + button/link LABELS. Passage names (`name=` and the
+    second quoted arg of `<<button "label" "Passage">>` / `<<link>>`) are
+    identifiers — translating them makes the engine look up a missing
+    passage (`Error: the passage "Центр города" does not exist`, Clean Slate
+    `"Downtown"`). Bare `[[Passage]]` injects as `[[label|Passage]]` so the
+    display can change without moving the target. `<<replace "#sel">>` selectors
+    are skipped. Guard: `check_twine` (incl. stale-translation refuse).
 - Sidecar (FastAPI) + IPC seam + project store + minimal UI.
 - i18n (en + ru), language switcher, persisted prefs.
 - LLM translation via pluggable providers (Ollama, LM Studio, Gemini), batched
@@ -659,7 +667,7 @@ the full app only to *see* it.
    glossary that feeds every prompt.
 4. **More engines** (each = one `BaseParser` subclass + registry line + `Engine`
    union entry): done so far — Ren'Py, RPG Maker, C#/DLL, Unity (UnityPy), i18n
-   JSON, Fusion/Chowdren, MMF2, QSP, Unreal Engine 3 (.INT), Unreal Engine 4/5
+   JSON, Fusion/Chowdren, MMF2, QSP, Twine/SugarCube, Unreal Engine 3 (.INT), Unreal Engine 4/5
    (.locres), Skyrim SE (`.esp`/`.esm`/`.esl`). Next candidates: Skyrim BSA +
    MCM Interface/Translations, Fallout 4 (shared ESP core + BA2 + TERM/OMOD),
    Godot (.tres/.tscn), GameMaker (JSON).

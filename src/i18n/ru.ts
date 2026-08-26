@@ -178,19 +178,24 @@ const ru: Strings = {
   progressLabel: (done: number, total: number) =>
     `${done} / ${total} строк`,
   statusInitializing: "Инициализация переводчика...",
+  // Attempt sits BEFORE seconds so a 1-digit→2-digit tick / ellipsis can't
+  // swallow "попытка N" every other second (it used to hang off the end).
   statusTranslatingBatch: (_num: number, size: number, elapsed: number, retry?: number) =>
     `Перевод (${size} строк)` +
-    (elapsed > 0 ? ` — ${elapsed} сек` : "") +
-    (retry && retry > 1 ? ` (попытка ${retry}/100)` : "") +
-    (elapsed > 15 ? " (ждём модель)" : ""),
+    (retry && retry > 1 ? ` · попытка ${retry}` : "") +
+    (elapsed > 0 ? ` · ${elapsed} сек` : ""),
   // Always free at the claim gate — owned batches finish before parking here.
   statusPaused: (_num: number, _size: number) => "Пауза — жду продолжения",
   statusFinishingBatch: (_num: number, size: number, elapsed: number) =>
     `Дописываю текущий запрос (${size} строк) — ${elapsed} сек`,
-  statusWaitingRetry: (_num: number, _size: number, _retry: number, waitLeft: number) =>
-    `Сбой. Повтор через ${waitLeft}с — строки целы`,
-  statusNetworkRetry: (_tryN: number, _size: number) =>
-    `Сеть отвалилась. Повтор — строки целы`,
+  statusWaitingRetry: (_num: number, _size: number, retry: number, waitLeft: number) =>
+    `Сбой. Повтор через ${waitLeft}с` +
+    (retry && retry > 1 ? ` · попытка ${retry}` : "") +
+    ` — строки целы`,
+  statusNetworkRetry: (tryN: number, _size: number) =>
+    `Сеть отвалилась. Повтор` +
+    (tryN && tryN > 1 ? ` · попытка ${tryN}` : "") +
+    ` — строки целы`,
   statusCompletedBatch: (_num: number) => `Пакет готов`,
   // After a successful batch: keep that fact + show RPM pacing countdown.
   statusWaitingDelay: (waitLeft: number, batchNum?: number) =>
@@ -204,14 +209,17 @@ const ru: Strings = {
     batchNum?: number,
     _free?: number,
     _est?: number,
-  ) =>
-    waitLeft > 0
+    retry?: number,
+  ) => {
+    const attempt = retry && retry > 1 ? ` · попытка ${retry}` : "";
+    return waitLeft > 0
       ? batchNum
-        ? `Пакет ${batchNum} — ждём TPM ${waitLeft} сек`
-        : `Ждём TPM ${waitLeft} сек`
+        ? `Пакет ${batchNum} — ждём TPM ${waitLeft} сек${attempt}`
+        : `Ждём TPM ${waitLeft} сек${attempt}`
       : batchNum
-        ? `Пакет ${batchNum} — ждём слот TPM`
-        : `Ждём слот TPM`,
+        ? `Пакет ${batchNum} — ждём слот TPM${attempt}`
+        : `Ждём слот TPM${attempt}`;
+  },
   statusResting: "Отдыхает (ждёт работу)",
   statusWorkerError: "Ключ не сработал",
   pyStatusWaiting: "Ожидание...",
