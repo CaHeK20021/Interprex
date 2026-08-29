@@ -250,6 +250,15 @@ leaves valid specs and `%%` byte-verbatim, idempotent), applied at inject to `tr
 to inline-Python `new` strings (never `old`). Verified: engine lint 3→0 actionable on
 Killer Chat; `check_renpy` %-format case in `selftest.py`.
 
+**Text-tag repair** (`_repair_text_tags`, applied at inject before newline-match):
+the LLM also mangles Ren'Py `{tag}` markup. Three deterministic cases, all no-API:
+(1) corrupted close name `{i}…{/iR}` → `{/i}`; (2) nested order `{i}{b}…{/i}{/b}` →
+`{/b}{/i}`; (3) wholly wrong close name `{i}…{/color}` → `{i}…{/i}` (real engine-lint:
+"Close text tag '{/color}' does not match open text tag '{i}'"). Case (3) only snaps
+when BOTH names are known paired tags (`i`/`b`/`color`/`size`/…) so a stray `{/i}`
+after standalone `{w=0.5}` stays verbatim. Custom/unknown tags are never guessed.
+Idempotent. Guard: `check_renpy` text-tag repair cases in `selftest.py`.
+
 **Stray-newline fixup** (`_match_newlines`, applied at inject right after
 `_repair_text_tags`): the LLM often collapses a 2-line source to one line but leaves
 the trailing `\n` (`"I DIDN'T SIGN UP\nFOR THIS"` → `"Я НА ЭТО НЕ ПОДПИСЫВАЛСЯ\n"`).

@@ -1073,6 +1073,15 @@ def check_renpy_risk() -> None:
     assert _rt("{i}{b}Умрёт.{/i}{/b}") == "{i}{b}Умрёт.{/b}{/i}"
     assert _rt("Он женится. {w}{i}{b}Умрёт.{/i}{/b}") == "Он женится. {w}{i}{b}Умрёт.{/b}{/i}"
     assert _rt("{i}{b}{u}text{/i}{/b}{/u}") == "{i}{b}{u}text{/u}{/b}{/i}"
+    # Wrong close-tag NAME (LLM opened `{i}` but closed `{/color}`). Real
+    # engine-lint: "Close text tag '{/color}' does not match open text tag '{i}'".
+    assert _rt("{i}Теперь ты можешь попросить Химари{/color}") == \
+        "{i}Теперь ты можешь попросить Химари{/i}"
+    assert _rt("{color=#fff}red{/i}") == "{color=#fff}red{/color}"
+    assert _rt("{i}{b}both{/color}") == "{i}{b}both{/b}{/i}"
+    assert _rt("{w}{i}wait then italic{/color}") == "{w}{i}wait then italic{/i}"
+    # Extra correct close after the wrong one is dropped as already-closed.
+    assert _rt("{i}x{/color}{/i}") == "{i}x{/i}"
     # VALID markup is left byte-verbatim (no false positives).
     for ok in ("{i}hi{/i}", "plain text", "{size=+4}big{/size}",
                "{b}{i}x{/i}{/b}", "text{/}", "{w=0.5}wait", "no tags at all"):
@@ -1080,8 +1089,12 @@ def check_renpy_risk() -> None:
     # Ambiguous / unmatched close we CAN'T safely guess -> leave verbatim, never crash.
     assert _rt("{w=0.5}wait{/i}weird") == "{w=0.5}wait{/i}weird"
     assert _rt("no close {i}open") == "no close {i}open"
+    # Unknown/custom names: don't guess a snap.
+    assert _rt("{i}x{/custom}") == "{i}x{/custom}"
+    assert _rt("{custom}x{/color}") == "{custom}x{/color}"
     # Idempotent: re-running never re-mangles a fixed string.
-    for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain", "{i}{b}test.{/i}{/b}"):
+    for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain",
+              "{i}{b}test.{/i}{/b}", "{i}x{/color}", "{color=#fff}red{/i}"):
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 

@@ -788,11 +788,25 @@ def _escape_bad_percent(s: str) -> str:
 # A single Ren'Py text tag: capture the leading "/" (closing) and the body.
 _TEXT_TAG_RE = re.compile(r'\{(/?)([^{}]*)\}')
 
+# Paired style tags the engine expects to nest LIFO. Standalones ({w}/{p}/{nw}/
+# {clear}/{image}/…) are NOT in this set — a stray `{/i}` after `{w=0.5}` must
+# stay verbatim; we only snap a WRONG close name when both sides are known.
+_PAIRED_TEXT_TAGS = frozenset({
+    "a", "alpha", "alt", "art", "b", "color", "cps", "font", "i", "k",
+    "outlinecolor", "plain", "rb", "rt", "s", "shader", "size", "u",
+})
+
+
+def _is_paired_text_tag(name: str) -> bool:
+    return bool(name) and name.lower() in _PAIRED_TEXT_TAGS
+
 
 def _repair_text_tags(s: str) -> str:
     """Fix a closing text tag whose name the LLM corrupted by appending junk —
     e.g. `{i}…{/iR}` -> `{i}…{/i}`, or fix invalid tag nesting order:
-    e.g. `{i}{b}…{/i}{/b}` -> `{i}{b}…{/b}{/i}`.
+    e.g. `{i}{b}…{/i}{/b}` -> `{i}{b}…{/b}{/i}`, or a wholly wrong close name:
+    e.g. `{i}…{/color}` -> `{i}…{/i}` (real engine-lint: close `{/color}` does
+    not match open `{i}`).
 
     Ren'Py matches a closing tag `{/name}` against the most-recently-opened tag of
     the same name (LIFO). We walk the string keeping a stack of open tag names.
@@ -802,6 +816,9 @@ def _repair_text_tags(s: str) -> str:
        closing tags later.
     2. If it starts with the top tag name (LLM corrupted name: open `i` / close `iR`),
        we snap it back to the open tag name.
+    3. If both the close and an unmatched open are known paired tags (`i`/`color`/
+       `b`/…), replace the wrong close with the proper LIFO closes. Custom or
+       standalone tags stay byte-verbatim (so `{w=0.5}wait{/i}` is untouched).
     Conservative: anything else is left byte-verbatim. Idempotent."""
     if "{" not in s:
         return s
@@ -883,6 +900,20 @@ def _repair_text_tags(s: str) -> str:
                     matched_early = next((k for k in early_closed if early_closed[k] > 0 and name.startswith(k) and len(k) > 0), None)
                     if matched_early:
                         early_closed[matched_early] -= 1
+                        changed = True
+                    elif (_is_paired_text_tag(name)
+                          and any(_is_paired_text_tag(t) for t in open_stack)):
+                        # LLM swapped the close-tag name entirely: `{i}…{/color}`.
+                        # Replace that close with the proper LIFO closes of every
+                        # still-open paired tag. Standalones on the stack ({w})
+                        # are popped without emitting a close.
+                        closes: list[str] = []
+                        while open_stack:
+                            popped = open_stack.pop()
+                            if _is_paired_text_tag(popped):
+                                closes.append("{/%s}" % popped)
+                                early_closed[popped] += 1
+                        out.append("".join(closes))
                         changed = True
                     else:
                         out.append(m.group(0))
