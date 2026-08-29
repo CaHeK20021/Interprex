@@ -55,15 +55,32 @@ echo  [2/2] Building Tauri app (Rust compiles on first run - ~10 min)...
 call npm run tauri build
 if errorlevel 1 ( echo  [ERROR] Tauri build failed. & pause & exit /b 1 )
 
-:: --- 6. Done --------------------------------------------------------------
+:: --- 6. Copy exe next to this bat -----------------------------------------
+set "EXE="
+if defined CARGO_TARGET_DIR if exist "%CARGO_TARGET_DIR%\release\interprex.exe" set "EXE=%CARGO_TARGET_DIR%\release\interprex.exe"
+if not defined EXE if exist "%LOCALAPPDATA%\cargo-target\release\interprex.exe" set "EXE=%LOCALAPPDATA%\cargo-target\release\interprex.exe"
+if not defined EXE if exist "src-tauri\target\release\interprex.exe" set "EXE=%CD%\src-tauri\target\release\interprex.exe"
+
+if defined EXE (
+    copy /Y "%EXE%" "%~dp0interprex.exe" >nul
+)
+
+set "BUNDLE="
+if defined CARGO_TARGET_DIR if exist "%CARGO_TARGET_DIR%\release\bundle" set "BUNDLE=%CARGO_TARGET_DIR%\release\bundle"
+if not defined BUNDLE if exist "%LOCALAPPDATA%\cargo-target\release\bundle" set "BUNDLE=%LOCALAPPDATA%\cargo-target\release\bundle"
+if not defined BUNDLE if exist "src-tauri\target\release\bundle" set "BUNDLE=%CD%\src-tauri\target\release\bundle"
+
 echo.
 echo  ==========================================
 echo   BUILD COMPLETE
 echo  ==========================================
 echo.
-echo  Installer is in:
-echo    src-tauri\target\release\bundle\msi\
-echo    src-tauri\target\release\bundle\nsis\
-echo.
-explorer src-tauri\target\release\bundle
+echo  App:
+echo    %~dp0interprex.exe
+if defined BUNDLE (
+    echo  Installer:
+    echo    %BUNDLE%\nsis\
+    echo    %BUNDLE%\msi\
+    explorer "%BUNDLE%"
+)
 pause

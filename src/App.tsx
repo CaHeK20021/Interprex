@@ -3042,7 +3042,13 @@ export default function App() {
   }, [strings, selectedIds]);
 
   return (
-    <main className="app">
+    <main className={`app engine-${engine || "none"}`}>
+      <div className="app-atmosphere" aria-hidden="true">
+        <div className="app-orb app-orb-a" />
+        <div className="app-orb app-orb-b" />
+        <div className="app-orb app-orb-c" />
+        <div className="app-grain" />
+      </div>
       <UpdateOverlay onStateChange={setUpdateBusyTracked} />
 
       {selectedIds.size > 0 && (
@@ -3098,8 +3104,13 @@ export default function App() {
 
       <header className="topbar">
         <div className="brand">
-          <h1 className={`brand-title engine-${engine || "none"}`}>Interprex</h1>
-          <span className="tagline">{t("appTagline")}</span>
+          <span className="brand-mark" aria-hidden="true">
+            <span className="brand-mark-core" />
+          </span>
+          <div className="brand-text">
+            <h1 className={`brand-title engine-${engine || "none"}`}>Interprex</h1>
+            <span className="tagline">{t("appTagline")}</span>
+          </div>
         </div>
 
         <div className={`mode-switcher engine-${engine || "none"}`}>
@@ -3307,7 +3318,11 @@ export default function App() {
             </div>
           </label>
         )}
-        <button onClick={() => handleTranslate()} disabled={translateDisabled}>
+        <button
+          className="btn-primary btn-translate"
+          onClick={() => handleTranslate()}
+          disabled={translateDisabled}
+        >
           {t("translate")}
         </button>
         {activeRoot && !busy && (
