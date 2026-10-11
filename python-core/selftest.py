@@ -500,8 +500,8 @@ def check_renpy_font() -> None:
     #       first fix swapped in place but didn't register the clone.)
     assert trans_fn is _mock_translate_string, \
         "translate_string must stay the SAME object (rebind breaks pickle/saves)"
-    _clone = (trans_fn.__kwdefaults__ or {}).get("_orig")
-    assert _clone is not None, "patched translate_string must hold the clone in _orig kwdefault"
+    _clone = getattr(_Renpy.translation, "_interprex_orig_translate_string", None)
+    assert _clone is not None, "patched translate_string must register clone on renpy.translation"
     assert _clone is not trans_fn, "clone must be a distinct object from the patched fn"
     # Mirror pickle.save_global: the clone must be findable by name on its module
     # AND resolve to itself. The mock's `renpy.translation` is _Translation; the
@@ -529,7 +529,7 @@ def check_renpy_font() -> None:
         "August": "Август", "September": "Сентябрь", "October": "Октябрь",
         "November": "Ноябрь", "December": "Декабрь",
     }
-    _wrap_map = (trans_fn.__kwdefaults__ or {}).get("_lookup") or {}
+    _wrap_map = getattr(_Renpy.translation, "_ix_month_lookup", None) or {}
     for _en, _ru in _ru_months.items():
         assert _wrap_map.get(_en) == _ru, (
             f"month map missing/wrong for {_en!r}: got {_wrap_map.get(_en)!r}, want {_ru!r}"
@@ -543,7 +543,7 @@ def check_renpy_font() -> None:
     # Simplest robust check: the regex+map substitution must turn the English
     # month into Russian (word-bounded, so "Mar" inside "March" is NOT touched).
     import re as _re_chk
-    _mre = (trans_fn.__kwdefaults__ or {}).get("_mre")
+    _mre = getattr(_Renpy.translation, "_ix_month_re", None)
     assert _mre is not None, "month regex must be built for a non-English target"
     _sub = _mre.sub(lambda mm: _wrap_map.get(mm.group(0), mm.group(0)), "December 01, 2024")
     assert _sub == "Декабрь 01, 2024", f"date localization failed: {_sub!r}"
@@ -583,7 +583,7 @@ def check_renpy_font() -> None:
     # Restore deletes the generated font file (registered type=created).
     from main import backup_restore, BackupRestoreReq
     res = backup_restore(BackupRestoreReq(root=root))
-    assert res == {"success": True}, res
+    assert res.get("success") is True, res
     assert not os.path.exists(fp), "_interprex_font.rpy was NOT deleted on restore"
 
 
