@@ -3,7 +3,7 @@
 // the user pick a directory in the app's own look. Built to degrade gracefully —
 // a locked/empty/vanished folder shows an empty list, never a dead end.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listDir, homeDir, fsShortcuts, type FsEntry, type FsShortcut } from "./lib/ipc";
 import { useT } from "./i18n";
 
@@ -49,24 +49,38 @@ interface Props {
   remember?: boolean;
   onRememberChange?: (val: boolean) => void;
   rememberTooltip?: string;
+  sidecarUp?: boolean | null;
 }
 
-export default function FolderPicker({ engineClass, startPath, onPick, onClose, remember, onRememberChange, rememberTooltip }: Props) {
+export default function FolderPicker({ engineClass, startPath, onPick, onClose, remember, onRememberChange, rememberTooltip, sidecarUp }: Props) {
   const { t } = useT();
   const [cwd, setCwd] = useState(""); // "" = drive list
   const [parent, setParent] = useState<string | null>(null);
   const [isRoot, setIsRoot] = useState(true);
   const [entries, setEntries] = useState<FsEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [sidecarStarting, setSidecarStarting] = useState(sidecarUp !== true);
   const [manual, setManual] = useState("");
   const [shortcuts, setShortcuts] = useState<FsShortcut[]>([]);
   const [homePath, setHomePath] = useState("");
   const [drives, setDrives] = useState<FsEntry[]>([]);
   const listRef = useRef<HTMLDivElement>(null);
   const pastedRef = useRef(false);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
 
-  // Load a directory. An invalid path makes the sidecar fall back to the drive
-  // list, so we just reflect whatever it returns.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+    };
+  }, []);
+
   // Esc closes; Backspace navigates up if not typing in an input field; Enter on the manual field navigates to it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -84,9 +98,37 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, parent]);
 
-  // Load a directory. An invalid path makes the sidecar fall back to the drive
-  // list, so we just reflect whatever it returns.
-  async function go(path: string) {
+  const loadSidebar = useCallback(async () => {
+    try {
+      const [d, sc, home] = await Promise.allSettled([
+        listDir(""),
+        fsShortcuts(),
+        homeDir(),
+      ]);
+      if (!mountedRef.current) return;
+      if (d.status === "fulfilled" && d.value.is_root) {
+        setDrives(d.value.entries);
+      }
+      if (sc.status === "fulfilled") {
+        setShortcuts(sc.value.shortcuts);
+      }
+      if (home.status === "fulfilled") {
+        setHomePath(home.value.path);
+      }
+    } catch {}
+  }, []);
+
+  // Load a directory. If the sidecar is still booting up (fetch fails / ECONNREFUSED),
+  // automatically retry polling every 350ms up to 25 times (~9 sec) without failing to an empty list.
+  async function go(path: string, isRetry = false) {
+    if (!isRetry) {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      retryCountRef.current = 0;
+    }
+
     let targetPath = path.trim();
     const lower = targetPath.toLowerCase();
     if (lower === "steam") {
@@ -98,10 +140,12 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
     setLoading(true);
     try {
       const r = await listDir(targetPath);
+      if (!mountedRef.current) return;
       setCwd(r.path);
       setParent(r.parent);
       setIsRoot(r.is_root);
       setEntries(r.entries);
+      setSidecarStarting(false);
       
       if (r.path === "steam_games_library") {
         setManual("Steam");
@@ -112,17 +156,50 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
       }
       
       if (listRef.current) listRef.current.scrollTop = 0;
-    } catch {
-      // Total failure (sidecar down): show an empty drive list rather than crash.
+      setLoading(false);
+
+      if (drives.length === 0 || shortcuts.length === 0) {
+        void loadSidebar();
+      }
+    } catch (err: any) {
+      if (!mountedRef.current) return;
+      const msg = String(err?.message || err || "");
+      const isConnError = msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("fetch failed") || !msg;
+
+      if (isConnError && retryCountRef.current < 25) {
+        setSidecarStarting(true);
+        setLoading(true);
+        retryCountRef.current++;
+        retryTimerRef.current = setTimeout(() => {
+          if (mountedRef.current) {
+            void go(targetPath, true);
+          }
+        }, 350);
+        return;
+      }
+
+      // Total failure after retries: show an empty drive list rather than crash.
+      setSidecarStarting(false);
       setEntries([]);
       setIsRoot(true);
       setCwd("");
       setParent(null);
       setManual("");
-    } finally {
       setLoading(false);
     }
   }
+
+  // When sidecar becomes ready, immediately reload
+  useEffect(() => {
+    if (sidecarUp) {
+      setSidecarStarting(false);
+      void loadSidebar();
+      if (entries.length === 0) {
+        void go(cwd || startPath || "");
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sidecarUp]);
 
   // Checks if the given path is active (case-insensitive and ignore trailing slashes)
   function isPathActive(targetPath: string) {
@@ -135,10 +212,12 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
 
   // Initial: start at the provided path, else home, else drives.
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       let start = startPath || "";
       try {
         const home = await homeDir();
+        if (cancelled) return;
         setHomePath(home.path);
         if (!start) {
           start = home.path;
@@ -146,21 +225,14 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
       } catch {
         if (!start) start = "";
       }
-      await go(start);
+      if (!cancelled) {
+        await go(start);
+      }
     })();
-    // Fetch drives on mount
-    listDir("")
-      .then((r) => {
-        if (r.is_root) {
-          setDrives(r.entries);
-        }
-      })
-      .catch(() => {});
-    // Game-launcher quick-jumps (Steam first, then Epic, then others — the
-    // sidecar already returns them in that priority order).
-    fsShortcuts()
-      .then((r) => setShortcuts(r.shortcuts))
-      .catch(() => setShortcuts([]));
+    void loadSidebar();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -277,7 +349,7 @@ export default function FolderPicker({ engineClass, startPath, onPick, onClose, 
           {/* listing */}
           <div className="fp-list" ref={listRef}>
             {loading ? (
-              <div className="fp-empty">{t("fpLoading")}</div>
+              <div className="fp-empty">{sidecarStarting ? t("fpStartingEngine") : t("fpLoading")}</div>
             ) : entries.length === 0 ? (
               <div className="fp-empty">{isRoot ? t("fpNoDrives") : t("fpEmpty")}</div>
             ) : (

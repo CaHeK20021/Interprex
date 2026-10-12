@@ -42,6 +42,7 @@ const en = {
   fpDrives: "Drives",
   fpUp: "Up one level",
   fpLoading: "Loading…",
+  fpStartingEngine: "Starting engine…",
   fpEmpty: "No subfolders here",
   fpNoDrives: "No drives found",
   fpPathPlaceholder: "Paste or type a folder path…",
@@ -232,13 +233,14 @@ const en = {
   pyStatusBatchDone: (phase: string, cur: string, total: string) => `${phase} batch ${cur}/${total}`,
   pyStatusError: (phase: string) => `Error: ${phase} failed`,
   pyStatusBatchError: (num: number) => `Error translating batch ${num}`,
-  // Two-stage Python progress: stage 1 evaluates which candidates need translating
-  // (the count is exact, but it's NOT how many will be translated — that's only
-  // known after); stage 2 translates the confirmed strings.
+  // Two-stage Python progress: stage 1 checks which strings need translating;
+  // stage 2 translates the confirmed strings.
   pyProgressClassify: (done: number, total: number) =>
-    `Evaluating ${done} / ${total} candidates`,
+    `Python strings: checking ${done} / ${total}...`,
   pyProgressTranslate: (done: number, total: number) =>
-    `Translating ${done} / ${total} strings`,
+    `Python strings: translating ${done} / ${total}...`,
+  pyProgressSummary: (trans: number, skipped: number) =>
+    `Python strings: ${trans} translated (${skipped} skipped)`,
   pyClassified: "Classified",
   pyTranslated: "Translated",
   statusDone: "Done",

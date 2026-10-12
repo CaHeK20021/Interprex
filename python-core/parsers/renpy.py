@@ -2091,8 +2091,10 @@ class RenPyParser(BaseParser):
                 _gui_strs, _gui_ints = parse_gui_rpy(root)
                 _w = _gui_ints.get("dialogue_width")
                 _h = _gui_ints.get("textbox_height")
+                _y = _gui_ints.get("dialogue_ypos") or 0
                 if isinstance(_w, int) and isinstance(_h, int) and _w > 0 and _h > 0:
-                    fit_box_w, fit_box_h = _w, _h
+                    effective_h = max(1, _h - _y) if isinstance(_y, int) and _y < _h else _h
+                    fit_box_w, fit_box_h = _w, effective_h
                     fit_font_size = _gui_ints.get("text_size") or 32
                 # Choice button width: gui.choice_button_width, else the explicit
                 # `style choice_button: xsize N` baked into a custom UI (Killer Chat).
@@ -3018,6 +3020,19 @@ class RenPyParser(BaseParser):
             f"    style.choice_button.ysize = None\n"
             f"    style.choice_button_text.layout = 'subtitle'\n"
             f"\n"
+            f"    # Adaptive font scaling for wider/longer scripts (Russian/Cyrillic) to prevent textbox overflow.\n"
+            f"    # Scales dialogue font size slightly (~90%) so sentences comfortably fit author-defined textboxes.\n"
+            f"    try:\n"
+            f"        _base_sz = getattr(style.say_dialogue, 'size', None) or getattr(gui, 'text_size', None)\n"
+            f"        if isinstance(_base_sz, (int, float)) and _base_sz >= 28:\n"
+            f"            _new_sz = max(20, int(round(_base_sz * 0.90)))\n"
+            f"            if hasattr(style, 'say_dialogue'):\n"
+            f"                style.say_dialogue.size = _new_sz\n"
+            f"            if hasattr(style, 'say_thought'):\n"
+            f"                style.say_thought.size = _new_sz\n"
+            f"    except Exception:\n"
+            f"        pass\n"
+            f"\n"
             f"    # Translate dynamic @ping chat messages BEFORE substitution (Killer\n"
             f"    # Chat!). CRITICAL: we patch add_ping_hyperlinks IN PLACE (swap its\n"
             f"    # __code__) instead of REBINDING the store name. Ren'Py pickles store\n"
@@ -3802,10 +3817,21 @@ def _parse_gui_text(content: str) -> tuple[dict[str, str], dict[str, int]]:
     ints: dict[str, int] = {}
     str_pattern = re.compile(r'\b(?:define\s+)?gui\.([a-zA-Z0-9_]+)\s*=\s*[\'"]([^\'"]+)[\'"]')
     int_pattern = re.compile(r'\b(?:define\s+)?gui\.([a-zA-Z0-9_]+)\s*=\s*(\d+)\b')
-    for line in content.split("\n"):
-        line = line.split("#")[0].strip()
+    in_variant = False
+    for raw_line in content.split("\n"):
+        line = raw_line.split("#")[0].strip()
         if not line:
             continue
+        # Ren'Py variant blocks: @gui.variant / def small(): / def touch():
+        # Variables inside variant functions must NOT overwrite base desktop definitions!
+        if line.startswith("@gui.variant") or re.match(r'^def\s+(?:small|touch|phone)\b', line):
+            in_variant = True
+            continue
+        if in_variant:
+            if not raw_line.startswith((" ", "\t")) and (line.startswith("define ") or line.startswith("init ") or line.startswith("gui.")):
+                in_variant = False
+            else:
+                continue
         sm = str_pattern.search(line)
         if sm:
             strings[sm.group(1)] = sm.group(2)

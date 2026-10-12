@@ -40,6 +40,7 @@ const ru: Strings = {
   fpDrives: "Диски",
   fpUp: "На уровень вверх",
   fpLoading: "Загрузка…",
+  fpStartingEngine: "Запуск движка…",
   fpEmpty: "Здесь нет подпапок",
   fpNoDrives: "Диски не найдены",
   fpPathPlaceholder: "Вставьте или введите путь к папке…",
@@ -230,13 +231,14 @@ const ru: Strings = {
   pyStatusBatchDone: (phase: string, cur: string, total: string) => `${phase} пакет ${cur}/${total}`,
   pyStatusError: (phase: string) => `Ошибка: ${phase} не удалась`,
   pyStatusBatchError: (num: number) => `Ошибка перевода пакета ${num}`,
-  // Двухстадийный прогресс Python-строк: стадия 1 оценивает, какие кандидаты надо
-  // переводить (число точное, но это НЕ сколько переведём — это станет известно
-  // только после оценки); стадия 2 переводит подтверждённые строки.
+  // Двухстадийный прогресс Python-строк: стадия 1 проверяет, какие строки надо
+  // переводить; стадия 2 переводит подтверждённые строки.
   pyProgressClassify: (done: number, total: number) =>
-    `Оценка ${done} / ${total} кандидатов`,
+    `Python-строки: проверка ${done} / ${total}...`,
   pyProgressTranslate: (done: number, total: number) =>
-    `Перевод ${done} / ${total} строк`,
+    `Python-строки: перевод ${done} / ${total}...`,
+  pyProgressSummary: (trans: number, skipped: number) =>
+    `Python-строки: ${trans} переведено (${skipped} не требуют перевода)`,
   pyClassified: "Классифицирован",
   pyTranslated: "Переведён",
   statusDone: "Готово",

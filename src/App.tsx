@@ -1157,9 +1157,13 @@ export default function App() {
   // to 0 between them reads as a NEW stage, not a regress. Each stage's total is
   // exact (candidate count, then confirmed-string count), so no estimate flag is
   // needed — the stage label tells the user what the number means.
-  const [pyProgress, setPyProgress] = useState<
-    { done: number; total: number; stage: "classify" | "translate" } | null
-  >(null);
+  const [pyProgress, setPyProgress] = useState<{
+    done: number;
+    total: number;
+    stage: "classify" | "translate" | "done";
+    translatedCount?: number;
+    skippedCount?: number;
+  } | null>(null);
   // Streaming inject progress: which mod is being written + count.
   const [injectProgress, setInjectProgress] = useState<
     { doneMod: number; totalMods: number; modName: string } | null
@@ -2360,7 +2364,9 @@ export default function App() {
     // (done or failed). Drives the bar — using the just-finished batch's INDEX
     // made the bar jump around, since parallel batches finish out of order.
     let pyDoneBatches = 0;
-    let pyStage: "classify" | "translate" = "classify";
+    let pyStage: "classify" | "translate" | "done" = "classify";
+    let pyTranslatedCount = 0;
+    let pySkippedCount = 0;
     const workerBatch: Record<number, number> = {};
     const initPhases: Record<number, string> = {};
     const initStatuses: Record<number, string> = {};
@@ -2390,6 +2396,72 @@ export default function App() {
         apply_cached_only: applyCachedOnly,
       }, (line) => {
         setPythonLogs((prev) => [...prev, line]);
+
+        // Structured Python progress events from backend
+        const pyProgCand = line.match(/\[PY_PROGRESS\] candidates: total=(\d+), evaluate=(\d+), skipped_rules=(\d+)/);
+        if (pyProgCand) {
+          const evalCount = Number(pyProgCand[2]);
+          pySkippedCount = Number(pyProgCand[3]);
+          pyTotal = evalCount;
+          pyStage = "classify";
+          if (evalCount > 0) {
+            setPyProgress({ done: 0, total: evalCount, stage: "classify", skippedCount: pySkippedCount });
+          }
+          return;
+        }
+
+        const pyProgClassifyStart = line.match(/\[PY_PROGRESS\] classify_start: total=(\d+)/);
+        if (pyProgClassifyStart) {
+          pyTotal = Number(pyProgClassifyStart[1]);
+          pyStage = "classify";
+          setPyProgress({ done: 0, total: pyTotal, stage: "classify", skippedCount: pySkippedCount });
+          return;
+        }
+
+        const pyProgClassifyProg = line.match(/\[PY_PROGRESS\] classify_progress: done=(\d+), total=(\d+)/);
+        if (pyProgClassifyProg) {
+          const done = Number(pyProgClassifyProg[1]);
+          const total = Number(pyProgClassifyProg[2]);
+          pyTotal = total;
+          pyStage = "classify";
+          setPyProgress({ done, total, stage: "classify", skippedCount: pySkippedCount });
+          return;
+        }
+
+        const pyProgTranslateStart = line.match(/\[PY_PROGRESS\] translate_start: total=(\d+)/);
+        if (pyProgTranslateStart) {
+          pyTotal = Number(pyProgTranslateStart[1]);
+          pyStage = "translate";
+          setPyProgress({ done: 0, total: pyTotal, stage: "translate", skippedCount: pySkippedCount });
+          return;
+        }
+
+        const pyProgTranslateProg = line.match(/\[PY_PROGRESS\] translate_progress: done=(\d+), total=(\d+)/);
+        if (pyProgTranslateProg) {
+          const done = Number(pyProgTranslateProg[1]);
+          const total = Number(pyProgTranslateProg[2]);
+          pyTotal = total;
+          pyStage = "translate";
+          setPyProgress({ done, total, stage: "translate", skippedCount: pySkippedCount });
+          return;
+        }
+
+        const pyProgDone = line.match(/\[PY_PROGRESS\] done: translated=(\d+), skipped=(\d+), total=(\d+)/);
+        if (pyProgDone) {
+          pyTranslatedCount = Number(pyProgDone[1]);
+          pySkippedCount = Number(pyProgDone[2]);
+          pyStage = "done";
+          setPyProgress({
+            done: pyTranslatedCount,
+            total: pyTranslatedCount,
+            stage: "done",
+            translatedCount: pyTranslatedCount,
+            skippedCount: pySkippedCount,
+          });
+          return;
+        }
+
+        // Fallback parsers for backward compatibility
         const extractedMatch = line.match(/Extracted (\d+) string literal candidates/);
         if (extractedMatch) {
           pyTotal = Number(extractedMatch[1]);
@@ -2401,14 +2473,15 @@ export default function App() {
         if (cacheHitMatch) {
           const hitCount = Number(cacheHitMatch[1]);
           const totalCount = Number(cacheHitMatch[2]);
-          setPyProgress({ done: hitCount, total: totalCount, stage: "classify" });
+          pyTotal = totalCount;
+          setPyProgress({ done: hitCount, total: totalCount, stage: "classify", skippedCount: pySkippedCount });
           return;
         }
         const transCacheHitMatch = line.match(/Translation cache hit: (\d+) \/ (\d+) strings/);
         if (transCacheHitMatch) {
           const hitCount = Number(transCacheHitMatch[1]);
           const totalCount = Number(transCacheHitMatch[2]);
-          setPyProgress({ done: hitCount, total: totalCount, stage: "translate" });
+          setPyProgress({ done: hitCount, total: totalCount, stage: "translate", skippedCount: pySkippedCount });
           return;
         }
         const classifyStart = line.match(/Classifying (\d+) candidates.*in (\d+) parallel batches.*\(threads=(\d+)\)/);
@@ -2569,7 +2642,9 @@ export default function App() {
           });
         }
       });
-      if (pyTotal > 0) setPyProgress({ done: pyTotal, total: pyTotal, stage: pyStage });
+      if ((pyStage as string) !== "done" && pyTotal > 0) {
+        setPyProgress({ done: pyTotal, total: pyTotal, stage: pyStage as "classify" | "translate" });
+      }
       const status = await getBackupStatus(root);
       setHasBackup(status.has_backup);
     } catch (err: any) {
@@ -3454,17 +3529,23 @@ export default function App() {
         </div>
       )}
 
-      {pyProgress && pyProgress.total > 0 && (
+      {pyProgress && (pyProgress.total > 0 || pyProgress.stage === "done") && (
         <div className="progress">
           <div className="progressbar">
             <div
               className="progressfill engine-renpy"
-              style={{ width: `${Math.round((pyProgress.done / pyProgress.total) * 100)}%` }}
+              style={{
+                width: pyProgress.stage === "done"
+                  ? "100%"
+                  : `${Math.round((pyProgress.done / Math.max(1, pyProgress.total)) * 100)}%`
+              }}
             />
           </div>
           <span className="progresslabel engine-renpy">
             <strong>
-              {pyProgress.stage === "classify"
+              {pyProgress.stage === "done"
+                ? (t("pyProgressSummary")(pyProgress.translatedCount ?? 0, pyProgress.skippedCount ?? 0) as string)
+                : pyProgress.stage === "classify"
                 ? (t("pyProgressClassify")(pyProgress.done, pyProgress.total) as string)
                 : (t("pyProgressTranslate")(pyProgress.done, pyProgress.total) as string)}
             </strong>
@@ -4604,6 +4685,7 @@ export default function App() {
       {folderPickerKind && (
         <FolderPicker
           engineClass={`engine-${engine || "none"}`}
+          sidecarUp={sidecarUp}
           startPath={
             (folderPickerKind === "mods"
               ? modsDir || (saveLastModsFolder ? loadSetting("lastModsFolder", "") : "")

@@ -2146,6 +2146,9 @@ def main(args_list=None):
         gemini_candidates.append(entry)
         
     total_workers = max(1, args.threads) * len(keys)
+    total_eval_candidates = len(gemini_candidates)
+    logger.info("[PY_PROGRESS] candidates: total=%d, evaluate=%d, skipped_rules=%d",
+                len(all_candidates), total_eval_candidates, skipped_keys + skipped_hard)
 
     # Translation cache: stores the actual inline-Python translations so a second
     # run re-translates ONLY new strings, and the no-API apply path (writeBack)
@@ -2162,6 +2165,7 @@ def main(args_list=None):
         logger.info("Apply-cached-only mode: no API; applying from translation cache.")
     elif gemini_candidates:
         classify_cache = _ClassificationCache(game_path, args.model, args.provider)
+        logger.info("[PY_PROGRESS] classify_start: total=%d", total_eval_candidates)
 
         cached_entries: list[dict] = []
         uncached_entries: list[dict] = []
@@ -2174,6 +2178,7 @@ def main(args_list=None):
 
         if cached_entries:
             logger.info("Classification cache hit: %d / %d candidates", len(cached_entries), len(gemini_candidates))
+            logger.info("[PY_PROGRESS] classify_progress: done=%d, total=%d", len(cached_entries), total_eval_candidates)
             for entry, decision, reason in cached_entries:
                 if decision == "TRANSLATE":
                     classified_gemini_trans += 1
@@ -2201,8 +2206,15 @@ def main(args_list=None):
             def _classify_pf(batch, key, worker_idx):
                 return _classify_batch_raw(batch, key, args.model, args.base_url, args.provider)
 
+            _classified_done_cnt = [len(cached_entries)]
+            _cnt_lock = threading.Lock()
+
             def _on_classify_batch_done(batch, decisions):
                 classify_cache.put_batch(batch, decisions)
+                with _cnt_lock:
+                    _classified_done_cnt[0] += len(batch)
+                    logger.info("[PY_PROGRESS] classify_progress: done=%d, total=%d",
+                                min(total_eval_candidates, _classified_done_cnt[0]), total_eval_candidates)
 
             decisions_map = _run_batches_over_keypool(
                 batches, keys, args.threads, args.delay_seconds, "Classified", _classify_pf,
@@ -2253,6 +2265,8 @@ def main(args_list=None):
 
     if not to_translate:
         logger.info("No strings identified for translation.")
+        total_skipped = skipped_keys + skipped_hard + classified_gemini_skip
+        logger.info("[PY_PROGRESS] done: translated=0, skipped=%d, total=%d", total_skipped, len(all_candidates))
         sys.exit(0)
         
     # Load user translations from project.json if they exist.
@@ -2276,6 +2290,7 @@ def main(args_list=None):
     # Step 4: Translate. Pull anything already in the translation cache (free), and
     # only send cache-misses to the API. This is what makes a re-run "translate
     # only new strings" and lets the no-API apply path work at all.
+    logger.info("[PY_PROGRESS] translate_start: total=%d", len(to_translate))
     translations: dict[str, str] = {}
     uncached_to_translate: list[dict] = []
     for entry in to_translate:
@@ -2291,6 +2306,7 @@ def main(args_list=None):
 
     if translations:
         logger.info("Translation cache hit: %d / %d strings", len(translations), len(to_translate))
+        logger.info("[PY_PROGRESS] translate_progress: done=%d, total=%d", len(translations), len(to_translate))
 
     if uncached_to_translate and not args.apply_cached_only:
         max_b, min_b = 30, 20
@@ -2308,8 +2324,15 @@ def main(args_list=None):
         def _translate_pf(batch, key, worker_idx):
             return _translate_batch_raw(batch, args.target_lang, key, args.model, args.base_url, args.provider)
 
+        _trans_done_cnt = [len(translations)]
+        _t_cnt_lock = threading.Lock()
+
         def _on_translate_batch_done(batch, fresh_map):
             trans_cache.put_batch(batch, fresh_map)
+            with _t_cnt_lock:
+                _trans_done_cnt[0] += len(batch)
+                logger.info("[PY_PROGRESS] translate_progress: done=%d, total=%d",
+                            min(len(to_translate), _trans_done_cnt[0]), len(to_translate))
 
         fresh = _run_batches_over_keypool(
             batches, keys, args.threads, args.delay_seconds, "Translated", _translate_pf,
@@ -2459,6 +2482,9 @@ def main(args_list=None):
         finalize_backups(game_path)
         logger.info("Inline Python translation finished. Wrote %d string translations to tl/%s/_interprex_inline.rpy.",
                     success_count, lang_dir)
+        total_skipped = len(all_candidates) - success_count
+        logger.info("[PY_PROGRESS] done: translated=%d, skipped=%d, total=%d",
+                    success_count, max(0, total_skipped), len(all_candidates))
 
 
 if __name__ == "__main__":
