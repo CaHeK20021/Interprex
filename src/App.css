@@ -1727,12 +1727,19 @@ input[type="range"]::-webkit-slider-thumb:active {
 .worker-card {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: 10px;
   border-left: 3px solid var(--muted);
   background: rgba(7, 8, 12, 0.45);
+  min-width: 0;
+}
+.worker-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
   min-width: 0;
 }
 .worker-card-name {
@@ -1741,6 +1748,34 @@ input[type="range"]::-webkit-slider-thumb:active {
   gap: 6px;
   font-size: 11px;
   color: var(--muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.worker-card-timer {
+  flex: 0 0 auto;
+  min-width: 40px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  color: var(--muted);
+  opacity: 0.6;
+}
+.worker-card.tone-busy .worker-card-timer.active {
+  color: #e0a64b;
+  opacity: 1;
+}
+.worker-card.tone-ok .worker-card-timer.active {
+  color: #41c98a;
+  opacity: 1;
+}
+.worker-card.tone-err .worker-card-timer.active {
+  color: #e0564b;
+  opacity: 1;
 }
 .worker-card-status {
   font-size: 12px;

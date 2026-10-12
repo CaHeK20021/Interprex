@@ -16,6 +16,7 @@ import ast
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -689,7 +690,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
     dead_lock = threading.Lock()
     key_cooldown: dict[str, float] = {}
     cd_lock = threading.Lock()
-    pacing_last: dict[str, float] = {}
+    pacing_last: dict[int, float] = {}
     pacing_lock = threading.Lock()
     # How many batches have reached a terminal state (done OR exhausted). When this
     # hits `total`, every worker may exit even if the queue is momentarily empty
@@ -701,40 +702,67 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
         with accounted_lock:
             accounted[0] += 1
 
+    def is_all_done():
+        with accounted_lock:
+            return accounted[0] >= total
+
     def worker(worker_idx: int, key: str):
         auth_fails = 0
+        # Initial stagger across threads on the same key so they don't fire simultaneously
+        thread_rank = worker_idx % threads if threads > 1 else 0
+        stagger = (delay_seconds * thread_rank / threads) if (delay_seconds > 0 and threads > 1) else 0.0
+        if stagger > 0:
+            stagger_start = time.time()
+            while time.time() - stagger_start < stagger:
+                if is_all_done():
+                    return
+                time.sleep(min(0.2, stagger - (time.time() - stagger_start)))
+
         while True:
             _wait_if_paused()  # pause only at the claim boundary, never mid-request
+            if is_all_done():
+                return
             with dead_lock:
                 if key in dead_keys:
                     return
-            # Per-key rate cooldown (sibling workers on this key honour it; other
-            # keys are unaffected).
+
+            # Per-key rate cooldown (sibling workers on this key honour it; other keys are unaffected)
             with cd_lock:
                 cd = key_cooldown.get(key, 0.0)
             wait = cd - time.time()
             if wait > 0:
-                time.sleep(min(wait, 1.0))
+                while wait > 0:
+                    if is_all_done():
+                        return
+                    time.sleep(min(wait, 0.2))
+                    wait = cd - time.time()
                 continue
-            # Per-key pacing: a request occupies >= delay_seconds of wall-clock.
+
+            # Per-worker pacing: this worker waits delay_seconds since ITS last request
             if delay_seconds > 0:
                 with pacing_lock:
-                    last = pacing_last.get(key, 0.0)
+                    last = pacing_last.get(worker_idx, 0.0)
                 gap = delay_seconds - (time.time() - last)
                 if gap > 0:
-                    time.sleep(min(gap, 1.0))
+                    while gap > 0:
+                        if is_all_done():
+                            return
+                        time.sleep(min(gap, 0.2))
+                        gap = delay_seconds - (time.time() - last)
                     continue
+
             try:
                 batch_idx, batch, attempts, rate_attempts = work.get_nowait()
             except queue.Empty:
-                with accounted_lock:
-                    if accounted[0] >= total:
-                        return
+                if is_all_done():
+                    return
                 time.sleep(0.2)
                 continue
-            if delay_seconds > 0:
-                with pacing_lock:
-                    pacing_last[key] = time.time()
+
+            with pacing_lock:
+                pacing_last[worker_idx] = time.time()
+
+            logger.info("Claimed %s batch %d/%d [thread %d]", label.lower(), batch_idx + 1, total, worker_idx)
             try:
                 result = process_fn(batch, key, worker_idx)
                 auth_fails = 0
@@ -2113,7 +2141,8 @@ def main(args_list=None):
                         logger.info("[DRY RUN] Would skip: %s (cached: %s)", repr(entry['value']), reason)
 
         if uncached_entries:
-            batch_size = 40
+            target_batches = max(total_workers, math.ceil(len(uncached_entries) / 40))
+            batch_size = min(40, max(5, math.ceil(len(uncached_entries) / target_batches)))
             batches = [uncached_entries[i : i + batch_size] for i in range(0, len(uncached_entries), batch_size)]
 
             logger.info("Classifying %d candidates with Gemini in %d parallel batches (threads=%d)...", len(uncached_entries), len(batches), total_workers)
@@ -2210,7 +2239,8 @@ def main(args_list=None):
         logger.info("Translation cache hit: %d / %d strings", len(translations), len(to_translate))
 
     if uncached_to_translate and not args.apply_cached_only:
-        batch_size = 30
+        target_batches = max(total_workers, math.ceil(len(uncached_to_translate) / 30))
+        batch_size = min(30, max(5, math.ceil(len(uncached_to_translate) / target_batches)))
         batches = [uncached_to_translate[i : i + batch_size] for i in range(0, len(uncached_to_translate), batch_size)]
 
         logger.info("Translating %d strings in %d parallel batches (threads=%d)...", len(uncached_to_translate), len(batches), total_workers)

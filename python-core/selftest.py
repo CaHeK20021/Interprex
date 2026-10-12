@@ -22,6 +22,11 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from parsers import detect_engine, get_parser  # noqa: E402
 from parsers.base import make_id  # noqa: E402
 
@@ -245,7 +250,7 @@ def check_renpy() -> None:
     # 5. Test backup restore deletes newly created files
     from main import backup_restore, BackupRestoreReq
     res = backup_restore(BackupRestoreReq(root=root))
-    assert res == {"success": True}, res
+    assert res.get("success") is True, res
     assert not os.path.exists(tl_script), "tl/russian/script.rpy was NOT deleted on restore"
     assert not os.path.exists(lang_file), "interprex_language.rpy was NOT deleted on restore"
     # restore must also prune the now-empty tl/<lang>/ dirs it emptied, not leave

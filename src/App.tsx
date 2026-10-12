@@ -1061,6 +1061,7 @@ export default function App() {
   // Live translation progress (strings done / total), null when not translating.
   const [progress, setProgress] = useState<TranslateProgress | null>(null);
   const [keyStatuses, setKeyStatuses] = useState<Record<number, string>>({});
+  const [workerTimes, setWorkerTimes] = useState<Record<number, number>>({});
   // Last per-worker progress snapshot. Status text is formatted FROM this, not
   // from the raw event, so omitted try_i/elapsed on a tick can't blink the card.
   const workerSnapRef = useRef<Record<number, TranslateProgress>>({});
@@ -1069,6 +1070,7 @@ export default function App() {
   const [models, setModels] = useState<string[]>([]);
   const [activeModel, setActiveModel] = useState("");
   const [modelsLoading, setModelsLoading] = useState(false);
+  const [keyValidated, setKeyValidated] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   // Fully paused = every worker finished its OWNED batch and parks free at the
   // claim gate (`paused`). While someone still drains (`finishing_batch` /
@@ -1325,42 +1327,54 @@ export default function App() {
     });
   }, [engine, translationMode]);
 
-  // Discover the backend's models whenever the connection details change.
-  // Debounced so typing a base URL / API key doesn't hammer the sidecar. The
-  // call never throws (sidecar returns empty on a down server); an empty list
-  // just leaves the UI on its free-text fallback.
+  // Discover the backend's models whenever the connection details change or
+  // the sidecar comes up. Debounced so typing a base URL / API key doesn't
+  // hammer the sidecar. If the sidecar is not up yet, wait until it comes online.
   useEffect(() => {
+    setKeyValidated(false);
+    if (!sidecarUp) return;
     let cancelled = false;
-    // ~1s after the last keystroke (so it validates the key once you've stopped
-    // typing, not on every character). The loading flag flips INSIDE the timer,
-    // so "finding models…" never flickers while you're still typing the key.
+    // ~500ms after the last keystroke when typing, or minimal delay (50ms) if
+    // models are empty (launch / provider switch) so discovery is near-instant.
+    const delay = models.length === 0 ? 50 : 500;
     const handle = setTimeout(async () => {
       setModelsLoading(true);
-      const { models: found, active } = await listModels({
-        provider,
-        base_url: baseUrl,
-        api_key: primaryKey,
-        free_only: provider === "openrouter" ? freeOnly : false,
-      }).catch(() => ({ models: [] as string[], active: "" }));
-      if (cancelled) return;
-      setModels(found);
-      setActiveModel(active);
-      setModelsLoading(false);
-      // Auto-pick a model so a local user usually never has to choose: prefer
-      // the loaded (active) one, else the first discovered. Only when the user
-      // hasn't already settled on a model the backend still offers.
-      setModel((cur) => {
-        if (cur && found.includes(cur)) return cur;
-        const pick = active || found[0] || "";
-        if (pick !== cur) saveProviderSetting("providerModel", provider, pick);
-        return pick;
-      });
-    }, 1000);
+      try {
+        const { models: found, active } = await listModels({
+          provider,
+          base_url: baseUrl,
+          api_key: primaryKey,
+          free_only: provider === "openrouter" ? freeOnly : false,
+        });
+        if (cancelled) return;
+        setModels(found);
+        setActiveModel(active);
+        setKeyValidated(true);
+        setModelsLoading(false);
+        // Auto-pick a model so a local user usually never has to choose: prefer
+        // the loaded (active) one, else the first discovered. Only when the user
+        // hasn't already settled on a model the backend still offers.
+        setModel((cur) => {
+          if (cur && found.includes(cur)) return cur;
+          const pick = active || found[0] || "";
+          if (pick !== cur) saveProviderSetting("providerModel", provider, pick);
+          return pick;
+        });
+      } catch {
+        if (cancelled) return;
+        setModels([]);
+        setActiveModel("");
+        // On sidecar communication error, do not mark as keyValidated so we don't
+        // falsely claim the key was rejected when the engine simply couldn't be reached.
+        setKeyValidated(false);
+        setModelsLoading(false);
+      }
+    }, delay);
     return () => {
       cancelled = true;
       clearTimeout(handle);
     };
-  }, [provider, baseUrl, primaryKey, freeOnly]);
+  }, [provider, baseUrl, primaryKey, freeOnly, sidecarUp]);
 
   // OpenRouter daily free-request budget. The API gives the cap (50 free tier /
   // 1000 once ≥$10 was bought) but NOT how many we've spent today, so we count
@@ -1398,6 +1412,7 @@ export default function App() {
     workerSnapRef.current = {};
     setKeyStatuses({});
     setWorkerPhases({});
+    setWorkerTimes({});
     setIsPaused(false);
   }
 
@@ -1846,6 +1861,7 @@ export default function App() {
       workerSnapRef.current = {};
       setKeyStatuses({ 0: "Initializing..." });
       setWorkerPhases({ 0: "initializing" });
+      setWorkerTimes({});
       // Seed the TPM panel IMMEDIATELY when a cap is set for this run — do not
       // wait for the first NDJSON event. Empty field → null (no bars on NVIDIA
       // with TPM off). Without this seed, a slow first event / old sidecar that
@@ -1949,6 +1965,16 @@ export default function App() {
               if (snap.phase) {
                 setWorkerPhases((prev) => ({ ...prev, [wi]: snap.phase! }));
               }
+              const sec =
+                snap.elapsed && snap.elapsed > 0
+                  ? snap.elapsed
+                  : snap.wait_left && snap.wait_left > 0
+                    ? snap.wait_left
+                    : 0;
+              setWorkerTimes((prev) => ({
+                ...prev,
+                [wi]: sec,
+              }));
             } else if (snap.status) {
               setKeyStatuses({ 0: snap.status });
             }
@@ -2041,6 +2067,7 @@ export default function App() {
         workerSnapRef.current = {};
         setKeyStatuses({});
         setWorkerPhases({});
+        setWorkerTimes({});
         setIsPaused(false);
         // Authoritative final merge: built on top of whatever live-merges already
         // applied during the run, not the stale `project` captured at call time.
@@ -2136,6 +2163,7 @@ export default function App() {
         workerSnapRef.current = {};
         setKeyStatuses({});
         setWorkerPhases({});
+        setWorkerTimes({});
         setIsPaused(false);
       } else {
         fail(e);
@@ -2377,21 +2405,10 @@ export default function App() {
           pyDoneBatches = 0;
           pyStage = "classify";
           setPyProgress({ done: 0, total: pyTotal, stage: "classify" });
-          // Only as many workers as there are batches can have work — the rest
-          // rest immediately (5 batches across 18 workers = 13 resting). Activating
-          // all of them and guessing a batch number each is what produced the
-          // bogus "thread 18 — batch 18/5".
-          const activeClassify = Math.min(workerCount, pyBatchTotal);
           for (let i = 0; i < workerCount; i++) {
-            if (i < activeClassify) {
-              workerBatch[i] = nextBatch++;
-              setWorkerPhases((prev) => ({ ...prev, [i]: "translating_batch" }));
-              setKeyStatuses((prev) => ({ ...prev, [i]: t("pyStatusClassifying") as string }));
-            } else {
-              workerBatch[i] = -1;
-              setWorkerPhases((prev) => ({ ...prev, [i]: "resting" }));
-              setKeyStatuses((prev) => ({ ...prev, [i]: t("statusResting") as string }));
-            }
+            workerBatch[i] = -1;
+            setWorkerPhases((prev) => ({ ...prev, [i]: "resting" }));
+            setKeyStatuses((prev) => ({ ...prev, [i]: t("statusResting") as string }));
           }
           return;
         }
@@ -2402,20 +2419,30 @@ export default function App() {
           nextBatch = 0;
           pyDoneBatches = 0;
           pyStage = "translate";
-          // Now we KNOW the real translate count (confirmed strings, exact).
           setPyProgress({ done: 0, total: pyTotal, stage: "translate" });
-          // Same as classify: only min(workers, batches) can work; rest the others
-          // so the grid never shows a worker on a batch that doesn't exist.
-          const activeTranslate = Math.min(workerCount, pyBatchTotal);
           for (let i = 0; i < workerCount; i++) {
-            if (i < activeTranslate) {
-              workerBatch[i] = nextBatch++;
-              setWorkerPhases((prev) => ({ ...prev, [i]: "translating_batch" }));
-              setKeyStatuses((prev) => ({ ...prev, [i]: t("pyStatusBatchDone")(t("pyStatusTranslating") as string, String(workerBatch[i] + 1), String(pyBatchTotal)) as string }));
+            workerBatch[i] = -1;
+            setWorkerPhases((prev) => ({ ...prev, [i]: "resting" }));
+            setKeyStatuses((prev) => ({ ...prev, [i]: t("statusResting") as string }));
+          }
+          return;
+        }
+        const claimedMatch = line.match(/Claimed (classified|translated) batch (\d+)\/(\d+) \[thread (\d+)\]/i);
+        if (claimedMatch) {
+          const curBatch = Number(claimedMatch[2]);
+          const totalBatches = Number(claimedMatch[3]);
+          const tidx = Number(claimedMatch[4]);
+          if (tidx < workerCount) {
+            workerBatch[tidx] = curBatch;
+            const isClassify = claimedMatch[1].toLowerCase() === "classified";
+            setWorkerPhases((prev) => ({ ...prev, [tidx]: "translating_batch" }));
+            if (isClassify) {
+              setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusClassifying") as string }));
             } else {
-              workerBatch[i] = -1;
-              setWorkerPhases((prev) => ({ ...prev, [i]: "resting" }));
-              setKeyStatuses((prev) => ({ ...prev, [i]: t("statusResting") as string }));
+              setKeyStatuses((prev) => ({
+                ...prev,
+                [tidx]: t("pyStatusBatchDone")(t("pyStatusTranslating") as string, String(curBatch), String(totalBatches)) as string,
+              }));
             }
           }
           return;
@@ -2426,35 +2453,20 @@ export default function App() {
           const totalBatches = Number(batchThreadMatch[3]);
           const tidx = Number(batchThreadMatch[4]);
           pyBatchTotal = totalBatches;
-          // Advance by COMPLETED-batch count (monotonic), not the finished batch's
-          // index — parallel batches finish out of order, so the index made the bar
-          // jump backwards.
           pyDoneBatches++;
           const done = pyTotal > 0 ? Math.min(pyTotal, Math.floor(pyDoneBatches * pyTotal / totalBatches)) : 0;
           setPyProgress({ done, total: pyTotal, stage: pyStage });
           if (tidx < workerCount) {
-            if (nextBatch < totalBatches) {
-              // This worker has another batch to claim — keep it lit.
-              workerBatch[tidx] = nextBatch++;
-              const isClassify = batchThreadMatch[1] === "Classified";
-              setWorkerPhases((prev) => ({ ...prev, [tidx]: isClassify ? "completed_batch" : "translating_batch" }));
-              if (isClassify) {
-                setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusClassifying") as string }));
-              } else {
-                setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusBatchDone")(t("pyStatusTranslating") as string, String(curBatch), String(totalBatches)) as string }));
-              }
+            workerBatch[tidx] = -1;
+            const isClassify = batchThreadMatch[1] === "Classified";
+            setWorkerPhases((prev) => ({ ...prev, [tidx]: "completed_batch" }));
+            if (isClassify) {
+              setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusClassified") as string }));
             } else {
-              // No more NEW batches, but this worker may still finish a requeued
-              // one. Show "completed" rather than "resting" — classifyDoneMatch
-              // will transition everyone to resting once the phase truly ends.
-              workerBatch[tidx] = -1;
-              const isClassify = batchThreadMatch[1] === "Classified";
-              setWorkerPhases((prev) => ({ ...prev, [tidx]: "completed_batch" }));
-              if (isClassify) {
-                setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusClassified") as string }));
-              } else {
-                setKeyStatuses((prev) => ({ ...prev, [tidx]: t("pyStatusBatchDone")(t("pyTranslated") as string, String(curBatch), String(totalBatches)) as string }));
-              }
+              setKeyStatuses((prev) => ({
+                ...prev,
+                [tidx]: t("pyStatusBatchDone")(t("pyTranslated") as string, String(curBatch), String(totalBatches)) as string,
+              }));
             }
           }
           return;
@@ -3477,6 +3489,12 @@ export default function App() {
               {Array.from({ length: visible }, (_, i) => {
                 const ph = workerPhases[i] ?? "idle";
                 const msg = keyStatuses[i] ?? "";
+                const sec = workerTimes[i] ?? 0;
+                // Strip redundant trailing seconds from status text so it won't truncate,
+                // as the timer is displayed in the dedicated top-right badge.
+                const cleanMsg = msg
+                  ? msg.replace(/\s*[·—\-]\s*\d+\s*(сек|s)\b.*$/i, "").trim()
+                  : "";
                 // Traffic-light tone: request in flight (yellow), answer landed
                 // (green), errored (red), or stopped/idle (grey — a thread that
                 // finished or went to rest). Waiting/paused keep their own accent.
@@ -3496,12 +3514,17 @@ export default function App() {
                             : "idle";
                 return (
                   <div key={i} className={`worker-card phase-${ph} tone-${tone}`}>
-                    <span className="worker-card-name">
-                      <span className={`worker-dot tone-${tone}`} />
-                      {t("workerLabel")(i + 1)}
-                    </span>
+                    <div className="worker-card-head">
+                      <span className="worker-card-name">
+                        <span className={`worker-dot tone-${tone}`} />
+                        {t("workerLabel")(i + 1)}
+                      </span>
+                      <span className={`worker-card-timer ${sec > 0 ? "active" : ""}`}>
+                        {sec > 0 ? `${sec}с` : ""}
+                      </span>
+                    </div>
                     <span className="worker-card-status" title={msg || (t("statusResting") as string)}>
-                      {msg || t("statusResting")}
+                      {cleanMsg || t("statusResting")}
                     </span>
                   </div>
                 );
@@ -3605,6 +3628,8 @@ export default function App() {
             onChange={(e) => {
               const next = e.target.value as ProviderId;
               setProvider(next);
+              setModels([]);
+              setKeyValidated(false);
               saveSetting("provider", next);
               // Restore this provider's own saved connection settings, so the
               // fields show ITS url/key/model rather than the old provider's.
@@ -3678,7 +3703,7 @@ export default function App() {
             <input
               value={model}
               placeholder={
-                modelsLoading
+                modelsLoading || (!sidecarUp && !!primaryKey)
                   ? (t("modelCheckingKey") as string)
                   : !primaryKey
                     ? (t("modelNeedKey") as string)
@@ -3702,7 +3727,7 @@ export default function App() {
               placeholder={
                 !primaryKey
                   ? t("modelNeedKey")
-                  : modelsLoading
+                  : (!sidecarUp || modelsLoading || !keyValidated)
                     ? t("modelCheckingKey")
                     : t("modelBadKey")
               }
