@@ -270,6 +270,13 @@ const ru: Strings = {
   backupStatusLabel: "Создан бэкап:",
   restoreSuccess: "Оригинальные файлы успешно восстановлены!",
   deleteBackupSuccess: "Резервная копия удалена.",
+  includePythonStrings: "Переводить Python-строки",
+  includePythonStringsHint: "Переводить встроенные строки в коде Python ($ блоки, init python). Снимите галочку, если игра вылетает из-за кода.",
+  restoreChoiceTitle: "Восстановление из бэкапа",
+  restoreChoiceDesc: "В игре обнаружен перевод встроенных Python-строк. Вы можете удалить только его (если в игре возникла ошибка из-за кода) или полностью восстановить оригинальную игру:",
+  btnRestorePythonOnly: "Удалить только Python-строки (сохранить диалоги)",
+  btnRestoreAll: "Восстановить всю игру (полный оригинал)",
+  restorePythonOnlySuccess: "Файлы перевода Python-строк удалены. Основной перевод игры сохранён!",
   exportZipSuccess: (name: string) => `Перевод успешно запакован в архив:\n${name}\n(файл выбран в проводнике)`,
   exportZipFail: (err: string) => `Не удалось экспортировать архив: ${err}`,
 

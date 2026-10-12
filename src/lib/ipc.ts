@@ -550,6 +550,16 @@ export function createBackup(root: string, files: string[]): Promise<{ success: 
   return callPython("backup/create", { root, files });
 }
 
+/** Check whether inline Python translations exist in the game. */
+export function getInlinePythonStatus(root: string, target_lang: string): Promise<{ has_inline: boolean }> {
+  return callPython("renpy/inline_python/status", { root, target_lang });
+}
+
+/** Remove inline Python translation files (_interprex_inline.rpy and .rpyc) while keeping main translations. */
+export function removeInlinePython(root: string, target_lang: string): Promise<{ success: boolean; removed: number }> {
+  return callPython("renpy/inline_python/remove", { root, target_lang });
+}
+
 /** Export all translation files to a ZIP archive in the game folder. */
 export function exportTranslationZip(root: string, engine: string, target_lang: string): Promise<{ success: boolean; zip_path: string; zip_name: string; file_count: number; message?: string }> {
   return callPython("project/export_zip", { root, engine, target_lang });

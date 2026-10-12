@@ -1917,6 +1917,69 @@ def backup_discard(req: BackupDiscardReq) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class InlinePythonReq(BaseModel):
+    root: str
+    target_lang: str = "russian"
+
+
+@app.post("/renpy/inline_python/status")
+def renpy_inline_python_status(req: InlinePythonReq) -> dict:
+    from parsers.renpy import RenPyParser
+    lang_dir = RenPyParser._lang_dir(req.target_lang)
+    tl_base = os.path.join(req.root, "game", "tl")
+    has_inline = False
+    if os.path.isdir(tl_base):
+        for dirname in os.listdir(tl_base):
+            if dirname.lower() == lang_dir.lower():
+                target_rpy = os.path.join(tl_base, dirname, "_interprex_inline.rpy")
+                if os.path.isfile(target_rpy):
+                    has_inline = True
+                    break
+    return {"has_inline": has_inline}
+
+
+@app.post("/renpy/inline_python/remove")
+def renpy_inline_python_remove(req: InlinePythonReq) -> dict:
+    from parsers.renpy import RenPyParser
+    lang_dir = RenPyParser._lang_dir(req.target_lang)
+    removed = 0
+    tl_base = os.path.join(req.root, "game", "tl")
+    if os.path.isdir(tl_base):
+        for dirname in os.listdir(tl_base):
+            if dirname.lower() == lang_dir.lower():
+                target_rpy = os.path.join(tl_base, dirname, "_interprex_inline.rpy")
+                target_rpyc = target_rpy + "c"
+                if os.path.exists(target_rpy):
+                    try:
+                        run_with_retry(os.remove, target_rpy)
+                        removed += 1
+                    except Exception as e:
+                        logger.warning("Failed to remove %s: %s", target_rpy, e)
+                if os.path.exists(target_rpyc):
+                    try:
+                        run_with_retry(os.remove, target_rpyc)
+                    except Exception as e:
+                        logger.warning("Failed to remove %s: %s", target_rpyc, e)
+
+    # Clean up from .interprex_backups/metadata.json if present
+    backup_dir = get_backup_dir(req.root)
+    metadata_path = os.path.join(backup_dir, "metadata.json")
+    if os.path.isfile(metadata_path):
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            keys_to_del = [k for k in meta if "_interprex_inline.rpy" in k.replace("\\", "/")]
+            if keys_to_del:
+                for k in keys_to_del:
+                    del meta[k]
+                with open(metadata_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("Failed to clean backup metadata for inline python: %s", e)
+
+    return {"success": True, "removed": removed}
+
+
 @app.post("/backup/create")
 def backup_create(req: BackupCreateReq) -> dict:
     import os

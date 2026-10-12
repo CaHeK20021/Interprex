@@ -33,6 +33,7 @@ const KEYS = {
   // provider's base_url is cleared, so the URL itself must persist here.
   proxyUrl: "interprex.proxyUrl",
   groupSmallFiles: "interprex.groupSmallFiles",
+  includePythonStrings: "interprex.includePythonStrings",
 } as const;
 
 /** Read a stored string, or `fallback` if absent / storage unavailable. */

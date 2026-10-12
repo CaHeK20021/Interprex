@@ -273,6 +273,13 @@ const en = {
   backupStatusLabel: "Backup active:",
   restoreSuccess: "Original files restored successfully!",
   deleteBackupSuccess: "Backup deleted.",
+  includePythonStrings: "Translate Python strings",
+  includePythonStringsHint: "Translate inline strings in Python code ($ blocks, init python). Uncheck if code changes cause issues.",
+  restoreChoiceTitle: "Restore Backup",
+  restoreChoiceDesc: "The game has translated inline Python strings. You can remove only them (if a code error occurred) or completely restore the original game:",
+  btnRestorePythonOnly: "Remove Python strings only (keep dialogue)",
+  btnRestoreAll: "Restore entire game (full original)",
+  restorePythonOnlySuccess: "Python inline translations removed. Main dialogue translation preserved!",
   exportZipSuccess: (name: string) => `Translation successfully packed to archive:\n${name}\n(file selected in explorer)`,
   exportZipFail: (err: string) => `Failed to export archive: ${err}`,
 

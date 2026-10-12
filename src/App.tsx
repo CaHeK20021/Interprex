@@ -20,6 +20,8 @@ import {
   autofixTranslation,
   proxyAutocheck,
   renpyLint,
+  getInlinePythonStatus,
+  removeInlinePython,
   type ModInfo,
   type ProxyAutocheckResult,
   type RenpyLintResult,
@@ -1101,6 +1103,9 @@ export default function App() {
     abortControllerRef.current = controller;
   };
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const [showRestoreChoice, setShowRestoreChoice] = useState(false);
+  const [hasInlinePython, setHasInlinePython] = useState(false);
+  const [includePythonStrings, setIncludePythonStrings] = useState<boolean>(() => loadSetting("includePythonStrings", "true") === "true");
   // Themed in-app folder browser: which picker is open (null = closed). The kind
   // decides whether the chosen path feeds the game or the mods flow.
   const [folderPickerKind, setFolderPickerKind] = useState<null | "game" | "mods">(null);
@@ -1188,6 +1193,17 @@ export default function App() {
     clearJustTranslated();
     setEditedModPaths(new Set());
   }, [root, modsDir, translationMode, clearJustTranslated]);
+
+  useEffect(() => {
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
+    if (activeRoot && engine === "renpy") {
+      getInlinePythonStatus(activeRoot, String(target))
+        .then((res) => setHasInlinePython(res.has_inline))
+        .catch(() => setHasInlinePython(false));
+    } else {
+      setHasInlinePython(false);
+    }
+  }, [root, gameRoot, translationMode, engine, target, hasBackup, phase]);
 
   // Sidecar health: poll until up, then keep a slow heartbeat.
   // After an update the UI mounts while Rust is still extracting/spawning
@@ -2248,7 +2264,7 @@ export default function App() {
       //    translation cache only, NO API. This makes "Write translation" lay
       //    down everything a prior full "Translate" produced, for free. Skipped
       //    in mods mode (it writes a separate pak, not the game's tl/ tree).
-      if (engine === "renpy" && translationMode !== "mods") {
+      if (engine === "renpy" && translationMode !== "mods" && includePythonStrings) {
         try {
           await handleTranslatePython(false, /* applyCachedOnly */ true);
         } catch (e) {
@@ -2734,6 +2750,16 @@ export default function App() {
     }
   }
 
+  async function handleRestoreBackupClick() {
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
+    if (!activeRoot) return;
+    if (engine === "renpy" && hasInlinePython) {
+      setShowRestoreChoice(true);
+    } else {
+      await handleRestoreBackup();
+    }
+  }
+
   async function handleRestoreBackup() {
     const activeRoot = translationMode === "mods" ? gameRoot : root;
     if (!activeRoot) return;
@@ -2743,9 +2769,34 @@ export default function App() {
       const res = await restoreBackup(activeRoot);
       if (res.success) {
         setHasBackup(false);
+        setHasInlinePython(false);
+        setPyProgress(null);
         setError(t("restoreSuccess") as string);
       } else {
         setError(res.message || "Failed to restore backup");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      getBackupStatus(activeRoot).then(({ has_backup }) => setHasBackup(has_backup)).catch(() => {});
+      setPhase("idle");
+    }
+  }
+
+  async function handleRemovePythonOnly() {
+    setShowRestoreChoice(false);
+    const activeRoot = translationMode === "mods" ? gameRoot : root;
+    if (!activeRoot) return;
+    try {
+      setPhase("restoring");
+      setError(null);
+      const res = await removeInlinePython(activeRoot, String(target));
+      if (res.success) {
+        setHasInlinePython(false);
+        setPyProgress(null);
+        setError(t("restorePythonOnlySuccess") as string);
+      } else {
+        setError("Failed to remove Python strings.");
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -2913,6 +2964,13 @@ export default function App() {
   const hasMixedEngines = selectedEngines.length > 1;
   const activeRoot = translationMode === "mods" ? gameRoot : root;
 
+  const hasTranslations = useMemo(() => {
+    if (!project?.strings) return false;
+    for (const s of Object.values(project.strings)) {
+      if (s && s.translated && s.translated.trim() !== "") return true;
+    }
+    return false;
+  }, [project]);
 
   const translateDisabled =
     busy && !isPaused ||
@@ -3422,6 +3480,22 @@ export default function App() {
             </div>
           </label>
         )}
+        {engine === "renpy" && (
+          <label className="checkbox-label" style={{ display: 'inline-flex', alignItems: 'center', cursor: 'pointer', userSelect: 'none', marginLeft: '4px', fontSize: '13px' }} title={t("includePythonStringsHint") as string}>
+            <input
+              type="checkbox"
+              checked={includePythonStrings}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setIncludePythonStrings(next);
+                saveSetting("includePythonStrings", String(next));
+              }}
+              disabled={busy && !isPaused}
+              style={{ marginRight: '6px', cursor: 'pointer' }}
+            />
+            <span>{t("includePythonStrings")}</span>
+          </label>
+        )}
         <button
           className="btn-primary btn-translate"
           onClick={() => handleTranslate()}
@@ -3429,11 +3503,15 @@ export default function App() {
         >
           {t("translate")}
         </button>
-        {activeRoot && !busy && (
+        {activeRoot && (
           <button
             onClick={handleExportZip}
             className="btn-secondary"
             title={t("exportZipHint") as string}
+            style={{
+              visibility: (hasTranslations && !busy) ? "visible" : "hidden",
+              pointerEvents: (hasTranslations && !busy) ? "auto" : "none",
+            }}
           >
             {t("exportZip") as string}
           </button>
@@ -3454,7 +3532,7 @@ export default function App() {
             <span className="backup-label">{t("backupStatusLabel")}</span>
             <button
               className="btn-danger"
-              onClick={handleRestoreBackup}
+              onClick={handleRestoreBackupClick}
               disabled={busy && !isPaused}
               title={t("restoreOriginalHint") as string}
             >
@@ -4568,6 +4646,37 @@ export default function App() {
               </button>
               <button className="btn-danger" onClick={confirmAndDiscardBackup}>
                 {t("confirmDiscardBackupOk") as string}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRestoreChoice && (
+        <div className="modal-overlay" onClick={() => setShowRestoreChoice(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '520px' }}>
+            <h2>{t("restoreChoiceTitle") as string}</h2>
+            <p style={{ lineHeight: '1.5', marginBottom: '16px', color: '#cbd5e1' }}>{t("restoreChoiceDesc") as string}</p>
+            <div className="modal-actions" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button
+                className="btn-primary"
+                style={{ background: 'linear-gradient(135deg, #0284c7, #0369a1)', padding: '10px 16px', textAlign: 'center' }}
+                onClick={handleRemovePythonOnly}
+              >
+                {t("btnRestorePythonOnly") as string}
+              </button>
+              <button
+                className="btn-danger"
+                style={{ padding: '10px 16px', textAlign: 'center' }}
+                onClick={() => {
+                  setShowRestoreChoice(false);
+                  handleRestoreBackup();
+                }}
+              >
+                {t("btnRestoreAll") as string}
+              </button>
+              <button className="btn-secondary" style={{ marginTop: '4px' }} onClick={() => setShowRestoreChoice(false)}>
+                {t("confirmDiscardBackupCancel") as string}
               </button>
             </div>
           </div>
