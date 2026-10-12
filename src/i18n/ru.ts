@@ -238,7 +238,8 @@ const ru: Strings = {
   pyProgressTranslate: (done: number, total: number) =>
     `Python-строки: перевод ${done} / ${total}...`,
   pyProgressSummary: (trans: number, skipped: number) =>
-    `Python-строки: ${trans} переведено (${skipped} не требуют перевода)`,
+    `Python-строки: ${trans} записано (${skipped} не требуют перевода)`,
+  pyProgressNone: "Python-строки: отдельный перевод не требовался (все строки уже есть в диалогах)",
   pyClassified: "Классифицирован",
   pyTranslated: "Переведён",
   statusDone: "Готово",

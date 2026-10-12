@@ -3603,27 +3603,33 @@ export default function App() {
       )}
 
       {pyProgress && (pyProgress.total > 0 || pyProgress.stage === "done") && (
-        <div className="progress">
-          <div className="progressbar">
-            <div
-              className="progressfill engine-renpy"
-              style={{
-                width: pyProgress.stage === "done"
-                  ? ((pyProgress.translatedCount ?? 0) > 0 ? "100%" : "0%")
-                  : `${Math.round((pyProgress.done / Math.max(1, pyProgress.total)) * 100)}%`
-              }}
-            />
+        pyProgress.stage === "done" && (pyProgress.translatedCount ?? 0) === 0 ? (
+          <div style={{ textAlign: "right", fontSize: "12px", color: "#94a3b8", padding: "2px 0 6px" }}>
+            <span>{t("pyProgressNone") as string}</span>
           </div>
-          <span className="progresslabel engine-renpy" style={{ maxWidth: '480px' }}>
-            <strong>
-              {pyProgress.stage === "done"
-                ? (t("pyProgressSummary")(pyProgress.translatedCount ?? 0, pyProgress.skippedCount ?? 0) as string)
-                : pyProgress.stage === "classify"
-                ? (t("pyProgressClassify")(pyProgress.done, pyProgress.total) as string)
-                : (t("pyProgressTranslate")(pyProgress.done, pyProgress.total) as string)}
-            </strong>
-          </span>
-        </div>
+        ) : (
+          <div className="progress">
+            <div className="progressbar">
+              <div
+                className="progressfill engine-renpy"
+                style={{
+                  width: pyProgress.stage === "done"
+                    ? ((pyProgress.translatedCount ?? 0) > 0 ? "100%" : "0%")
+                    : `${Math.round((pyProgress.done / Math.max(1, pyProgress.total)) * 100)}%`
+                }}
+              />
+            </div>
+            <span className="progresslabel engine-renpy" style={{ maxWidth: '480px' }}>
+              <strong>
+                {pyProgress.stage === "done"
+                  ? (t("pyProgressSummary")(pyProgress.translatedCount ?? 0, pyProgress.skippedCount ?? 0) as string)
+                  : pyProgress.stage === "classify"
+                  ? (t("pyProgressClassify")(pyProgress.done, pyProgress.total) as string)
+                  : (t("pyProgressTranslate")(pyProgress.done, pyProgress.total) as string)}
+              </strong>
+            </span>
+          </div>
+        )
       )}
 
       {/* Live per-thread status — a collapsible grid, one card per worker. The

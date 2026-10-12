@@ -240,7 +240,8 @@ const en = {
   pyProgressTranslate: (done: number, total: number) =>
     `Python strings: translating ${done} / ${total}...`,
   pyProgressSummary: (trans: number, skipped: number) =>
-    `Python strings: ${trans} translated (${skipped} skipped)`,
+    `Python strings: ${trans} written (${skipped} skipped)`,
+  pyProgressNone: "Python strings: not needed (all strings already covered by main translation)",
   pyClassified: "Classified",
   pyTranslated: "Translated",
   statusDone: "Done",

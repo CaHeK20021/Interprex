@@ -2499,7 +2499,7 @@ def main(args_list=None):
         logger.info("Inline Python translation finished. %d strings translated (%d written to tl/%s/_interprex_inline.rpy, %d already present in tl/).",
                     success_count, written_count, lang_dir, success_count - written_count)
         logger.info("[PY_PROGRESS] done: translated=%d, skipped=%d, total=%d",
-                    success_count, total_skipped, len(all_candidates))
+                    written_count, total_skipped, len(all_candidates))
 
 
 if __name__ == "__main__":
