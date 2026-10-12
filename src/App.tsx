@@ -2450,14 +2450,17 @@ export default function App() {
         if (pyProgDone) {
           pyTranslatedCount = Number(pyProgDone[1]);
           pySkippedCount = Number(pyProgDone[2]);
+          const totalAll = Number(pyProgDone[3]);
           pyStage = "done";
-          setPyProgress({
-            done: pyTranslatedCount,
-            total: pyTranslatedCount,
-            stage: "done",
-            translatedCount: pyTranslatedCount,
-            skippedCount: pySkippedCount,
-          });
+          if (!applyCachedOnly || pyTranslatedCount > 0) {
+            setPyProgress({
+              done: pyTranslatedCount,
+              total: totalAll,
+              stage: "done",
+              translatedCount: pyTranslatedCount,
+              skippedCount: pySkippedCount,
+            });
+          }
           return;
         }
 
@@ -3536,12 +3539,12 @@ export default function App() {
               className="progressfill engine-renpy"
               style={{
                 width: pyProgress.stage === "done"
-                  ? "100%"
+                  ? ((pyProgress.translatedCount ?? 0) > 0 ? "100%" : "0%")
                   : `${Math.round((pyProgress.done / Math.max(1, pyProgress.total)) * 100)}%`
               }}
             />
           </div>
-          <span className="progresslabel engine-renpy">
+          <span className="progresslabel engine-renpy" style={{ maxWidth: '480px' }}>
             <strong>
               {pyProgress.stage === "done"
                 ? (t("pyProgressSummary")(pyProgress.translatedCount ?? 0, pyProgress.skippedCount ?? 0) as string)
@@ -3549,9 +3552,6 @@ export default function App() {
                 ? (t("pyProgressClassify")(pyProgress.done, pyProgress.total) as string)
                 : (t("pyProgressTranslate")(pyProgress.done, pyProgress.total) as string)}
             </strong>
-            <span style={{ marginLeft: '6px', opacity: 0.7, fontSize: '0.85em' }}>
-              ({t("translatePythonBtn") as string})
-            </span>
           </span>
         </div>
       )}

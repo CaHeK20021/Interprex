@@ -2150,19 +2150,49 @@ def main(args_list=None):
     logger.info("[PY_PROGRESS] candidates: total=%d, evaluate=%d, skipped_rules=%d",
                 len(all_candidates), total_eval_candidates, skipped_keys + skipped_hard)
 
+    # Load user translations from project.json if they exist.
+    # User translations in project.json have the highest priority!
+    project_translations = {}
+    project_path = game_path / INTERPREX_DIR / "project.json"
+    if project_path.is_file():
+        try:
+            with open(project_path, "r", encoding="utf-8") as f:
+                proj_data = json.load(f)
+            proj_strings = proj_data.get("strings", {})
+            for sid, sval in proj_strings.items():
+                if isinstance(sval, dict):
+                    orig = sval.get("original")
+                    trans = sval.get("translated")
+                    if orig and trans and trans.strip():
+                        project_translations[orig] = trans
+        except Exception as e:
+            logger.warning("Failed to load user translations from project.json: %s", e)
+
     # Translation cache: stores the actual inline-Python translations so a second
     # run re-translates ONLY new strings, and the no-API apply path (writeBack)
     # can lay them back down with zero API quota.
     trans_cache = _TranslationCache(game_path, args.target_lang)
 
     if args.apply_cached_only:
-        # No API at all. hard_translate entries are already in to_translate; add
-        # any gemini-candidate that has a stored translation (it was a TRANSLATE
-        # in a prior full run). Strings without a cached translation stay English.
+        # No API at all. Check translation cache, classify cache, and project.json translations.
+        classify_cache = _ClassificationCache(game_path, args.model, args.provider)
         for entry in gemini_candidates:
-            if trans_cache.get(entry) is not None:
-                to_translate.append(entry)
-        logger.info("Apply-cached-only mode: no API; applying from translation cache.")
+            hit = classify_cache.get(entry)
+            val = entry["value"]
+            has_translation = (trans_cache.get(entry) is not None) or (val in project_translations)
+            if hit is not None:
+                decision, reason = hit[0], hit[1]
+                if decision == "TRANSLATE":
+                    if has_translation:
+                        classified_gemini_trans += 1
+                        to_translate.append(entry)
+                elif decision == "SKIP":
+                    classified_gemini_skip += 1
+            else:
+                if has_translation:
+                    classified_gemini_trans += 1
+                    to_translate.append(entry)
+        logger.info("Apply-cached-only mode: no API; applying %d strings from translation cache / project.json.", len(to_translate))
     elif gemini_candidates:
         classify_cache = _ClassificationCache(game_path, args.model, args.provider)
         logger.info("[PY_PROGRESS] classify_start: total=%d", total_eval_candidates)
@@ -2269,24 +2299,6 @@ def main(args_list=None):
         logger.info("[PY_PROGRESS] done: translated=0, skipped=%d, total=%d", total_skipped, len(all_candidates))
         sys.exit(0)
         
-    # Load user translations from project.json if they exist.
-    # User translations in project.json have the highest priority!
-    project_translations = {}
-    project_path = game_path / INTERPREX_DIR / "project.json"
-    if project_path.is_file():
-        try:
-            with open(project_path, "r", encoding="utf-8") as f:
-                proj_data = json.load(f)
-            proj_strings = proj_data.get("strings", {})
-            for sid, sval in proj_strings.items():
-                if isinstance(sval, dict):
-                    orig = sval.get("original")
-                    trans = sval.get("translated")
-                    if orig and trans and trans.strip():
-                        project_translations[orig] = trans
-        except Exception as e:
-            logger.warning("Failed to load user translations from project.json: %s", e)
-
     # Step 4: Translate. Pull anything already in the translation cache (free), and
     # only send cache-misses to the API. This is what makes a re-run "translate
     # only new strings" and lets the no-API apply path work at all.
@@ -2427,13 +2439,17 @@ def main(args_list=None):
         seen_vals.add(original_val)
         pairs.append((original_val, translations[original_val]))
 
+    total_skipped = skipped_keys + skipped_hard + classified_gemini_skip
     if args.dry_run:
         for original_val, translated_val in pairs:
             logger.info("[DRY RUN] Would translate: %s ➔ %s", repr(original_val), repr(translated_val))
         success_count = len(pairs)
         logger.info("[DRY RUN] Finished simulation. Total strings to translate: %d", success_count)
+        logger.info("[PY_PROGRESS] done: translated=%d, skipped=%d, total=%d",
+                    success_count, total_skipped, len(all_candidates))
     else:
-        success_count = _write_inline_strings_file(game_path, lang_dir, pairs)
+        written_count = _write_inline_strings_file(game_path, lang_dir, pairs)
+        success_count = len(pairs)
         
         # Write the new Python translations back into project.json so they appear in the UI
         if project_path.is_file() and pairs:
@@ -2480,11 +2496,10 @@ def main(args_list=None):
                 logger.warning("Failed to sync translations back to project.json: %s", e)
 
         finalize_backups(game_path)
-        logger.info("Inline Python translation finished. Wrote %d string translations to tl/%s/_interprex_inline.rpy.",
-                    success_count, lang_dir)
-        total_skipped = len(all_candidates) - success_count
+        logger.info("Inline Python translation finished. %d strings translated (%d written to tl/%s/_interprex_inline.rpy, %d already present in tl/).",
+                    success_count, written_count, lang_dir, success_count - written_count)
         logger.info("[PY_PROGRESS] done: translated=%d, skipped=%d, total=%d",
-                    success_count, max(0, total_skipped), len(all_candidates))
+                    success_count, total_skipped, len(all_candidates))
 
 
 if __name__ == "__main__":

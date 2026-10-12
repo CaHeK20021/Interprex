@@ -348,7 +348,7 @@ body {
   white-space: nowrap;
   text-align: right;
   min-width: 120px;
-  max-width: 320px;
+  max-width: 480px;
   flex-shrink: 0;
   overflow: hidden;
   text-overflow: ellipsis;
