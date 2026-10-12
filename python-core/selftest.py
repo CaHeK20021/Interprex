@@ -1138,6 +1138,21 @@ def check_renpy_risk() -> None:
     print("OK — renpy newline match: trailing/leading empty stripped, interior kept, "
           "original-trailing respected, idempotent")
 
+    # --- square-bracket interpolation safety: Ren'Py conversions (!t, !c) kept, invalid escaped ---
+    from parsers.renpy import _escape_invalid_brackets as _eib
+    assert _eib("[pronounlist[0]!t]") == "[pronounlist[0]!t]"
+    assert _eib("[they!t!c]") == "[they!t!c]"
+    assert _eib("[selectedpronouns!t]") == "[selectedpronouns!t]"
+    assert _eib("[partner!t]") == "[partner!t]"
+    assert _eib("[mc]") == "[mc]"
+    assert _eib("[gui.about!t]") == "[gui.about!t]"
+    assert _eib("[renpy.license!t]") == "[renpy.license!t]"
+    assert _eib("[points:03d]") == "[points:03d]"
+    assert _eib("Russian [в её лице]") == "Russian [[в её лице]"
+    assert _eib("Footnote [1]") == "Footnote [[1]"
+    assert _eib("[any_unknown_var]", "[any_unknown_var]") == "[any_unknown_var]"
+    print("OK — renpy bracket interpolation: !t/!c/expressions kept, non-code escaped, idempotent")
+
     # --- is_technical_string: strip markup BEFORE the path/slash heuristic ---
     # Real bug (Beyond the Turquoise Stars): a one-word line wrapped in a closing
     # text tag — "{i}Exhausting.{/i}" — has no space, a '.', and a '/' (from the

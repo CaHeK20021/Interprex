@@ -1002,13 +1002,75 @@ def _match_newlines(translation: str, original: str) -> str:
     return "\n".join(t_lines)
 
 
-def _escape_invalid_brackets(s: str) -> str:
-    """Escape square brackets that are NOT valid Python expressions/variables,
+def _is_valid_renpy_sub(content: str) -> bool:
+    content = content.strip()
+    if not content:
+        return False
+
+    # Extract the Python expression part before any Ren'Py conversion flag (!) or format specifier (:).
+    # Ren'Py conversion flags (after !): frozenset("rstiqulc!")
+    # We must respect nested parentheses/brackets/quotes in the expression (e.g. `list[0]`, `func(x: 1)`).
+    expr = content
+    brackets = 0
+    parens = 0
+    in_quote = None
+
+    for idx, c in enumerate(content):
+        if in_quote:
+            if c == in_quote and (idx == 0 or content[idx - 1] != "\\"):
+                in_quote = None
+            continue
+        if c in ('"', "'"):
+            in_quote = c
+            continue
+        if c == "(":
+            parens += 1
+        elif c == ")":
+            if parens > 0:
+                parens -= 1
+        elif c == "[":
+            brackets += 1
+        elif c == "]":
+            if brackets > 0:
+                brackets -= 1
+        elif not parens and not brackets:
+            if c == "!" and (idx + 1 >= len(content) or content[idx + 1] != "="):
+                expr = content[:idx]
+                break
+            elif c == ":":
+                expr = content[:idx]
+                break
+
+    expr = expr.strip()
+    if not expr:
+        return False
+
+    # Pure digits like [1] or [0] are footnotes or literal numbers, not interpolation variables
+    if expr.isdigit():
+        return False
+
+    try:
+        compile(expr, "<string>", "eval")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _escape_invalid_brackets(s: str, original: str | None = None) -> str:
+    """Escape square brackets that are NOT valid Ren'Py interpolation expressions/variables,
     e.g. `[в её лице]` -> `[[в её лице]`. This prevents Ren'Py from attempting
     to compile them as interpolation variables, which raises SyntaxError and
-    crashes the game. Already escaped brackets `[[` are ignored."""
+    crashes the game. Already escaped brackets `[[` and valid Ren'Py expressions
+    (including conversions like `!t`, `!c` and format specifiers `:format`) are preserved."""
     if "[" not in s:
         return s
+
+    # Any bracket tag present in the original game string was authored by the dev
+    # and is known-valid for the engine; never escape it.
+    orig_brackets = set()
+    if original and "[" in original:
+        for m in re.finditer(r'\[([^\[\]]+)\]', original):
+            orig_brackets.add(m.group(0))
 
     out = []
     i = 0
@@ -1036,11 +1098,11 @@ def _escape_invalid_brackets(s: str) -> str:
                     j += 1
 
             if depth == 0:
+                full_tag = s[start:j]
                 content = s[start+1 : j-1]
-                try:
-                    compile(content, "<string>", "eval")
-                    out.append(s[start:j])
-                except SyntaxError:
+                if (full_tag in orig_brackets) or _is_valid_renpy_sub(content):
+                    out.append(full_tag)
+                else:
                     out.append("[[" + content + "]")
                     changed = True
                 i = j
@@ -2182,7 +2244,7 @@ class RenPyParser(BaseParser):
                     # box-fit shrink). Compared against the UNESCAPED original. No API.
                     tr = _match_newlines(tr, _unescape_translation(rec["original"]))
                     # Escape invalid square bracket substitutions to prevent runtime syntax errors
-                    tr = _escape_invalid_brackets(tr)
+                    tr = _escape_invalid_brackets(tr, _unescape_translation(rec["original"]))
 
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],
