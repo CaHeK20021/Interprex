@@ -2964,14 +2964,6 @@ export default function App() {
   const hasMixedEngines = selectedEngines.length > 1;
   const activeRoot = translationMode === "mods" ? gameRoot : root;
 
-  const hasTranslations = useMemo(() => {
-    if (!project?.strings) return false;
-    for (const s of Object.values(project.strings)) {
-      if (s && s.translated && s.translated.trim() !== "") return true;
-    }
-    return false;
-  }, [project]);
-
   const translateDisabled =
     busy && !isPaused ||
     !strings.length ||
@@ -3509,8 +3501,8 @@ export default function App() {
             className="btn-secondary"
             title={t("exportZipHint") as string}
             style={{
-              visibility: (hasTranslations && !busy) ? "visible" : "hidden",
-              pointerEvents: (hasTranslations && !busy) ? "auto" : "none",
+              visibility: (hasBackup && !busy) ? "visible" : "hidden",
+              pointerEvents: (hasBackup && !busy) ? "auto" : "none",
             }}
           >
             {t("exportZip") as string}
