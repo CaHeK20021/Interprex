@@ -2304,6 +2304,7 @@ class RenPyParser(BaseParser):
                         detected_font = self._detect_font(tr_val, font_style)
                     written += 1
 
+            self._inject_existing_tl_aliases(root, lang, string_entries, seen_strings)
             self._write_tl_files(root, lang, say_blocks, string_entries)
             self._write_language_file(root, lang)
             if detected_font:
@@ -2752,6 +2753,89 @@ class RenPyParser(BaseParser):
             abs_path = os.path.join(root, tl_rel.replace("/", os.sep))
             self._atomic_write(root, abs_path, content)
 
+    def _inject_existing_tl_aliases(
+        self,
+        root: str,
+        lang: str,
+        string_entries: dict[str, list[tuple[str, str, str]]],
+        seen_strings: set[str],
+    ) -> int:
+        """Find other existing translations in `game/tl/<other_lang>` (both loose
+        and inside .rpa archives) and add alias mappings to string_entries.
+        For example, if an official French translation mapped 'he/him' -> 'il/lui',
+        and our Russian translation maps 'he/him' -> 'он/его', this adds
+        'il/lui' -> 'он/его' into the Russian string translation table.
+        This ensures that existing save files or dynamic variables that were
+        evaluated while French was active will seamlessly render in Russian."""
+        orig_to_target: dict[str, tuple[str, str]] = {}
+        for tl_rel, entries in string_entries.items():
+            for src_comment, old_raw, new_tr in entries:
+                if old_raw and new_tr and old_raw != new_tr:
+                    orig_to_target[old_raw] = (tl_rel, new_tr)
+
+        if not orig_to_target:
+            return 0
+
+        re_pair = re.compile(
+            r'^\s*old\s+"(?P<old>(?:[^"\\]|\\.)*)"\s*\n\s*new\s+"(?P<new>(?:[^"\\]|\\.)*)"',
+            re.MULTILINE,
+        )
+
+        aliases_added = 0
+        from . import rpa as rpamod
+
+        def process_content(text: str, source_label: str) -> None:
+            nonlocal aliases_added
+            for m in re_pair.finditer(text):
+                other_old = _unescape_translation(m.group("old"))
+                other_new = _unescape_translation(m.group("new"))
+                if not other_old or not other_new or other_old == other_new:
+                    continue
+                if other_old in orig_to_target:
+                    target_tl_rel, target_tr = orig_to_target[other_old]
+                    if other_new not in seen_strings:
+                        seen_strings.add(other_new)
+                        string_entries.setdefault(target_tl_rel, []).append(
+                            (f"Alias from existing {source_label}", other_new, target_tr)
+                        )
+                        aliases_added += 1
+
+        game_tl = os.path.join(root, "game", "tl")
+        if os.path.isdir(game_tl):
+            for other_lang in os.listdir(game_tl):
+                if other_lang in (lang, "None", "cache"):
+                    continue
+                lang_dir = os.path.join(game_tl, other_lang)
+                if not os.path.isdir(lang_dir):
+                    continue
+                for dirpath, _, filenames in os.walk(lang_dir):
+                    for fn in filenames:
+                        if fn.endswith(".rpy"):
+                            fp = os.path.join(dirpath, fn)
+                            try:
+                                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                                    process_content(f.read(), f"tl/{other_lang}/{fn}")
+                            except Exception as e:
+                                logger.warning("failed reading loose tl file %s: %s", fp, e)
+
+        game_dir = os.path.join(root, "game")
+        for arc in rpamod.iter_rpa_files(game_dir):
+            try:
+                inner_files = rpamod.read_rpa(arc, want_suffix=".rpy")
+            except Exception:
+                continue
+            for rf in inner_files:
+                norm_p = rf.path.replace("\\", "/")
+                if norm_p.startswith("tl/"):
+                    parts = norm_p.split("/")
+                    if len(parts) >= 2:
+                        other_lang = parts[1]
+                        if other_lang in (lang, "None", "cache"):
+                            continue
+                        process_content(rf.data, norm_p)
+
+        return aliases_added
+
     def _write_language_file(self, root: str, lang: str) -> None:
         """Force the game to start in <lang>. init 999 runs after the game's own
         init, so config.language wins over the game's default."""
@@ -2761,6 +2845,8 @@ class RenPyParser(BaseParser):
             "# Added by Interprex — forces the translated language on every start.\n"
             "init 999 python:\n"
             f'    config.language = "{lang}"\n'
+            f'    if _preferences.language != "{lang}":\n'
+            f'        _preferences.language = "{lang}"\n'
             f'\n'
             f'    _interprex_orig_label_cb = config.label_callback\n'
             f'    def _interprex_language_callback(name, abnormal):\n'
@@ -2769,6 +2855,11 @@ class RenPyParser(BaseParser):
             f'        if _interprex_orig_label_cb:\n'
             f'            _interprex_orig_label_cb(name, abnormal)\n'
             f'    config.label_callback = _interprex_language_callback\n'
+            f'\n'
+            f'    def _interprex_ensure_language():\n'
+            f'        if _preferences.language != "{lang}":\n'
+            f'            renpy.change_language("{lang}")\n'
+            f'    config.start_interact_callbacks.append(_interprex_ensure_language)\n'
             f'\n'
             f'    def _interprex_after_load():\n'
             f'        if _preferences.language != "{lang}":\n'
