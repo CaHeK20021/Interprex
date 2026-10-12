@@ -796,6 +796,27 @@ _PAIRED_TEXT_TAGS = frozenset({
     "outlinecolor", "plain", "rb", "rt", "s", "shader", "size", "u",
 })
 
+# Standalones ({w}/{p}/{nw}/{fast}/{done}/{clear}/{image}/…) are self-closing;
+# they NEVER have a closing tag in Ren'Py syntax.
+_STANDALONE_TEXT_TAGS = frozenset({
+    "w", "p", "nw", "fast", "done", "clear", "image", "space", "vspace",
+})
+
+_STANDALONE_CLOSES_RE = re.compile(
+    r'\{/(?:w|p|nw|fast|done|clear|image|space|vspace)\b[^}]*\}',
+    re.IGNORECASE,
+)
+
+# Unclosed opening paired tag typo, e.g. `{iменя{/i}` -> `{i}меня{/i}`
+_UNCLOSED_OPEN_TAG_RE = re.compile(
+    r'\{([a-zA-Z]+)([\u0400-\u04FF][^{}]*?)(?=\{|\})'
+)
+
+# Cyrillic prose mistakenly wrapped in braces without '=', e.g. `{Далеко нет.}`
+_PROSE_IN_BRACES_RE = re.compile(
+    r'\{([^{}=]*[\u0400-\u04FF][^{}=]*)\}'
+)
+
 
 def _is_paired_text_tag(name: str) -> bool:
     return bool(name) and name.lower() in _PAIRED_TEXT_TAGS
@@ -823,6 +844,34 @@ def _repair_text_tags(s: str) -> str:
     if "{" not in s:
         return s
 
+    # 1. Strip illegal closing tags for standalone tags ({/w}, {/p}, {/nw}, etc.)
+    s = _STANDALONE_CLOSES_RE.sub("", s)
+
+    # 2. Fix unclosed opening tags where tag name merged with Cyrillic text ({iменя{/i} -> {i}меня{/i})
+    def _fix_unclosed_open(m: re.Match) -> str:
+        tag_name = m.group(1).lower()
+        if tag_name in _PAIRED_TEXT_TAGS or tag_name in _STANDALONE_TEXT_TAGS:
+            return f"{{{tag_name}}}{m.group(2)}"
+        return m.group(0)
+
+    s = _UNCLOSED_OPEN_TAG_RE.sub(_fix_unclosed_open, s)
+
+    # 3. Unwrap Cyrillic prose mistakenly wrapped in braces ({Далеко нет.} -> Далеко нет.)
+    def _unwrap_prose(m: re.Match) -> str:
+        body = m.group(1).strip()
+        prefix = " " if (m.start() > 0 and s[m.start() - 1] in ".!?,:;…" and not body.startswith(" ")) else ""
+        return prefix + body
+
+    s = _PROSE_IN_BRACES_RE.sub(_unwrap_prose, s)
+
+    # 4. Fix typoed `{q}` (or `{q=...}`) -> `{w}`
+    s = re.sub(r'\{q(\b|=.*?)\}', r'{w\1}', s, flags=re.IGNORECASE)
+    s = re.sub(r'\{/q\}', '', s, flags=re.IGNORECASE)
+
+    # 5. Fix HTML-style tags ({em} -> {i}, {strong} -> {b})
+    s = re.sub(r'\{/?(?:em)\}', lambda m: '{/i}' if '/' in m.group(0) else '{i}', s, flags=re.IGNORECASE)
+    s = re.sub(r'\{/?(?:strong)\}', lambda m: '{/b}' if '/' in m.group(0) else '{b}', s, flags=re.IGNORECASE)
+
     def _name(body: str) -> str:
         # Tag name = text before '=' (args) and without surrounding spaces.
         return body.split("=", 1)[0].strip()
@@ -838,13 +887,13 @@ def _repair_text_tags(s: str) -> str:
         out.append(s[pos:m.start()])
         pos = m.end()
         closing, body = m.group(1), m.group(2)
-        name = _name(body)
+        name = _name(body).lower()
 
         if not closing:
-            # Opening tag (or a standalone like {w=0.5}/{p}/{nw}/{clear}); we only
-            # need real paired tags on the stack. Push the name so a later close
-            # can match it.
-            open_stack.append(name)
+            # ONLY push paired tags onto open_stack! Standalones ({w}, {p}, etc.)
+            # are self-closing and must NEVER be on the LIFO stack.
+            if _is_paired_text_tag(name):
+                open_stack.append(name)
             out.append(m.group(0))
         else:
             if name == "":
@@ -867,8 +916,9 @@ def _repair_text_tags(s: str) -> str:
                 nested_closes = []
                 while open_stack and open_stack[-1] != name:
                     popped = open_stack.pop()
-                    nested_closes.append("{/%s}" % popped)
-                    early_closed[popped] += 1
+                    if _is_paired_text_tag(popped):
+                        nested_closes.append("{/%s}" % popped)
+                        early_closed[popped] += 1
                 # Now pop 'name' itself
                 if open_stack:
                     open_stack.pop()
@@ -882,8 +932,9 @@ def _repair_text_tags(s: str) -> str:
                 nested_closes = []
                 while open_stack and open_stack[-1] != target_tag:
                     popped = open_stack.pop()
-                    nested_closes.append("{/%s}" % popped)
-                    early_closed[popped] += 1
+                    if _is_paired_text_tag(popped):
+                        nested_closes.append("{/%s}" % popped)
+                        early_closed[popped] += 1
                 if open_stack:
                     open_stack.pop()
                 out.append("".join(nested_closes))

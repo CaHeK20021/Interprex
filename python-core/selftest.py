@@ -1097,9 +1097,22 @@ def check_renpy_risk() -> None:
     # Unknown/custom names: don't guess a snap.
     assert _rt("{i}x{/custom}") == "{i}x{/custom}"
     assert _rt("{custom}x{/color}") == "{custom}x{/color}"
+    # Standalone tags ({w}, {p}, {nw}, etc.) never have closes -> {/w} is stripped
+    assert _rt('"{i}Тем...{w} {b}Убив [mc]?!{/b}{/w}{/i}"') == '"{i}Тем...{w} {b}Убив [mc]?!{/b}{/i}"'
+    assert _rt('"{b}{i}Энджел!{w} Отвечай мне!{/w}{/i}{/b}"') == '"{b}{i}Энджел!{w} Отвечай мне!{/i}{/b}"'
+    assert _rt('Энджел улыбался.{w} {i}Улыбался.{w} {/w}{/i}Находя') == 'Энджел улыбался.{w} {i}Улыбался.{w} {/i}Находя'
+    assert _rt('"{size=50}{i}{b}Я люблю тебя,{w} Эван.{/w}{/b}{/i}{/size}"') == '"{size=50}{i}{b}Я люблю тебя,{w} Эван.{/b}{/i}{/size}"'
+    # Unclosed opening tag typos ({iменя{/i} -> {i}меня{/i})
+    assert _rt('Ты любишь вовсе не {iменя{/i}, а {i}мои страдания{/i}.') == 'Ты любишь вовсе не {i}меня{/i}, а {i}мои страдания{/i}.'
+    # Prose in braces unwrapped
+    assert _rt('К несчастью для него, Эван ещё не закончил.{Далеко нет.}') == 'К несчастью для него, Эван ещё не закончил. Далеко нет.'
+    # Q-tag typo restored to {w}
+    assert _rt('И всё же он ничего не увидел.{q} Как знать') == 'И всё же он ничего не увидел.{w} Как знать'
     # Idempotent: re-running never re-mangles a fixed string.
     for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain",
-              "{i}{b}test.{/i}{/b}", "{i}x{/color}", "{color=#fff}red{/i}"):
+              "{i}{b}test.{/i}{/b}", "{i}x{/color}", "{color=#fff}red{/i}",
+              '"{i}Тем...{w} {b}Убив [mc]?!{/b}{/w}{/i}"',
+              'Ты любишь вовсе не {iменя{/i}, а {i}мои страдания{/i}.'):
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 

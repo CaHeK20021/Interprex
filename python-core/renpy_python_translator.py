@@ -2141,9 +2141,15 @@ def main(args_list=None):
                         logger.info("[DRY RUN] Would skip: %s (cached: %s)", repr(entry['value']), reason)
 
         if uncached_entries:
-            target_batches = max(total_workers, math.ceil(len(uncached_entries) / 40))
-            batch_size = min(40, max(5, math.ceil(len(uncached_entries) / target_batches)))
-            batches = [uncached_entries[i : i + batch_size] for i in range(0, len(uncached_entries), batch_size)]
+            max_b, min_b = 40, 20
+            if len(uncached_entries) <= max_b:
+                batches = [uncached_entries]
+            else:
+                n_batches = math.ceil(len(uncached_entries) / max_b)
+                max_workers_possible = max(1, len(uncached_entries) // min_b)
+                n_batches = max(n_batches, min(total_workers, max_workers_possible))
+                batch_size = math.ceil(len(uncached_entries) / n_batches)
+                batches = [uncached_entries[i : i + batch_size] for i in range(0, len(uncached_entries), batch_size)]
 
             logger.info("Classifying %d candidates with Gemini in %d parallel batches (threads=%d)...", len(uncached_entries), len(batches), total_workers)
 
@@ -2239,9 +2245,15 @@ def main(args_list=None):
         logger.info("Translation cache hit: %d / %d strings", len(translations), len(to_translate))
 
     if uncached_to_translate and not args.apply_cached_only:
-        target_batches = max(total_workers, math.ceil(len(uncached_to_translate) / 30))
-        batch_size = min(30, max(5, math.ceil(len(uncached_to_translate) / target_batches)))
-        batches = [uncached_to_translate[i : i + batch_size] for i in range(0, len(uncached_to_translate), batch_size)]
+        max_b, min_b = 30, 20
+        if len(uncached_to_translate) <= max_b:
+            batches = [uncached_to_translate]
+        else:
+            n_batches = math.ceil(len(uncached_to_translate) / max_b)
+            max_workers_possible = max(1, len(uncached_to_translate) // min_b)
+            n_batches = max(n_batches, min(total_workers, max_workers_possible))
+            batch_size = math.ceil(len(uncached_to_translate) / n_batches)
+            batches = [uncached_to_translate[i : i + batch_size] for i in range(0, len(uncached_to_translate), batch_size)]
 
         logger.info("Translating %d strings in %d parallel batches (threads=%d)...", len(uncached_to_translate), len(batches), total_workers)
 
