@@ -110,6 +110,7 @@ class _ClassificationCache:
         self._version_key = _cache_version_key(model, provider)
         self._entries: dict[str, dict] = {}
         self._dirty = False
+        self._lock = threading.Lock()
         self._load()
 
     # -- persistence ----------------------------------------------------------
@@ -125,7 +126,7 @@ class _ClassificationCache:
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             self._entries = {}
 
-    def save(self):
+    def _save_locked(self):
         if not self._dirty:
             return
         try:
@@ -137,24 +138,43 @@ class _ClassificationCache:
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._dirty = False
             logger.info("Classification cache saved: %d entries", len(self._entries))
         except OSError as exc:
             logger.warning("Failed to save classification cache: %s", exc)
+
+    def save(self):
+        with self._lock:
+            self._save_locked()
 
     # -- lookup / store -------------------------------------------------------
 
     def get(self, entry: dict) -> tuple[str, str] | None:
         """Return (decision, reason) or None on miss."""
         key = _candidate_cache_key(entry)
-        hit = self._entries.get(key)
+        with self._lock:
+            hit = self._entries.get(key)
         if hit is None:
             return None
         return hit["decision"], hit["reason"]
 
     def put(self, entry: dict, decision: str, reason: str):
-        key = _candidate_cache_key(entry)
-        self._entries[key] = {"decision": decision, "reason": reason}
-        self._dirty = True
+        with self._lock:
+            key = _candidate_cache_key(entry)
+            self._entries[key] = {"decision": decision, "reason": reason}
+            self._dirty = True
+
+    def put_batch(self, batch: list[dict], decisions_map: dict[str, tuple[str, str]]):
+        """Store decisions for a completed batch and flush to disk immediately."""
+        with self._lock:
+            for entry in batch:
+                if entry["value"] in decisions_map:
+                    decision, reason = decisions_map[entry["value"]]
+                    key = _candidate_cache_key(entry)
+                    self._entries[key] = {"decision": decision, "reason": reason}
+                    self._dirty = True
+            if self._dirty:
+                self._save_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +216,7 @@ class _TranslationCache:
         self._version_key = _translation_version_key(target_lang)
         self._entries: dict[str, dict] = {}
         self._dirty = False
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self):
@@ -211,7 +232,7 @@ class _TranslationCache:
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             self._entries = {}
 
-    def save(self):
+    def _save_locked(self):
         if not self._dirty:
             return
         try:
@@ -223,18 +244,36 @@ class _TranslationCache:
                 }, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._dirty = False
             logger.info("Translation cache saved: %d entries", len(self._entries))
         except OSError as exc:
             logger.warning("Failed to save translation cache: %s", exc)
 
+    def save(self):
+        with self._lock:
+            self._save_locked()
+
     def get(self, entry: dict) -> str | None:
         """Return the cached translation for this candidate, or None on miss."""
-        hit = self._entries.get(_candidate_cache_key(entry))
+        key = _candidate_cache_key(entry)
+        with self._lock:
+            hit = self._entries.get(key)
         return hit["translated"] if hit else None
 
     def put(self, entry: dict, translated: str):
-        self._entries[_candidate_cache_key(entry)] = {"translated": translated}
-        self._dirty = True
+        with self._lock:
+            self._entries[_candidate_cache_key(entry)] = {"translated": translated}
+            self._dirty = True
+
+    def put_batch(self, batch: list[dict], fresh_translations: dict[str, str]):
+        """Store translations for a completed batch and flush to disk immediately."""
+        with self._lock:
+            for entry in batch:
+                tr = fresh_translations.get(entry["value"])
+                if tr:
+                    self._entries[_candidate_cache_key(entry)] = {"translated": tr}
+            self._dirty = True
+            self._save_locked()
 
 
 CLASSIFICATION_PROMPT = """
@@ -668,11 +707,12 @@ def _build_key_list(api_keys, legacy_key: str) -> list[str]:
     return keys or [legacy_key or ""]
 
 
-def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, process_fn):
+def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, process_fn, on_batch_done=None):
     """Run every batch across the key-pool with failover; return the merged result.
 
     process_fn(batch, key, worker_idx) -> dict; it MUST raise on an API error so
     the pool can classify it. label is the log verb ("Classified"/"Translated").
+    on_batch_done(batch, result) is called immediately when a batch finishes successfully.
     """
     # Same cap as scheduler.MAX_THREADS_PER_KEY (avoid importing scheduler here
     # for a constant — keep in sync if either changes).
@@ -768,6 +808,11 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                 auth_fails = 0
                 with merged_lock:
                     merged.update(result)
+                if on_batch_done:
+                    try:
+                        on_batch_done(batch, result)
+                    except Exception as e_cbd:
+                        logger.warning("on_batch_done callback error: %s", e_cbd)
                 account_one()
                 logger.info("%s batch %d/%d [thread %d]", label, batch_idx + 1, total, worker_idx)
             except Exception as e:
@@ -2156,13 +2201,16 @@ def main(args_list=None):
             def _classify_pf(batch, key, worker_idx):
                 return _classify_batch_raw(batch, key, args.model, args.base_url, args.provider)
 
+            def _on_classify_batch_done(batch, decisions):
+                classify_cache.put_batch(batch, decisions)
+
             decisions_map = _run_batches_over_keypool(
-                batches, keys, args.threads, args.delay_seconds, "Classified", _classify_pf
+                batches, keys, args.threads, args.delay_seconds, "Classified", _classify_pf,
+                on_batch_done=_on_classify_batch_done
             )
 
             for entry in uncached_entries:
                 decision, reason = decisions_map.get(entry["value"], ("SKIP", "Failed to classify/error"))
-                classify_cache.put(entry, decision, reason)
                 if decision == "TRANSLATE":
                     classified_gemini_trans += 1
                     to_translate.append(entry)
@@ -2260,8 +2308,12 @@ def main(args_list=None):
         def _translate_pf(batch, key, worker_idx):
             return _translate_batch_raw(batch, args.target_lang, key, args.model, args.base_url, args.provider)
 
+        def _on_translate_batch_done(batch, fresh_map):
+            trans_cache.put_batch(batch, fresh_map)
+
         fresh = _run_batches_over_keypool(
-            batches, keys, args.threads, args.delay_seconds, "Translated", _translate_pf
+            batches, keys, args.threads, args.delay_seconds, "Translated", _translate_pf,
+            on_batch_done=_on_translate_batch_done
         )
 
         # Retry strings the model silently dropped from their batch (a real failure
@@ -2272,7 +2324,8 @@ def main(args_list=None):
         if missing:
             logger.info("Retrying %d string(s) the model dropped from their batch...", len(missing))
             retry = _run_batches_over_keypool(
-                [[e] for e in missing], keys, args.threads, args.delay_seconds, "Retried", _translate_pf
+                [[e] for e in missing], keys, args.threads, args.delay_seconds, "Retried", _translate_pf,
+                on_batch_done=_on_translate_batch_done
             )
             fresh.update(retry)
             still = [e["value"] for e in missing if e["value"] not in fresh]
@@ -2281,10 +2334,6 @@ def main(args_list=None):
                                len(still), [s[:50] for s in still[:10]])
 
         translations.update(fresh)
-        for entry in uncached_to_translate:
-            tr = fresh.get(entry["value"])
-            if tr:
-                trans_cache.put(entry, tr)
         trans_cache.save()
 
     # Step 4b: Validate Ren'Py tokens in all translations. If [var], {tag}, or

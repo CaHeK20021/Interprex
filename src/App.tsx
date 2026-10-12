@@ -2397,6 +2397,20 @@ export default function App() {
           setPyProgress({ done: 0, total: pyTotal, stage: "classify" });
           return;
         }
+        const cacheHitMatch = line.match(/Classification cache hit: (\d+) \/ (\d+) candidates/);
+        if (cacheHitMatch) {
+          const hitCount = Number(cacheHitMatch[1]);
+          const totalCount = Number(cacheHitMatch[2]);
+          setPyProgress({ done: hitCount, total: totalCount, stage: "classify" });
+          return;
+        }
+        const transCacheHitMatch = line.match(/Translation cache hit: (\d+) \/ (\d+) strings/);
+        if (transCacheHitMatch) {
+          const hitCount = Number(transCacheHitMatch[1]);
+          const totalCount = Number(transCacheHitMatch[2]);
+          setPyProgress({ done: hitCount, total: totalCount, stage: "translate" });
+          return;
+        }
         const classifyStart = line.match(/Classifying (\d+) candidates.*in (\d+) parallel batches.*\(threads=(\d+)\)/);
         if (classifyStart) {
           pyTotal = Number(classifyStart[1]);
