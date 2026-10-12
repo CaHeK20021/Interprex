@@ -1955,61 +1955,45 @@ def gather_translation_files(root: str, engine: str, target_lang: str) -> list[s
     import json
     files = set()
     
-    # 1. Ren'Py specific translation files (written directly to tl/ or fonts/)
-    if engine == "renpy":
-        # standard tl folder
-        tl_dir = os.path.join(root, "game", "tl", target_lang)
-        if os.path.isdir(tl_dir):
-            for dirpath, _, filenames in os.walk(tl_dir):
-                for fname in filenames:
-                    abs_path = os.path.join(dirpath, fname)
-                    rel = os.path.relpath(abs_path, root).replace("\\", "/")
-                    files.add(rel)
-        # fonts folder
-        fonts_dir = os.path.join(root, "game", "fonts")
-        if os.path.isdir(fonts_dir):
-            for dirpath, _, filenames in os.walk(fonts_dir):
-                for fname in filenames:
-                    abs_path = os.path.join(dirpath, fname)
-                    rel = os.path.relpath(abs_path, root).replace("\\", "/")
-                    files.add(rel)
-        # language switcher file
-        for switcher in ["game/interprex_language.rpy", "game/interprex_language.rpyc"]:
-            if os.path.isfile(os.path.join(root, switcher)):
-                files.add(switcher)
-                
-    # 2. Files modified in-place (tracked via backups)
-    backup_dir = os.path.join(root, ".interprex_backups")
-    metadata_path = os.path.join(backup_dir, "metadata.json")
-    if os.path.isfile(metadata_path):
-        try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-            for rel_path in metadata:
-                # rel_path is already forward slash relative path from root
-                if os.path.isfile(os.path.join(root, rel_path.replace("/", os.sep))):
-                    files.add(rel_path)
-        except Exception:
-            pass
-
-    # 3. Add all files from the Interprex directory (project.json, glossary, caches, etc.)
+    # Check Interprex directory for project.json
     interprex_dir = os.path.join(root, "Interprex")
-    if os.path.isdir(interprex_dir):
-        for dirpath, _, filenames in os.walk(interprex_dir):
-            for fname in filenames:
-                abs_path = os.path.join(dirpath, fname)
-                rel = os.path.relpath(abs_path, root).replace("\\", "/")
-                files.add(rel)
+    legacy_dir = os.path.join(root, ".interprex")
+    target_dir = interprex_dir if os.path.isdir(interprex_dir) else (legacy_dir if os.path.isdir(legacy_dir) else None)
+    if not target_dir:
+        return []
 
-    # 4. Support legacy .interprex directory if present
-    dot_interprex_dir = os.path.join(root, ".interprex")
-    if os.path.isdir(dot_interprex_dir):
-        for dirpath, _, filenames in os.walk(dot_interprex_dir):
-            for fname in filenames:
-                abs_path = os.path.join(dirpath, fname)
-                rel = os.path.relpath(abs_path, root).replace("\\", "/")
-                files.add(rel)
-            
+    proj_file = os.path.join(target_dir, "project.json")
+    if not os.path.isfile(proj_file):
+        return []
+
+    # Verify that project.json actually contains translated strings
+    has_translations = False
+    try:
+        with open(proj_file, "r", encoding="utf-8") as f:
+            pdata = json.load(f)
+        strings = pdata.get("strings", {})
+        for sid, item in strings.items():
+            if isinstance(item, dict) and item.get("translated"):
+                has_translations = True
+                break
+    except Exception:
+        pass
+
+    if not has_translations:
+        return []
+
+    # Gather project files (project.json, caches, glossary), ignoring temporary live state
+    EXCLUDE_FILES = {
+        "supervisor_live.json", "supervisor.lock", "interprex.lock"
+    }
+    for dirpath, _, filenames in os.walk(target_dir):
+        for fname in filenames:
+            if fname in EXCLUDE_FILES or fname.endswith((".tmp", ".lock", ".orig_temp")):
+                continue
+            abs_path = os.path.join(dirpath, fname)
+            rel = os.path.relpath(abs_path, root).replace("\\", "/")
+            files.add(rel)
+
     return sorted(list(files))
 
 
@@ -2029,7 +2013,7 @@ def project_export_zip(req: ExportZipReq) -> dict:
         # Gather files
         files_to_zip = gather_translation_files(req.root, req.engine, req.target_lang)
         if not files_to_zip:
-            return {"success": False, "message": "No translated files found to pack."}
+            return {"success": False, "message": "Перевод ещё не выполнен. Сначала переведите строки перед экспортом."}
             
         # Write zip
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
