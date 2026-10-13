@@ -92,6 +92,62 @@ export function saveProviderSetting(
   }
 }
 
+/**
+ * For Google (gemini), rate limits (RPM and TPM) are model-specific because
+ * each model has very different quotas (e.g. 2.5-flash: 15 RPM / 16K TPM vs
+ * 2.5-pro: 2 RPM / 32K TPM vs gemma: 30 RPM). Other providers keep a single
+ * rate limit across all models.
+ */
+export function loadModelRpm(provider: string, model: string): number {
+  if (provider === "gemini" && model) {
+    try {
+      const val = localStorage.getItem(`${KEYS.providerRpm}.${provider}.${model}`);
+      if (val !== null) return Math.max(0, Number(val) || 0);
+    } catch {
+      /* ignore */
+    }
+  }
+  return Math.max(0, Number(loadProviderSetting("providerRpm", provider, "0")) || 0);
+}
+
+export function saveModelRpm(provider: string, model: string, rpm: number): void {
+  if (provider === "gemini" && model) {
+    try {
+      localStorage.setItem(`${KEYS.providerRpm}.${provider}.${model}`, String(rpm));
+    } catch {
+      /* ignore */
+    }
+  }
+  saveProviderSetting("providerRpm", provider, String(rpm));
+}
+
+export function loadModelTpmK(provider: string, model: string): number {
+  if (provider === "gemini" && model) {
+    try {
+      const val = localStorage.getItem(`${KEYS.providerTpm}.${provider}.${model}`);
+      if (val !== null) {
+        const raw = Math.max(0, Number(val) || 0);
+        return raw >= 1000 ? Math.round(raw / 1000) : raw;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  const raw = Math.max(0, Number(loadProviderSetting("providerTpm", provider, "0")) || 0);
+  return raw >= 1000 ? Math.round(raw / 1000) : raw;
+}
+
+export function saveModelTpmK(provider: string, model: string, tpmK: number): void {
+  if (provider === "gemini" && model) {
+    try {
+      localStorage.setItem(`${KEYS.providerTpm}.${provider}.${model}`, String(tpmK));
+    } catch {
+      /* ignore */
+    }
+  }
+  saveProviderSetting("providerTpm", provider, String(tpmK));
+}
+
 // API keys are a LIST per provider now (cloud backends can rotate across many:
 // Gemini, OpenRouter, …). Stored as a JSON array under providerApiKey. Reading
 // migrates the old single providerApiKey (plain string) + providerApiKey2 so a

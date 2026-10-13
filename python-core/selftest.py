@@ -4726,6 +4726,27 @@ def check_providers() -> None:
     assert "стране недоступен" in str(err_geo)
     assert _classify_error(str(err_geo)) == "auth"
 
+    # Model-specific rate limits for Gemini in supervisor
+    from supervisor import resolve_provider_config
+    settings_gemini = {
+        "provider": "gemini",
+        "providerModel.gemini": "gemini-2.5-flash",
+        "providerRpm.gemini": "10",
+        "providerTpm.gemini": "10",
+        "providerRpm.gemini.gemini-2.5-flash": "15",
+        "providerTpm.gemini.gemini-2.5-flash": "16",
+        "providerRpm.gemini.gemma-4-31b-it": "30",
+        "providerTpm.gemini.gemma-4-31b-it": "60",
+    }
+    cfg_flash = resolve_provider_config(settings_gemini)
+    assert cfg_flash["delay_seconds"] == 60.0 / 15, cfg_flash
+    assert cfg_flash["tpm_limit"] == 16000, cfg_flash
+
+    settings_gemini["providerModel.gemini"] = "gemma-4-31b-it"
+    cfg_gemma = resolve_provider_config(settings_gemini)
+    assert cfg_gemma["delay_seconds"] == 60.0 / 30, cfg_gemma
+    assert cfg_gemma["tpm_limit"] == 60000, cfg_gemma
+
 
 def check_scheduler() -> None:
     """The parallel translation scheduler (scheduler.py): correctness under the

@@ -40,6 +40,10 @@ import {
   saveProviderSetting,
   loadProviderKeys,
   saveProviderKeys,
+  loadModelRpm,
+  saveModelRpm,
+  loadModelTpmK,
+  saveModelTpmK,
 } from "./lib/settings";
 import type { Engine, FontStyle, ProjectFile, TranslationString } from "./lib/types";
 import { engineLabel } from "./lib/types";
@@ -718,18 +722,11 @@ export default function App() {
   // tpmLimitK: tokens-per-minute PER KEY in thousands (UI: 16 → 16000 tok/min).
   // Must match scheduler.MAX_THREADS_PER_KEY / the select below.
   const MAX_THREADS = 40;
-  /** Load TPM as K: values ≥1000 are legacy raw tok/min → convert once. */
-  function loadTpmK(p: string): number {
-    const raw = Math.max(0, Number(loadProviderSetting("providerTpm", p, "0")) || 0);
-    return raw >= 1000 ? Math.round(raw / 1000) : raw;
-  }
   const [threads, setThreads] = useState(() =>
     Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", provider, "1")) || 1)),
   );
-  const [rpmLimit, setRpmLimit] = useState(() =>
-    Math.max(0, Number(loadProviderSetting("providerRpm", provider, "0")) || 0),
-  );
-  const [tpmLimitK, setTpmLimitK] = useState(() => loadTpmK(provider));
+  const [rpmLimit, setRpmLimit] = useState(() => loadModelRpm(provider, model));
+  const [tpmLimitK, setTpmLimitK] = useState(() => loadModelTpmK(provider, model));
   // Seconds to wait for one API reply body before WE abort. Default 200 matches
   // the sidecar; NVIDIA free NIM can need 600–900. Per-provider.
   const DEFAULT_HTTP_TIMEOUT = 200;
@@ -1377,7 +1374,13 @@ export default function App() {
         setModel((cur) => {
           if (cur && found.includes(cur)) return cur;
           const pick = active || found[0] || "";
-          if (pick !== cur) saveProviderSetting("providerModel", provider, pick);
+          if (pick !== cur) {
+            saveProviderSetting("providerModel", provider, pick);
+            if (provider === "gemini") {
+              setRpmLimit(loadModelRpm(provider, pick));
+              setTpmLimitK(loadModelTpmK(provider, pick));
+            }
+          }
           return pick;
         });
       } catch {
@@ -1867,7 +1870,7 @@ export default function App() {
       // tick; loadTpmK is the same source the field uses after switch.
       // UI is in K (16 → 16000 tok/min); sidecar wants absolute tokens.
       const runTpmK = providerInfo.needsKey
-        ? Math.max(0, tpmLimitK || loadTpmK(provider) || 0)
+        ? Math.max(0, tpmLimitK || loadModelTpmK(provider, model) || 0)
         : 0;
       const runTpmLimit = runTpmK * 1000;
 
@@ -3806,11 +3809,11 @@ export default function App() {
               // fields show ITS url/key/model rather than the old provider's.
               setBaseUrl(loadProviderSetting("providerBaseUrl", next, ""));
               setApiKeys(loadProviderKeys(next));
-              setShownKeys(new Set());
-              setModel(loadProviderSetting("providerModel", next, ""));
+              const nextModel = loadProviderSetting("providerModel", next, "");
+              setModel(nextModel);
               setThreads(Math.min(MAX_THREADS, Math.max(1, Number(loadProviderSetting("providerThreads", next, "1")) || 1)));
-              setRpmLimit(Math.max(0, Number(loadProviderSetting("providerRpm", next, "0")) || 0));
-              setTpmLimitK(loadTpmK(next));
+              setRpmLimit(loadModelRpm(next, nextModel));
+              setTpmLimitK(loadModelTpmK(next, nextModel));
               setHttpTimeoutS(Math.min(3600, Math.max(10,
                 Number(loadProviderSetting("providerTimeout", next, String(DEFAULT_HTTP_TIMEOUT))) || DEFAULT_HTTP_TIMEOUT,
               )));
@@ -3838,8 +3841,13 @@ export default function App() {
             <select
               value={models.includes(model) ? model : ""}
               onChange={(e) => {
-                setModel(e.target.value);
-                saveProviderSetting("providerModel", provider, e.target.value);
+                const nextModel = e.target.value;
+                setModel(nextModel);
+                saveProviderSetting("providerModel", provider, nextModel);
+                if (provider === "gemini") {
+                  setRpmLimit(loadModelRpm(provider, nextModel));
+                  setTpmLimitK(loadModelTpmK(provider, nextModel));
+                }
               }}
               disabled={busy && !isFullyPaused}
             >
@@ -3957,7 +3965,7 @@ export default function App() {
                   const digits = e.target.value.replace(/[^\d]/g, "");
                   const v = Math.min(100000, Number(digits) || 0);
                   setRpmLimit(v);
-                  saveProviderSetting("providerRpm", provider, String(v));
+                  saveModelRpm(provider, model, v);
                 }}
                 disabled={busy && !isFullyPaused}
               />
@@ -3978,7 +3986,7 @@ export default function App() {
                   // Stored/displayed in K (16 = 16000 tok/min). Cap 10000K.
                   const v = Math.min(10_000, Number(digits) || 0);
                   setTpmLimitK(v);
-                  saveProviderSetting("providerTpm", provider, String(v));
+                  saveModelTpmK(provider, model, v);
                 }}
                 disabled={busy && !isFullyPaused}
               />

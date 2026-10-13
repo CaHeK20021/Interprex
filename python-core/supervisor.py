@@ -103,8 +103,12 @@ def resolve_provider_config(settings: Dict[str, Any], provider_override: Optiona
     model = settings.get(f"providerModel.{provider}", "")
     threads = int(settings.get(f"providerThreads.{provider}", "1") or 1)
     rpm = float(settings.get(f"providerRpm.{provider}", "0") or 0)
+    if provider == "gemini" and model and f"providerRpm.gemini.{model}" in settings:
+        rpm = float(settings.get(f"providerRpm.gemini.{model}", "0") or 0)
     delay_seconds = (60.0 / rpm) if rpm > 0 else 0.0
     tpm_raw = float(settings.get(f"providerTpm.{provider}", "0") or 0)
+    if provider == "gemini" and model and f"providerTpm.gemini.{model}" in settings:
+        tpm_raw = float(settings.get(f"providerTpm.gemini.{model}", "0") or 0)
     # App stores TPM in thousands (e.g. 16 means 16,000)
     tpm_limit = int(tpm_raw * 1000) if 0 < tpm_raw < 10000 else int(tpm_raw)
     batch_size = int(settings.get("maxBatchSize", "30") or 30)
