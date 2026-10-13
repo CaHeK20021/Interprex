@@ -120,8 +120,10 @@ class Usage:
     completion_tokens: int = 0
     total_tokens: int = 0
 
-    def billed_tokens(self) -> int:
+    def billed_tokens(self, include_output: bool = True) -> int:
         """Tokens that count against a TPM budget for this completion."""
+        if not include_output:
+            return int(self.prompt_tokens or 0)
         if self.total_tokens > 0:
             return int(self.total_tokens)
         return int(self.prompt_tokens or 0) + int(self.completion_tokens or 0)
@@ -435,6 +437,9 @@ class Calibrator:
 class BaseProvider(ABC):
     """name is the stable provider id used by the frontend dropdown."""
     name: str = ""
+    # True if the provider's TPM rate limit accounts for both input and output tokens
+    # (e.g. OpenAI). False if TPM counts only input tokens (e.g. Google Gemini).
+    tpm_counts_output: bool = True
 
     @abstractmethod
     def _complete(self, prompt: str, cfg: ProviderConfig) -> CompletionResult:

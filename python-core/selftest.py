@@ -4562,7 +4562,7 @@ def check_prompt_width() -> None:
 
 def check_providers() -> None:
     from providers.openai_compat import OpenRouterProvider
-    from providers.base import ProviderConfig, http_timeout_s, DEFAULT_HTTP_TIMEOUT_S, get_http_client
+    from providers.base import ProviderConfig, http_timeout_s, DEFAULT_HTTP_TIMEOUT_S, get_http_client, Usage
     from unittest.mock import patch, MagicMock
     import httpx
 
@@ -4677,13 +4677,54 @@ def check_providers() -> None:
     assert any(cls.name == "nvidia" for cls in REGISTRY)
     ncfg = ProviderConfig(api_key="nvapi-test", model="google/gemma-4-31b-it")
     assert nvidia._base(ncfg) == "https://integrate.api.nvidia.com/v1"
-    # Proxy override still wins when autocheck routes via proxy.
     ncfg_proxy = ProviderConfig(
         api_key="nvapi-test",
         base_url="https://example-proxy.example/v1",
         model="google/gemma-4-31b-it",
     )
     assert nvidia._base(ncfg_proxy) == "https://example-proxy.example/v1"
+
+    # Gemini provider TPM & error extraction parity
+    gemini = get_provider("gemini")
+    assert gemini.tpm_counts_output is False, "Gemini TPM must count input tokens only"
+    assert gemini._use_proxy_fallback is False, "_use_proxy_fallback must initialize to False"
+    u = Usage(prompt_tokens=150, completion_tokens=300, total_tokens=450)
+    assert u.billed_tokens(include_output=True) == 450
+    assert u.billed_tokens(include_output=False) == 150
+
+    from scheduler import _classify_error
+    mock_resp_429 = MagicMock()
+    mock_resp_429.status_code = 429
+    mock_resp_429.json.return_value = {
+        "error": {
+            "code": 429,
+            "message": "Resource exhausted",
+            "details": [{"@type": "RetryInfo", "retryDelay": "12.5s"}]
+        }
+    }
+    err429 = gemini._extract_error(mock_resp_429)
+    assert "[retry_after=12.5s]" in str(err429)
+    assert _classify_error(str(err429)) == "rate"
+
+    mock_resp_daily = MagicMock()
+    mock_resp_daily.status_code = 429
+    mock_resp_daily.json.return_value = {
+        "error": {
+            "code": 429,
+            "message": "Quota exceeded",
+            "details": [{"violations": [{"description": "Quota exceeded for requests per day"}]}]
+        }
+    }
+    err_daily = gemini._extract_error(mock_resp_daily)
+    assert "[daily_limit]" in str(err_daily)
+    assert _classify_error(str(err_daily)) == "auth"
+
+    mock_resp_geo = MagicMock()
+    mock_resp_geo.status_code = 403
+    mock_resp_geo.json.return_value = {"error": {"message": "User location is not supported"}}
+    err_geo = gemini._extract_error(mock_resp_geo)
+    assert "стране недоступен" in str(err_geo)
+    assert _classify_error(str(err_geo)) == "auth"
 
 
 def check_scheduler() -> None:
@@ -5247,6 +5288,7 @@ def check_scheduler_tpm() -> None:
             self.path = []
 
     def run(req, prov, timeout=20):
+        scheduler.clear_process_caches()
         scheduler.get_provider = lambda n: prov
         sched = scheduler.TranslationScheduler(req, should_pause=lambda: False)
         out = {

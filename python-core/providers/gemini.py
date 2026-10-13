@@ -10,7 +10,14 @@ from __future__ import annotations
 import logging
 import httpx
 
-from .base import BaseProvider, CompletionResult, ProviderConfig, Usage, http_timeout_s
+from .base import (
+    BaseProvider,
+    CompletionResult,
+    ProviderConfig,
+    Usage,
+    get_http_client,
+    http_timeout_s,
+)
 
 logger = logging.getLogger("interprex")
 
@@ -27,10 +34,12 @@ def _get_proxy_url(url: str, base_url: str) -> str:
 
 class GeminiProvider(BaseProvider):
     name = "gemini"
+    # Google Gemini enforces TPM on input tokens only: "Tokens per minute (input) (TPM)".
+    tpm_counts_output = False
 
     def __init__(self):
         super().__init__()
-        self._use_proxy_fallback = True
+        self._use_proxy_fallback = False
 
     def list_models(self, cfg: ProviderConfig) -> list[str]:
         """Models the key can use, via GET v1beta/models, filtered to those that
@@ -83,6 +92,51 @@ class GeminiProvider(BaseProvider):
         # Prefer the module default if the key can actually use it.
         return _DEFAULT_MODEL if _DEFAULT_MODEL in models else models[0]
 
+    def _extract_error(self, resp: httpx.Response) -> RuntimeError:
+        err_data = None
+        try:
+            err_data = resp.json()
+            msg = err_data.get("error", {}).get("message", resp.text)
+        except Exception:
+            msg = resp.text
+            err_data = {}
+
+        is_geoblock = resp.status_code in (403, 451) or any(
+            kw in msg.lower()
+            for kw in (
+                "location", "region", "country", "not supported",
+                "not available", "unsupported", "forbidden", "geo",
+            )
+        )
+        if is_geoblock:
+            return RuntimeError("В вашей стране недоступен этот провайдер - нажмите ⚙, чтобы настроить Hugging Face прокси")
+
+        retry_delay_s = None
+        is_daily = False
+        error_obj = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+        details = error_obj.get("details", [])
+        for d in details:
+            if isinstance(d, dict):
+                rd = d.get("retryDelay")
+                if rd is not None:
+                    try:
+                        s = str(rd).strip().rstrip("s")
+                        retry_delay_s = float(s)
+                    except ValueError:
+                        pass
+                for v in d.get("violations", []):
+                    desc = str(v.get("description", "")).lower()
+                    if any(w in desc for w in ("per day", "per_day", "daily")):
+                        is_daily = True
+        if any(w in msg.lower() for w in ("per day", "per_day", "daily limit", "requests per day")):
+            is_daily = True
+
+        if is_daily:
+            return RuntimeError(f"Gemini API daily quota exceeded: {msg} [daily_limit]")
+        if retry_delay_s is not None and retry_delay_s > 0:
+            return RuntimeError(f"Gemini API rate limit ({resp.status_code}): {msg} [retry_after={retry_delay_s:.1f}s]")
+        return RuntimeError(f"Gemini API error ({resp.status_code}): {msg}")
+
     def _complete(self, prompt: str, cfg: ProviderConfig) -> CompletionResult:
         model = cfg.model or _DEFAULT_MODEL
         if cfg.base_url:
@@ -91,11 +145,11 @@ class GeminiProvider(BaseProvider):
             self._use_proxy_fallback = True
         else:
             url = f"{_API_ROOT}/{model}:generateContent"
-        
+
         key = cfg.api_key
         if not key:
             raise RuntimeError("No Gemini API key provided")
-            
+
         headers = {
             "x-goog-api-key": key,
             "x-provider": "gemini",  # lets the Vercel proxy route to Gemini upstream
@@ -144,38 +198,34 @@ class GeminiProvider(BaseProvider):
         }
         resp = None
         timeout = httpx.Timeout(http_timeout_s(cfg), connect=20.0)
+        client = get_http_client()
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=timeout)
+            resp = client.post(url, json=body, headers=headers, timeout=timeout)
             if resp.is_error:
-                try:
-                    err_data = resp.json()
-                    msg = err_data["error"]["message"]
-                except Exception:
-                    msg = resp.text
-                
-                # Check if this error warrants proxy fallback
-                is_geoblock = resp.status_code in (403, 451) or any(kw in msg.lower() for kw in ("location", "region", "country", "not supported", "not available", "unsupported", "forbidden", "geo"))
-                
-                if is_geoblock:
-                    if not self._use_proxy_fallback and cfg.base_url:
-                        proxy_url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
-                        logger.info("Direct Gemini API call failed with status %d: %s. Retrying via proxy: %s", resp.status_code, msg, proxy_url)
-                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=timeout)
-                        if not resp.is_error:
-                            self._use_proxy_fallback = True
+                err_inst = self._extract_error(resp)
+                # Check if geoblock allows proxy fallback
+                is_geoblock = resp.status_code in (403, 451) or "стране недоступен" in str(err_inst)
+                if is_geoblock and not self._use_proxy_fallback and cfg.base_url:
+                    proxy_url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
+                    logger.info("Direct Gemini API call failed with status %d. Retrying via proxy: %s", resp.status_code, proxy_url)
+                    resp = client.post(proxy_url, json=body, headers=headers, timeout=timeout)
+                    if not resp.is_error:
+                        self._use_proxy_fallback = True
                     else:
-                        raise RuntimeError("В вашей стране недоступен этот провайдер - нажмите ⚙, чтобы настроить Hugging Face прокси")
+                        raise self._extract_error(resp)
                 else:
-                    raise RuntimeError(f"Gemini API error ({resp.status_code}): {msg}")
+                    raise err_inst
         except Exception as e:
             if resp is None:
                 if not self._use_proxy_fallback and cfg.base_url:
                     proxy_url = _get_proxy_url(f"{_API_ROOT}/{model}:generateContent", cfg.base_url)
                     logger.info("Direct Gemini API connection failed: %s. Retrying via proxy: %s", e, proxy_url)
                     try:
-                        resp = httpx.post(proxy_url, json=body, headers=headers, timeout=timeout)
+                        resp = client.post(proxy_url, json=body, headers=headers, timeout=timeout)
                         if not resp.is_error:
                             self._use_proxy_fallback = True
+                        else:
+                            raise self._extract_error(resp)
                     except Exception as proxy_e:
                         logger.error("Proxy Gemini API connection also failed: %s", proxy_e)
                         raise proxy_e
@@ -185,14 +235,7 @@ class GeminiProvider(BaseProvider):
                 raise e
 
         if resp.is_error:
-            try:
-                err_data = resp.json()
-                msg = err_data["error"]["message"]
-                raise RuntimeError(f"Gemini API error ({resp.status_code}): {msg}")
-            except Exception as e_parse:
-                if isinstance(e_parse, RuntimeError):
-                    raise e_parse
-                resp.raise_for_status()
+            raise self._extract_error(resp)
         resp.raise_for_status()
         data = resp.json()
         try:

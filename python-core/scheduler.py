@@ -55,6 +55,7 @@ import json
 import logging
 import math
 import queue
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -100,6 +101,25 @@ _TPM_EST_SAFETY_COLD = 1.35
 # 8s while siblings keep firing → "TPM on, still hammering errors".
 _RATE_COOLDOWN_NO_RPM_S = 20.0
 
+# Process-wide caches across translation runs in the same sidecar lifetime.
+# Key: (provider_name, model_name, target_lang) -> (chars_per_token, out_ratio, samples)
+_CALIBRATOR_CACHE: dict[tuple[str, str, str], tuple[float, float, int]] = {}
+_CALIBRATOR_CACHE_LOCK = threading.Lock()
+
+# Process-wide token events ledger across runs so that starting a new run
+# within 60s of the previous run knows about tokens already spent.
+# Key: api_key -> list of (timestamp, tokens)
+_GLOBAL_TOKEN_EVENTS: dict[str, list[tuple[float, int]]] = {}
+_GLOBAL_TOKEN_EVENTS_LOCK = threading.Lock()
+
+
+def clear_process_caches() -> None:
+    """Clear process-wide calibration and token event ledgers (useful in tests)."""
+    with _CALIBRATOR_CACHE_LOCK:
+        _CALIBRATOR_CACHE.clear()
+    with _GLOBAL_TOKEN_EVENTS_LOCK:
+        _GLOBAL_TOKEN_EVENTS.clear()
+
 
 def _classify_error(msg: str) -> str:
     """Bucket a provider error so the retry loop can react correctly.
@@ -108,12 +128,29 @@ def _classify_error(msg: str) -> str:
                 request still consumed the provider's per-minute quota, so the
                 retry must wait at least the pacing delay. These often recover,
                 so keep retrying up to BATCH_TRIES.
-      "auth"  — invalid / expired / unauthorized key, billing. Will NOT recover
-                this run: fail the key fast so its work fails over to a surviving
-                key instead of burning ~26 minutes of pointless retries.
+      "auth"  — invalid / expired / unauthorized key, billing, daily limit exhausted,
+                or regional geoblock. Will NOT recover this run: fail the key fast so
+                its work fails over to a surviving key instead of burning ~26 minutes
+                of pointless retries.
       "other" — anything else (parse hiccup, odd 500): retry normally.
     """
     m = (msg or "").lower()
+    # Permanent failures that won't recover during this translation run:
+    daily_markers = (
+        "daily_limit", "per day", "per_day", "daily quota", "requests per day",
+    )
+    if any(k in m for k in daily_markers):
+        return "auth"
+
+    geo_markers = (
+        "в вашей стране недоступен", "стране недоступен",
+        "location is not supported", "region is not supported",
+        "unsupported country", "not available in your country",
+        "geoblock",
+    )
+    if any(k in m for k in geo_markers):
+        return "auth"
+
     rate_markers = (
         "429", "too many", "rate limit", "rate-limit", "resource exhausted",
         "resource_exhausted", "quota", "503", "overloaded", "unavailable",
@@ -384,6 +421,17 @@ class TranslationScheduler:
         # thread "cold" on the first burst (5× default chars/token) so TPM
         # reserved 2k while Gemini billed 5k → 429 with the cap "respected".
         self.cal = Calibrator(req.target_lang)
+        self._cal_cache_key = (
+            str(req.provider or "").strip().lower(),
+            str(req.model or "").strip().lower(),
+            str(req.target_lang or "").strip().lower(),
+        )
+        with _CALIBRATOR_CACHE_LOCK:
+            if self._cal_cache_key in _CALIBRATOR_CACHE:
+                cpt, out_r, smp = _CALIBRATOR_CACHE[self._cal_cache_key]
+                self.cal.chars_per_token = cpt
+                self.cal.out_ratio = out_r
+                self.cal._samples = smp
 
         # --- shared state, all guarded by self.cond -----------------------------
         self.cond = threading.Condition()
@@ -405,6 +453,16 @@ class TranslationScheduler:
         # Per-key TPM ledger: committed (ts, tokens) spends in the last 60s, plus
         # reserved tokens for in-flight sends so sibling threads can't over-book.
         self.key_token_events: dict[str, list[tuple[float, int]]] = {}
+        now_ts = time.time()
+        with _GLOBAL_TOKEN_EVENTS_LOCK:
+            for k in self.keys_to_use:
+                events = [
+                    (t, n) for t, n in _GLOBAL_TOKEN_EVENTS.get(k, [])
+                    if now_ts - t < _TPM_WINDOW_S
+                ]
+                _GLOBAL_TOKEN_EVENTS[k] = events
+                if events:
+                    self.key_token_events[k] = list(events)
         self.key_token_reserved: dict[str, int] = {}
         # How many tokens THIS worker currently has reserved (for clean unreserve).
         self.worker_tpm_reserve: dict[int, int] = {}
@@ -526,7 +584,9 @@ class TranslationScheduler:
         # Cold start (no usage samples yet): pad harder so concurrent threads
         # cannot under-reserve and dump the free-tier TPM in one burst.
         safety = _TPM_EST_SAFETY_COLD if samples <= 0 else _TPM_EST_SAFETY
-        return max(1, int(prompt_tok * (1.0 + out_ratio) * safety))
+        counts_output = getattr(self.provider, "tpm_counts_output", True)
+        multiplier = (1.0 + out_ratio) if counts_output else 1.0
+        return max(1, int(prompt_tok * multiplier * safety))
 
     @staticmethod
     def _tpm_key_label(key: str, key_idx: int) -> str:
@@ -633,15 +693,25 @@ class TranslationScheduler:
         else:
             self.worker_tpm_reserve.pop(worker_idx, None)
 
-    def _tpm_commit(self, worker_idx: int, key: str, tokens: int) -> None:
+    def _tpm_commit(self, worker_idx: int, key: str, tokens: int,
+                    event_time: float | None = None) -> None:
         """Drop this worker's reserve and record a committed spend (if any)."""
         now = time.time()
+        stamp = now if event_time is None else float(event_time)
         with self.cond:
             self._tpm_unreserve_locked(worker_idx, key)
             if tokens > 0:
-                self.key_token_events.setdefault(key, []).append((now, int(tokens)))
+                self.key_token_events.setdefault(key, []).append((stamp, int(tokens)))
                 self._tpm_prune_locked(key, now)
             self.cond.notify_all()
+        with _GLOBAL_TOKEN_EVENTS_LOCK:
+            if tokens > 0:
+                _GLOBAL_TOKEN_EVENTS.setdefault(key, []).append((stamp, int(tokens)))
+            if key in _GLOBAL_TOKEN_EVENTS:
+                _GLOBAL_TOKEN_EVENTS[key] = [
+                    (t, n) for t, n in _GLOBAL_TOKEN_EVENTS[key]
+                    if now - t < _TPM_WINDOW_S
+                ]
 
     def _tpm_shrink_to_free(
         self, batch: list, cal: Calibrator, worker_key: str, fname: str,
@@ -941,8 +1011,6 @@ class TranslationScheduler:
                         # Token-pack one batch from the front of this file; never mix files.
                         end = cal.next_batch(items, self.window, req.glossary, 0,
                                              req.max_batch_size)
-                        while (end) > 1 and self._overflows_exact(cal, items[:end], worker_key):
-                            end = end // 2
                         batch = items[:end]
                         del items[:end]
                         if not items:
@@ -977,6 +1045,34 @@ class TranslationScheduler:
         if exact is None:
             return False
         return exact > cal.input_budget(self.window, self.req.glossary)
+
+    def _shrink_overflow_exact(
+        self, batch: list, cal: Calibrator, worker_key: str, fname: str,
+    ) -> list:
+        """Outside-of-lock guard: if the provider defines a cheap exact tokenizer
+        and the packed batch overflows the context window, shrink and return tail to pool."""
+        if len(batch) <= 1 or not self._overflows_exact(cal, batch, worker_key):
+            return batch
+        best = len(batch)
+        while best > 1 and self._overflows_exact(cal, batch[:best], worker_key):
+            best = best // 2
+        if best >= len(batch):
+            return batch
+        leftover = batch[best:]
+        kept = batch[:best]
+        with self.cond:
+            cur = self.pool.get(fname)
+            if cur is None:
+                self.pool[fname] = list(leftover)
+            else:
+                self.pool[fname] = list(leftover) + list(cur)
+            self.pool.move_to_end(fname, last=False)
+            self.cond.notify_all()
+        logger.info(
+            "Exact context shrink: batch %d→%d (rest requeued for %s)",
+            len(batch), len(kept), fname,
+        )
+        return kept
 
     def finish_batch(self, worker_idx: int, batch: list, tr_map: dict[str, str], key_died: bool) -> None:
         """Fold a finished batch back into shared state. ALWAYS call from finally:
@@ -1160,13 +1256,15 @@ class TranslationScheduler:
                 # the main batch.
                 reask_tok = self._enforce_char_limits(batch, batch_tr, cfg)
 
-                actual_tok = int(tr.usage.billed_tokens() or 0) + int(reask_tok or 0)
+                counts_output = getattr(self.provider, "tpm_counts_output", True)
+                actual_tok = int(tr.usage.billed_tokens(include_output=counts_output) or 0) + int(reask_tok or 0)
                 if tpm_held:
                     # Prefer exact usage; fall back to the pre-send estimate if
-                    # the provider returned zeros (unknown).
+                    # the provider returned zeros (unknown). Stamp spend at send time.
                     self._tpm_commit(
                         worker_idx, worker_key,
                         actual_tok if actual_tok > 0 else est_tokens,
+                        event_time=start_time,
                     )
                     tpm_held = False
                 with self.cond:
@@ -1178,6 +1276,13 @@ class TranslationScheduler:
                     self.requests_sent += 1  # a successful request reached the server
                     self.chars_per_token = cal.chars_per_token
                     self.output_ratio = cal.out_ratio
+                if hasattr(self, "_cal_cache_key"):
+                    with _CALIBRATOR_CACHE_LOCK:
+                        _CALIBRATOR_CACHE[self._cal_cache_key] = (
+                            float(cal.chars_per_token),
+                            float(cal.out_ratio),
+                            int(getattr(cal, "_samples", 1)),
+                        )
                 return (batch_tr, False, False)
 
             except Exception as e:  # noqa: BLE001
@@ -1220,7 +1325,7 @@ class TranslationScheduler:
                 # failures release the reserve without counting spend.
                 if tpm_held:
                     if _reached_server(err_str):
-                        self._tpm_commit(worker_idx, worker_key, est_tokens)
+                        self._tpm_commit(worker_idx, worker_key, est_tokens, event_time=start_time)
                     else:
                         self._tpm_commit(worker_idx, worker_key, 0)
                     tpm_held = False
@@ -1277,11 +1382,16 @@ class TranslationScheduler:
                     # fixed no-RPM cooldown (or the RPM-derived delay).
                     rate_floor = 0.0
                     if kind == "rate":
-                        rate_floor = (
-                            self.delay_seconds
-                            if self.delay_seconds > 0
-                            else _RATE_COOLDOWN_NO_RPM_S
-                        )
+                        m_retry = re.search(r"\[retry_after=([0-9.]+)s?\]", err_str)
+                        retry_delay_from_err = float(m_retry.group(1)) if m_retry else None
+                        if retry_delay_from_err is not None and retry_delay_from_err > 0:
+                            rate_floor = retry_delay_from_err
+                        else:
+                            rate_floor = (
+                                self.delay_seconds
+                                if self.delay_seconds > 0
+                                else _RATE_COOLDOWN_NO_RPM_S
+                            )
                     elif not reached:
                         # 10054 / SSL handshake drop recovers, but N threads
                         # retrying in lockstep 8s later re-slam a dying path
@@ -1726,6 +1836,7 @@ class TranslationScheduler:
                 continue
 
             _fname, batch = payload
+            batch = self._shrink_overflow_exact(batch, cal, worker_key, _fname)
             # Use free TPM now: shrink a fat batch if partial budget remains so
             # free tokens aren't left idle while we wait for a full-size send.
             batch = self._tpm_shrink_to_free(batch, cal, worker_key, _fname)
