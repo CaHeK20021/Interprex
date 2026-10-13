@@ -128,6 +128,41 @@ def _extract_say_args(suffix: str) -> str | None:
                 return None  # outer paren closed before end -> trailing code
     return s if depth == 0 else None
 
+
+def _extract_say_suffix(suffix: str) -> tuple[str | None, str | None]:
+    """Extract (say_args, with_clause) from a say statement's suffix.
+    Supports argument lists, trailing `with <transition>` clauses, and trailing comments:
+      who "text" (channel=m.dm) with vpunch
+      "text" with Dissolve(1.0) # comment
+    Both arguments and transitions are folded into ast.Say.get_code() by the engine,
+    so both must be preserved for say-block md5 identifier parity.
+    """
+    s = _strip_line_comment(suffix).strip()
+    if not s:
+        return None, None
+    say_args = None
+    with_clause = None
+    if s.startswith("("):
+        depth = 0
+        close_idx = -1
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+        if close_idx != -1:
+            say_args = s[:close_idx + 1]
+            s = s[close_idx + 1:].strip()
+    m_with = re.match(r'^with\b\s*(.*)$', s)
+    if m_with:
+        w = m_with.group(1).strip()
+        if w:
+            with_clause = w
+    return say_args, with_clause
+
 # A menu choice is a bare quoted string whose only trailing content is an
 # optional `if <condition>` guard and the block-opening colon.
 _MENU_SUFFIX_RE = re.compile(r'\s*(?:if\s.+?)?:\s*$')
@@ -622,14 +657,11 @@ def _encode_say_string(s: str) -> str:
 
 
 def _say_get_code(who_var: str, attrs: list[str], raw_what: str, *,
-                  nointeract: bool, say_args: str | None = None) -> str:
+                  nointeract: bool, say_args: str | None = None,
+                  with_clause: str | None = None) -> str:
     """Reproduce ast.Say.get_code(): space-joined speaker + attrs + encoded text,
-    then ` nointeract` (menu captions) and the verbatim argument list, in the
-    engine's order. `raw_what` is the source inner text; it's run through the lexer
-    decode then re-encoded so the hash matches the engine regardless of how the
-    source happened to escape it. `say_args` is the raw `(...)` from source, which
-    the engine appends verbatim (ArgumentInfo.get_code re-emits expressions as
-    written) — order in get_code is: text, nointeract, [id], arguments."""
+    then ` nointeract` (menu captions), the verbatim argument list, and `with <transition>`
+    in the engine's exact order: [who] [attrs] [what] [nointeract] [args] [with with_]."""
     parts: list[str] = []
     if who_var:
         parts.append(who_var)
@@ -640,6 +672,8 @@ def _say_get_code(who_var: str, attrs: list[str], raw_what: str, *,
         code += " nointeract"
     if say_args:
         code += " " + say_args
+    if with_clause:
+        code += " with " + with_clause
     return code
 
 
@@ -1786,19 +1820,23 @@ class RenPyParser(BaseParser):
                 continue
 
             suffix = m.group("suffix")
-            say_args = _extract_say_args(suffix)
+            say_args, with_clause = _extract_say_suffix(suffix)
             if _MENU_SUFFIX_RE.match(suffix):
                 kind = "menu"
                 native_kind = "menu_choice"
+                say_args = None
+                with_clause = None
             elif _is_menu_choice_with_args(suffix):
                 # Chat-style choice carrying args: `"Choice"(reacts=[...]):`.
                 # Only the choice TEXT is translatable; the arg list (which may
                 # contain quoted emoji) is code and stays verbatim.
                 kind = "menu"
                 native_kind = "menu_choice"
-            elif say_args is not None:
-                # `who "text" (channel=m.dm)` — say with an argument list. Checked
-                # BEFORE the `"` test below because args like `(type="voice")`
+                say_args = None
+                with_clause = None
+            elif say_args is not None or with_clause is not None:
+                # `who "text" (channel=m.dm)` or `who "text" with vpunch` — say with args/transition.
+                # Checked BEFORE the `"` test below because args like `(type="voice")`
                 # contain a quote and would otherwise be misread as a 2nd string.
                 kind = "say"
                 native_kind = "say"
@@ -1843,11 +1881,14 @@ class RenPyParser(BaseParser):
                 if is_caption and who_var is None:
                     native_kind = "string"
                     is_caption = False
+                    say_args = None
+                    with_clause = None
             else:
                 who_var = None
                 attrs = []
                 is_caption = False
-                say_args = None  # only say lines carry an argument list
+                say_args = None
+                with_clause = None
 
             # Finalize context and track dialogue history
             if native_kind == "say":
@@ -1880,6 +1921,7 @@ class RenPyParser(BaseParser):
                 "attrs": attrs,
                 "raw_what": m.group("text"),
                 "say_args": say_args,
+                "with_clause": with_clause,
                 "label": label,
                 "is_menu_caption": is_caption,
                 "src_line": li,
@@ -2251,7 +2293,8 @@ class RenPyParser(BaseParser):
                     if kind == "say":
                         code = _say_get_code(rec["who_var"], rec["attrs"], rec["raw_what"],
                                              nointeract=rec["is_menu_caption"],
-                                             say_args=rec.get("say_args"))
+                                             say_args=rec.get("say_args"),
+                                             with_clause=rec.get("with_clause"))
                         prefix = rec.get("block_prefix") or []
                         block_codes = [c for c, _ in prefix] + [code]
                         ident = _compute_identifier(rec["label"], _block_digest(block_codes), seen_ids)
@@ -2717,6 +2760,9 @@ class RenPyParser(BaseParser):
         say_args = rec.get("say_args")
         if say_args:
             tail += " " + say_args
+        with_clause = rec.get("with_clause")
+        if with_clause:
+            tail += " with " + with_clause
         translated_line = " ".join(parts) + tail
 
         prefix = rec.get("block_prefix") or []

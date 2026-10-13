@@ -1382,6 +1382,13 @@ def check_renpy_identifier_parity() -> None:
         got = _md5_identifier(code)
         assert got == expected, f"identifier parity drift: {what[:30]!r} got={got} expected={expected}"
 
+    # Say line with trailing `with <transition>` (e.g. `with vpunch`):
+    code_with = _say_get_code(None, [], "{color=#B57431}Hahahaha! Oh, man, that takes me back!{/color}",
+                              nointeract=False, with_clause="vpunch")
+    from parsers.renpy import _block_digest
+    digest_with = _block_digest(['voice "Carl/carl50.mp3"', code_with])
+    assert digest_with == "588a11b1", f"say with-clause digest drift: got={digest_with} expected=588a11b1"
+
 
 def check_renpy_mixed_translate() -> None:
     """A single .rpy can hold real SOURCE *and* inline `translate <lang> …:` blocks

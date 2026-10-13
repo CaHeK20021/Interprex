@@ -3664,7 +3664,7 @@ export default function App() {
                 // Strip redundant trailing seconds from status text so it won't truncate,
                 // as the timer is displayed in the dedicated top-right badge.
                 const cleanMsg = msg
-                  ? msg.replace(/\s*[·—\-]\s*\d+\s*(сек|s)\b.*$/i, "").trim()
+                  ? msg.replace(/\s*[\u00B7\u2014\-]\s*\d+\s*(?:сек|s|c|sec)\b.*$/i, "").trim()
                   : "";
                 // Traffic-light tone: request in flight (yellow), answer landed
                 // (green), errored (red), or stopped/idle (grey — a thread that
