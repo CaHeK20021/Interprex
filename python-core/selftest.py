@@ -1982,6 +1982,21 @@ def check_unity_sources_registry() -> None:
         # Stable catalog
         assert SOURCE_CONTENT in SOURCE_ORDER
         assert isinstance(UnityCapabilities().to_dict(), dict)
+
+        # Ren'Py vs Unity detection isolation:
+        renpy_root = tempfile.mkdtemp(prefix="ipx_renpy_unity_fake_")
+        try:
+            os.makedirs(os.path.join(renpy_root, "renpy"))
+            os.makedirs(os.path.join(renpy_root, "lib", "py3-windows-x86_64"))
+            open(os.path.join(renpy_root, "lib", "py3-windows-x86_64", "librenpython.dll"), "wb").write(b"MZfake")
+            open(os.path.join(renpy_root, "lib", "py3-windows-x86_64", "d3dcompiler_47.dll"), "wb").write(b"MZfake")
+            from parsers.unity import UnityParser, is_dotnet_pe, is_custom_dll
+            assert not UnityParser.detect(renpy_root), "Ren'Py root must not detect as Unity"
+            assert not is_custom_dll("librenpython.dll")
+            assert not is_custom_dll("d3dcompiler_47.dll")
+            assert not is_dotnet_pe(os.path.join(renpy_root, "lib", "py3-windows-x86_64", "librenpython.dll"))
+        finally:
+            shutil.rmtree(renpy_root, ignore_errors=True)
     finally:
         import shutil
         shutil.rmtree(root, ignore_errors=True)

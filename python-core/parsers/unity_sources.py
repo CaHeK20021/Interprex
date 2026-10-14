@@ -247,6 +247,7 @@ def detect_unity_capabilities(
         caps.notes.append("root missing")
         return caps
 
+    is_dotnet_pe_fn = None
     if find_managed_dir_fn is None or find_aa_dir_fn is None:
         # Local import: unity.py imports this module for the registry.
         from . import unity as unity_mod
@@ -255,6 +256,13 @@ def detect_unity_capabilities(
         find_aa_dir_fn = find_aa_dir_fn or unity_mod.find_aa_dir
         iter_files_fn = iter_files_fn or unity_mod.iter_files
         is_custom_dll_fn = is_custom_dll_fn or unity_mod.is_custom_dll
+        is_dotnet_pe_fn = getattr(unity_mod, "is_dotnet_pe", None)
+    else:
+        try:
+            from . import unity as unity_mod
+            is_dotnet_pe_fn = getattr(unity_mod, "is_dotnet_pe", None)
+        except Exception:
+            is_dotnet_pe_fn = None
 
     managed = find_managed_dir_fn(root)
     caps.managed_dir = managed
@@ -305,7 +313,8 @@ def detect_unity_capabilities(
         f = os.path.basename(fpath)
         fl = f.lower()
         if is_custom_dll_fn(f):
-            dll_n += 1
+            if fl.startswith("assembly-csharp") or is_dotnet_pe_fn is None or is_dotnet_pe_fn(fpath):
+                dll_n += 1
         if fl == "global-metadata.dat":
             caps.has_il2cpp = True
         if fl.endswith(".assets"):

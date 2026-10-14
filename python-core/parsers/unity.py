@@ -143,6 +143,12 @@ def is_custom_dll(filename: str) -> bool:
         "elringus.", "naninovel.", "naninovel",
         "spine.", "DOTween", "dotween", "rewired", "photon", "mirror.",
         "facepunch", "com.unity.", "unityengine",
+        # Native runtime / C libraries (never .NET managed assemblies)
+        "d3dcompiler", "libpython", "librenpy", "libwinpthread", "libffi",
+        "libcrypto", "libssl", "libegl", "libgles", "nvdrs", "steam_api",
+        "civetweb", "ffmpeg", "avcodec", "avformat", "avutil", "swresample",
+        "swscale", "vcruntime", "msvcp", "api-ms-win", "ucrtbase", "concrt",
+        "vcomp", "mfc", "atl",
     )
     for pref in deny_prefixes:
         if fn.startswith(pref.lower()):
@@ -151,6 +157,42 @@ def is_custom_dll(filename: str) -> bool:
     if fn.startswith("unity"):
         return False
     return True
+
+def is_dotnet_pe(path: str) -> bool:
+    """True if the PE binary contains a valid CLR / .NET runtime header (CLI header).
+
+    Prevents invoking Mono.Cecil / DllEditor on unmanaged native C/C++ DLLs
+    (Python runtimes, DirectX, graphics drivers, audio wrappers, etc.).
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read(1024)
+            if len(data) < 64 or data[:2] != b"MZ":
+                return False
+            pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+            f.seek(pe_offset)
+            pe_sig = f.read(4)
+            if pe_sig != b"PE\x00\x00":
+                return False
+            f.seek(pe_offset + 24)
+            opt_magic_bytes = f.read(2)
+            if len(opt_magic_bytes) < 2:
+                return False
+            opt_magic = struct.unpack("<H", opt_magic_bytes)[0]
+            if opt_magic == 0x10B:  # PE32
+                f.seek(pe_offset + 24 + 96 + 14 * 8)
+            elif opt_magic == 0x20B:  # PE32+
+                f.seek(pe_offset + 24 + 112 + 14 * 8)
+            else:
+                return False
+            entry_bytes = f.read(8)
+            if len(entry_bytes) < 8:
+                return False
+            clr_rva, clr_size = struct.unpack("<II", entry_bytes)
+            return clr_rva != 0 and clr_size != 0
+    except Exception:
+        return False
+
 
 # ── Compiled regexes ────────────────────────────────────────────────────────
 _GUID_RE          = re.compile(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', re.I)
@@ -1533,6 +1575,14 @@ class UnityParser(BaseParser):
         except Exception:
             pass
 
+        # Ren'Py signature protection: if it's a Ren'Py game, do not detect as Unity.
+        if os.path.isdir(os.path.join(root, "renpy")) or os.path.isfile(os.path.join(root, "renpy.py")):
+            return False
+        if os.path.isdir(os.path.join(root, "game")):
+            for marker in ("options.rpy", "options.rpyc", "script.rpy", "script.rpyc", "archive.rpa", "data.rpa"):
+                if os.path.isfile(os.path.join(root, "game", marker)):
+                    return False
+
         # 1. Check for StreamingAssets/aa
         aa_dir = find_aa_dir(root)
         if aa_dir:
@@ -1546,7 +1596,8 @@ class UnityParser(BaseParser):
             f = os.path.basename(fpath)
             f_lower = f.lower()
             if is_custom_dll(f):
-                return True
+                if f_lower.startswith("assembly-csharp") or is_dotnet_pe(fpath):
+                    return True
             if f_lower in ("data.unity3d", "global-metadata.dat", "gameassembly.dll", "gameassembly.so"):
                 return True
             if f_lower.endswith(".assetbundle") or f_lower.endswith(".bundle"):
@@ -1612,7 +1663,7 @@ class UnityParser(BaseParser):
         results = []
         for fpath in iter_files(root, sub_paths):
             f = os.path.basename(fpath)
-            if is_custom_dll(f):
+            if is_custom_dll(f) and (f.lower().startswith("assembly-csharp") or is_dotnet_pe(fpath)):
                 rel_path = os.path.relpath(fpath, root).replace("\\", "/")
 
                 try:
@@ -2435,7 +2486,7 @@ class UnityParser(BaseParser):
         written = 0
         for fpath in iter_files(root, sub_paths):
             f = os.path.basename(fpath)
-            if is_custom_dll(f):
+            if is_custom_dll(f) and (f.lower().startswith("assembly-csharp") or is_dotnet_pe(fpath)):
                 rel_path = os.path.relpath(fpath, root).replace("\\", "/")
 
                 try:
