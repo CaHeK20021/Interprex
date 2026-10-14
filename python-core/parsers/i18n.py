@@ -1218,6 +1218,8 @@ class I18nParser(BaseParser):
             "and are displayed in menus, HUD, or system messages.\n"
             "FORMAT SPECIFIERS: preserve {0}, {1}, {player}, %s, %d and similar "
             "patterns EXACTLY — they are filled in at runtime.\n"
+            "RIMWORLD TARGET TOKENS: in RimWorld strings, keep literal words TargetA, TargetB, TargetC "
+            "verbatim (do NOT replace with {0} or {1}) — the game engine replaces TargetA/TargetB by exact name at runtime.\n"
             "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
             "UI TAB/BUTTON LABELS: if a string's context says it is a UI tab or button "
             "label, the on-screen width is very limited — translate it as SHORT as "
