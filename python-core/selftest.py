@@ -290,6 +290,17 @@ def check_renpy_font() -> None:
     # Emoji font preserved.
     assert "Twemoji" not in src, "emoji font must not be remapped"
 
+    # Pickle safety stubs must be emitted in init python: so that loading saves
+    # from the main menu (before translate blocks run) does not raise AttributeError.
+    init_m = re.search(r'init python:\n(.*?)(?=\ntranslate |\Z)', src, re.S)
+    assert init_m, "init python: block missing from _interprex_font.rpy"
+    init_body = init_m.group(1)
+    for expected_stub in ("_set_dominant_role", "_get_dominant_role", "_set_role_name",
+                          "_get_role_name", "_ix_ts_wrapper", "_ix_aph_wrapper",
+                          "_get_who_typing_translated", "_interprex_orig_aph",
+                          "_interprex_orig_translate_string", "TranslatingString"):
+        assert expected_stub in init_body, f"pickle safety stub {expected_stub} missing from init python:"
+
     # Execute the first translate-python block twice against a fake engine that
     # mirrors the real FontGroup-alias rule — proves idempotency + correctness.
     m = re.search(r'translate russian python:\n(.*?)(?=\ntranslate |\Z)', src, re.S)
