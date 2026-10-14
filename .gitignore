@@ -57,3 +57,17 @@ Thumbs.db
 # ---- Tauri signing keys ----
 ~/
 ~/.tauri/
+
+# ---- Скомпилированные бинарники и артефакты сборки ----
+build/
+/interprex.exe
+*.pkg
+*.pyz
+
+# ---- Временные тестовые дампы и ассеты ----
+*.assets
+*.ndjson
+.opt_work/
+python-core/_chk/
+python-core/_bp/
+python-core/scratch_temp/
