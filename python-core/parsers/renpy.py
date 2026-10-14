@@ -129,19 +129,29 @@ def _extract_say_args(suffix: str) -> str | None:
     return s if depth == 0 else None
 
 
-def _extract_say_suffix(suffix: str) -> tuple[str | None, str | None]:
-    """Extract (say_args, with_clause) from a say statement's suffix.
-    Supports argument lists, trailing `with <transition>` clauses, and trailing comments:
-      who "text" (channel=m.dm) with vpunch
+def _extract_say_suffix(suffix: str) -> tuple[str | None, str | None, str | None]:
+    """Extract (say_args, with_clause, explicit_id) from a say statement's suffix.
+    Supports argument lists, trailing `with <transition>` clauses, explicit `id <ident>` clauses,
+    and trailing comments:
+      who "text" (channel=m.dm) with vpunch id start_0e450e5e
       "text" with Dissolve(1.0) # comment
     Both arguments and transitions are folded into ast.Say.get_code() by the engine,
     so both must be preserved for say-block md5 identifier parity.
+    Explicit `id <ident>` clauses (produced by Ren'Py / unrpyc) take precedence over MD5.
     """
     s = _strip_line_comment(suffix).strip()
     if not s:
-        return None, None
+        return None, None, None
     say_args = None
     with_clause = None
+    explicit_id = None
+
+    # Check for trailing `id <ident>` (Ren'Py explicit say identifier)
+    m_id = re.search(r'\bid\s+([A-Za-z0-9_]+)\s*$', s)
+    if m_id:
+        explicit_id = m_id.group(1)
+        s = s[:m_id.start()].strip()
+
     if s.startswith("("):
         depth = 0
         close_idx = -1
@@ -161,7 +171,7 @@ def _extract_say_suffix(suffix: str) -> tuple[str | None, str | None]:
         w = m_with.group(1).strip()
         if w:
             with_clause = w
-    return say_args, with_clause
+    return say_args, with_clause, explicit_id
 
 # A menu choice is a bare quoted string whose only trailing content is an
 # optional `if <condition>` guard and the block-opening colon.
@@ -308,8 +318,8 @@ _SCREEN_FOR_RE = re.compile(
 # Translatable-function call:  _("Back")  — Ren'Py's gettext-style marker. Used in
 # screens.rpy menu buttons (Back/Save/History/...). We catch every occurrence on a
 # line; positions let us assign a stable per-line index for the id.
-_USCORE_RE = re.compile(r'_\(\s*"(?P<text>(?:[^"\\]|\\.)*)"\s*\)')
-_USCORE_F_RE = re.compile(r'_\(\s*f(?P<quote>["\'])(?P<text>.*?)(?P=quote)\s*\)', re.IGNORECASE)
+_USCORE_RE = re.compile(r'_\s*\(\s*"(?P<text>(?:[^"\\]|\\.)*)"\s*\)')
+_USCORE_F_RE = re.compile(r'_\s*\(\s*f(?P<quote>["\'])(?P<text>.*?)(?P=quote)\s*\)', re.IGNORECASE)
 
 # `show text "..."` statement — a quick on-screen Text displayable (intro cards,
 # chapter titles). Ren'Py runs the literal through translate_string() at render
@@ -320,7 +330,7 @@ _USCORE_F_RE = re.compile(r'_\(\s*f(?P<quote>["\'])(?P<text>.*?)(?P=quote)\s*\)'
 # is a different statement, already handled by the screen-widget branch; this
 # matches only the top-level `show text` form.
 _SHOW_TEXT_RE = re.compile(
-    r'^(?P<indent>\s*)show\s+text\s+"(?P<text>(?:[^"\\]|\\.)*)"'
+    r'^(?P<indent>\s*)show\s+text\s+(?:_\s*\(\s*)?"(?P<text>(?:[^"\\]|\\.)*)"(?:\s*\))?'
 )
 
 
@@ -1820,12 +1830,13 @@ class RenPyParser(BaseParser):
                 continue
 
             suffix = m.group("suffix")
-            say_args, with_clause = _extract_say_suffix(suffix)
+            say_args, with_clause, explicit_id = _extract_say_suffix(suffix)
             if _MENU_SUFFIX_RE.match(suffix):
                 kind = "menu"
                 native_kind = "menu_choice"
                 say_args = None
                 with_clause = None
+                explicit_id = None
             elif _is_menu_choice_with_args(suffix):
                 # Chat-style choice carrying args: `"Choice"(reacts=[...]):`.
                 # Only the choice TEXT is translatable; the arg list (which may
@@ -1834,8 +1845,9 @@ class RenPyParser(BaseParser):
                 native_kind = "menu_choice"
                 say_args = None
                 with_clause = None
-            elif say_args is not None or with_clause is not None:
-                # `who "text" (channel=m.dm)` or `who "text" with vpunch` — say with args/transition.
+                explicit_id = None
+            elif say_args is not None or with_clause is not None or explicit_id is not None:
+                # `who "text" (channel=m.dm)` or `who "text" with vpunch` or `who "text" id foo` — say with args/transition/id.
                 # Checked BEFORE the `"` test below because args like `(type="voice")`
                 # contain a quote and would otherwise be misread as a 2nd string.
                 kind = "say"
@@ -1883,12 +1895,14 @@ class RenPyParser(BaseParser):
                     is_caption = False
                     say_args = None
                     with_clause = None
+                    explicit_id = None
             else:
                 who_var = None
                 attrs = []
                 is_caption = False
                 say_args = None
                 with_clause = None
+                explicit_id = None
 
             # Finalize context and track dialogue history
             if native_kind == "say":
@@ -1922,6 +1936,7 @@ class RenPyParser(BaseParser):
                 "raw_what": m.group("text"),
                 "say_args": say_args,
                 "with_clause": with_clause,
+                "explicit_id": explicit_id,
                 "label": label,
                 "is_menu_caption": is_caption,
                 "src_line": li,
@@ -2295,9 +2310,14 @@ class RenPyParser(BaseParser):
                                              nointeract=rec["is_menu_caption"],
                                              say_args=rec.get("say_args"),
                                              with_clause=rec.get("with_clause"))
-                        prefix = rec.get("block_prefix") or []
-                        block_codes = [c for c, _ in prefix] + [code]
-                        ident = _compute_identifier(rec["label"], _block_digest(block_codes), seen_ids)
+                        explicit_id = rec.get("explicit_id")
+                        if explicit_id:
+                            ident = explicit_id
+                            seen_ids[ident] = seen_ids.get(ident, 0) + 1
+                        else:
+                            prefix = rec.get("block_prefix") or []
+                            block_codes = [c for c, _ in prefix] + [code]
+                            ident = _compute_identifier(rec["label"], _block_digest(block_codes), seen_ids)
                         # Dialogue safety-net: if a FIXED textbox is known and the
                         # full translation would overflow it, wrap in {size=*scale}
                         # so the engine renders the WHOLE text smaller (never cut).
@@ -2763,13 +2783,20 @@ class RenPyParser(BaseParser):
         with_clause = rec.get("with_clause")
         if with_clause:
             tail += " with " + with_clause
+        explicit_id = rec.get("explicit_id")
+        if explicit_id:
+            tail += " id " + explicit_id
         translated_line = " ".join(parts) + tail
 
         prefix = rec.get("block_prefix") or []
         header_line = prefix[0][1] if prefix else rec["src_line"]
         prefix_codes = [c for c, _ in prefix]
 
-        comment_lines = "".join(f"    # {c}\n" for c in prefix_codes) + f"    # {code}\n"
+        orig_code = code
+        if explicit_id and not orig_code.rstrip().endswith(f"id {explicit_id}"):
+            orig_code = orig_code + " id " + explicit_id
+
+        comment_lines = "".join(f"    # {c}\n" for c in prefix_codes) + f"    # {orig_code}\n"
         body_lines = "".join(f"    {c}\n" for c in prefix_codes) + f"    {translated_line}\n"
         return (
             f"# {file_rel}:{header_line}\n"

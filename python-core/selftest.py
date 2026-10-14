@@ -1385,9 +1385,21 @@ def check_renpy_identifier_parity() -> None:
     # Say line with trailing `with <transition>` (e.g. `with vpunch`):
     code_with = _say_get_code(None, [], "{color=#B57431}Hahahaha! Oh, man, that takes me back!{/color}",
                               nointeract=False, with_clause="vpunch")
-    from parsers.renpy import _block_digest
+    from parsers.renpy import _block_digest, _extract_say_suffix, _SHOW_TEXT_RE, _USCORE_RE
     digest_with = _block_digest(['voice "Carl/carl50.mp3"', code_with])
     assert digest_with == "588a11b1", f"say with-clause digest drift: got={digest_with} expected=588a11b1"
+
+    # Say line with explicit `id <identifier>` (decompiled AST / author explicit id):
+    s_args, s_with, s_id = _extract_say_suffix(' id start_0e450e5e')
+    assert s_id == "start_0e450e5e" and s_args is None and s_with is None
+    s_args2, s_with2, s_id2 = _extract_say_suffix('(channel=m.dm) with vpunch id start_0e450e5e')
+    assert s_id2 == "start_0e450e5e" and s_args2 == "(channel=m.dm)" and s_with2 == "vpunch"
+
+    # Show text with `_ (...)` translatable wrapper and whitespace:
+    m_st = _SHOW_TEXT_RE.match('    show text _ ("{color=#ff0000}Terrifying...{/color}") with dissolve')
+    assert m_st and m_st.group("text") == "{color=#ff0000}Terrifying...{/color}"
+    m_us = _USCORE_RE.search('    $ msg = _ ("Spaced call")')
+    assert m_us and m_us.group("text") == "Spaced call"
 
 
 def check_renpy_mixed_translate() -> None:
