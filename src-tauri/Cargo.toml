@@ -1,6 +1,6 @@
 [package]
 name = "interprex"
-version = "0.0.109"
+version = "0.0.110"
 description = "Interprex"
 authors = ["you"]
 edition = "2021"
