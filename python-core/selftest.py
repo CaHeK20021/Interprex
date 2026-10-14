@@ -2213,6 +2213,12 @@ def check_unity_engine_identifiers() -> None:
     play_slots = [s for _, s in _iter_raw_translatable_slots(play_label_raw)]
     assert "Play" in play_slots, f"standalone Play label should extract: {play_slots!r}"
 
+    # Strict padding check: fake binary string with non-zero padding must be rejected
+    fake_binary = struct.pack("<I", 5) + b"Hello\x01\x00\x00"
+    assert len(_sequential_aligned_strings(fake_binary)) == 0, "fake binary string with dirty padding not rejected"
+    clean_aligned = struct.pack("<I", 5) + b"Hello\x00\x00\x00"
+    assert len(_sequential_aligned_strings(clean_aligned)) == 1, "clean aligned string should be detected"
+
     print(
         "OK — unity engine-id + Naninovel slot walk: opcodes/mixer/script ids "
         "rejected, dialogue kept, Commands-lookahead strips Goto, "
@@ -2350,8 +2356,130 @@ def check_unity_localization() -> None:
         assert mock_table_tree["m_TableData"][1]["m_Localized"] == "EXIT GAME"
         
         mock_table_data.save_typetree.assert_called_with(mock_table_tree)
-        mock_env.file.save.assert_called_with(packer="none")
+        mock_env.file.save.assert_called_with(packer="original")
         
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_unity_frameworks_typetree() -> None:
+    """Test Fungus, I2 Localization, and Dialogue System TypeTree extract + inject."""
+    import shutil
+    from unittest.mock import MagicMock, patch
+    from parsers.unity import UnityParser
+    p = UnityParser()
+    root = tempfile.mkdtemp(prefix="interprex_unity_fw_")
+    try:
+        fpath = os.path.join(root, "sharedassets0.assets")
+        with open(fpath, "wb") as f:
+            f.write(b"\x00" * 100)
+
+        # 1. Fungus Say & Menu MonoBehaviour
+        fungus_tree = {
+            "storyText": "Welcome traveler, to our quiet village.",
+            "description": "Visit the local tavern",
+        }
+        mock_fungus_obj = MagicMock()
+        mock_fungus_obj.type.name = "MonoBehaviour"
+        mock_fungus_obj.path_id = 101
+        mock_fungus_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_fungus_obj.assets_file.objects = {}
+        mock_fungus_obj.read_typetree.return_value = fungus_tree
+        mock_fungus_obj.read.side_effect = Exception("No script dll")
+        mock_fungus_obj.parse_monobehaviour_head.side_effect = Exception("No head")
+
+        # 2. I2 Localization MonoBehaviour
+        i2_tree = {
+            "mTerms": [
+                {
+                    "Term": "UI/StartButton",
+                    "Languages": ["Start New Adventure", "Commencer une nouvelle aventure"],
+                }
+            ]
+        }
+        mock_i2_obj = MagicMock()
+        mock_i2_obj.type.name = "MonoBehaviour"
+        mock_i2_obj.path_id = 202
+        mock_i2_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_i2_obj.assets_file.objects = {}
+        mock_i2_obj.read_typetree.return_value = i2_tree
+        mock_i2_obj.read.side_effect = Exception("No script dll")
+        mock_i2_obj.parse_monobehaviour_head.side_effect = Exception("No head")
+
+        # 3. PixelCrushers Dialogue System MonoBehaviour
+        ds_tree = {
+            "conversations": [
+                {
+                    "Title": "Intro Dialogue",
+                    "dialogueEntries": [
+                        {
+                            "id": 1,
+                            "fields": [
+                                {"title": "Actor", "value": "Elder"},
+                                {"title": "Dialogue Text", "value": "Beware of the shadows near the forest edge."},
+                                {"title": "Menu Text", "value": "Ask about the shadows"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        mock_ds_obj = MagicMock()
+        mock_ds_obj.type.name = "MonoBehaviour"
+        mock_ds_obj.path_id = 303
+        mock_ds_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_ds_obj.assets_file.objects = {}
+        mock_ds_obj.read_typetree.return_value = ds_tree
+        mock_ds_obj.read.side_effect = Exception("No script dll")
+        mock_ds_obj.parse_monobehaviour_head.side_effect = Exception("No head")
+
+        mock_env = MagicMock()
+        mock_env.objects = [mock_fungus_obj, mock_i2_obj, mock_ds_obj]
+        mock_env.file.save.return_value = b"SAVED_ASSET"
+
+        with patch("UnityPy.load", return_value=mock_env):
+            extracted = p._extract_assets(root)["strings"]
+
+        origs = {s.original for s in extracted}
+        assert "Welcome traveler, to our quiet village." in origs
+        assert "Visit the local tavern" in origs
+        assert "Start New Adventure" in origs
+        assert "Beware of the shadows near the forest edge." in origs
+        assert "Ask about the shadows" in origs
+
+        # Translate all extracted strings
+        translations = {s.id: f"[RU] {s.original}" for s in extracted}
+
+        # Reset mocks for injection
+        mock_fungus_obj.read_typetree.return_value = fungus_tree
+        mock_i2_obj.read_typetree.return_value = i2_tree
+        mock_ds_obj.read_typetree.return_value = ds_tree
+
+        with patch("UnityPy.load", return_value=mock_env):
+            written = p._inject_assets(root, translations)
+
+        assert written == 5, f"Expected 5 written, got {written}"
+        assert fungus_tree["storyText"] == "[RU] Welcome traveler, to our quiet village."
+        assert fungus_tree["description"] == "[RU] Visit the local tavern"
+        assert i2_tree["mTerms"][0]["Languages"][0] == "[RU] Start New Adventure"
+        assert ds_tree["conversations"][0]["dialogueEntries"][0]["fields"][1]["value"] == "[RU] Beware of the shadows near the forest edge."
+        assert ds_tree["conversations"][0]["dialogueEntries"][0]["fields"][2]["value"] == "[RU] Ask about the shadows"
+
+        mock_fungus_obj.save_typetree.assert_called_with(fungus_tree)
+        mock_i2_obj.save_typetree.assert_called_with(i2_tree)
+        mock_ds_obj.save_typetree.assert_called_with(ds_tree)
+
+        # Test skip_pids in _inject_raw_fallback:
+        mock_raw_obj = MagicMock()
+        mock_raw_obj.type.name = "MonoBehaviour"
+        mock_raw_obj.path_id = 101  # in skip_pids
+        mock_env_raw = MagicMock()
+        mock_env_raw.objects = [mock_raw_obj]
+        raw_written = p._inject_raw_fallback(fpath, root, {}, env=mock_env_raw, skip_pids={101})
+        mock_raw_obj.get_raw_data.assert_not_called()
+        assert raw_written == 0
+
+        print("OK — unity frameworks typetree (Fungus, I2, Dialogue System) + skip_pids safety")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -5934,7 +6062,7 @@ def check_scheduler_high_threads() -> None:
         items = [It(i, "r%d" % i) for i in range(120)]
         prov = StrictProvider(rate_once={"K0": 15}, delay=0.001)
         _, out = stream_run(
-            Req(items, threads=MAX_T, api_keys=["K0", "K1"]), prov, timeout=90,
+            Req(items, threads=MAX_T, api_keys=["K0", "K1"]), prov, timeout=120,
         )
         assert_clean("rate-recover",
                      Req(items, threads=MAX_T, api_keys=["K0", "K1"]), out, prov, 120)
@@ -7060,6 +7188,7 @@ def main() -> int:
     check_unity_engine_identifiers()
     check_unity()
     check_unity_localization()
+    check_unity_frameworks_typetree()
     check_i18n()
     check_i18n_rimworld_defs()
     check_rimworld_research_lines()

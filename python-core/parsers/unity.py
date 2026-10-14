@@ -395,13 +395,19 @@ def _sequential_aligned_strings(raw: bytes) -> list[tuple[int, str]]:
     n = len(raw)
     while i + 4 < n:
         slen = struct.unpack_from("<I", raw, i)[0]
-        if 1 <= slen <= 8000 and i + 4 + slen <= n:
+        aligned_end = _aligned_string_end(i, slen)
+        if 1 <= slen <= 8000 and aligned_end <= n:
+            pad = (4 - (slen % 4)) % 4
+            # Reject if padding contains non-zero bytes (prevents false matches on binary floats/arrays)
+            if pad > 0 and any(b != 0 for b in raw[i + 4 + slen : aligned_end]):
+                i += 1
+                continue
             chunk = raw[i + 4 : i + 4 + slen]
             try:
                 s = chunk.decode("utf-8")
                 if _is_valid_unity_text_string(s):
                     out.append((i, s))
-                    i = _aligned_string_end(i, slen)
+                    i = aligned_end
                     continue
             except (UnicodeDecodeError, ValueError):
                 pass
@@ -1232,6 +1238,46 @@ class UnityParser(BaseParser):
                     print(f"Failed to initialize TypeTreeGenerator: {e}", file=sys.stderr)
             except ImportError:
                 pass
+        else:
+            # Check for IL2CPP: GameAssembly.dll / GameAssembly.so and global-metadata.dat
+            try:
+                from UnityPy.helpers.TypeTreeGenerator import TypeTreeGenerator
+                ga_path = None
+                gm_path = None
+
+                for candidate_ga in ("GameAssembly.dll", "GameAssembly.so"):
+                    p = os.path.join(root, candidate_ga)
+                    if os.path.isfile(p):
+                        ga_path = p
+                        break
+
+                if not ga_path:
+                    for dirpath, _, filenames in os.walk(root):
+                        for fn in filenames:
+                            if fn.lower() in ("gameassembly.dll", "gameassembly.so"):
+                                ga_path = os.path.join(dirpath, fn)
+                                break
+                        if ga_path:
+                            break
+
+                if ga_path:
+                    for dirpath, _, filenames in os.walk(root):
+                        for fn in filenames:
+                            if fn.lower() == "global-metadata.dat":
+                                gm_path = os.path.join(dirpath, fn)
+                                break
+                        if gm_path:
+                            break
+
+                if ga_path and gm_path and os.path.isfile(ga_path) and os.path.isfile(gm_path):
+                    try:
+                        generator = TypeTreeGenerator(unity_version)
+                        with open(ga_path, "rb") as f_ga, open(gm_path, "rb") as f_gm:
+                            generator.load_il2cpp(f_ga.read(), f_gm.read())
+                    except Exception as e:
+                        print(f"Failed to initialize IL2CPP TypeTreeGenerator: {e}", file=sys.stderr)
+            except ImportError:
+                pass
 
         self._generator_cache[cache_key] = generator
         return generator
@@ -1465,52 +1511,108 @@ class UnityParser(BaseParser):
                                 continue
 
                             tree = obj.read_typetree()
-                            text = None
-                            field_name = None
-                            if "m_Text" in tree and isinstance(tree["m_Text"], str):
-                                text = tree["m_Text"]
-                                field_name = "m_Text"
-                            elif "m_text" in tree and isinstance(tree["m_text"], str):
-                                text = tree["m_text"]
-                                field_name = "m_text"
 
-                            if text and not text.isspace() and _is_game_text(text):
-                                path = ["Asset", obj.type.name, str(obj.path_id), field_name]
-                                
-                                # Resolve GameObject name from tree
-                                go_name = ""
-                                go_ptr = tree.get("m_GameObject")
-                                if isinstance(go_ptr, dict):
-                                    go_path_id = go_ptr.get("m_PathID")
-                                    if go_path_id and go_path_id in obj.assets_file.objects:
-                                        go_obj = obj.assets_file.objects[go_path_id]
-                                        try:
-                                            go_data = go_obj.read()
-                                            go_name = getattr(go_data, "m_Name", None) or getattr(go_data, "name", "")
-                                        except Exception:
-                                            pass
-                                
-                                # Resolve Script class name
-                                script_name = ""
-                                try:
-                                    mb_head = obj.parse_monobehaviour_head()
-                                    script = mb_head.m_Script.deref_parse_as_object()
-                                    script_name = f"{script.m_Namespace}.{script.m_ClassName}" if script.m_Namespace else script.m_ClassName
-                                except Exception:
-                                    pass
+                            # Resolve GameObject name from tree
+                            go_name = ""
+                            go_ptr = tree.get("m_GameObject")
+                            if isinstance(go_ptr, dict):
+                                go_path_id = go_ptr.get("m_PathID")
+                                if go_path_id and go_path_id in obj.assets_file.objects:
+                                    go_obj = obj.assets_file.objects[go_path_id]
+                                    try:
+                                        go_data = go_obj.read()
+                                        go_name = getattr(go_data, "m_Name", None) or getattr(go_data, "name", "")
+                                    except Exception:
+                                        pass
 
-                                parts = []
-                                if go_name:
-                                    parts.append(f"GameObject: {go_name}")
-                                if script_name:
-                                    parts.append(f"Script: {script_name}")
-                                parts.append(f"File: {os.path.basename(fpath)}")
-                                parts.append(f"PathID: {obj.path_id}")
-                                
-                                context = ", ".join(parts)
-                                results.append(self._mk(rel_path, path, text, context))
-                                typetree_found += 1
-                                n_typetree += 1
+                            # Resolve Script class name
+                            script_name = ""
+                            try:
+                                mb_head = obj.parse_monobehaviour_head()
+                                script = mb_head.m_Script.deref_parse_as_object()
+                                script_name = f"{script.m_Namespace}.{script.m_ClassName}" if script.m_Namespace else script.m_ClassName
+                            except Exception:
+                                pass
+
+                            # 1. Direct text fields (Unity UI, TextMeshPro, Fungus Say/Menu, localizedText)
+                            for field_name in ("m_Text", "m_text", "storyText", "description", "localizedText"):
+                                if field_name in tree and isinstance(tree[field_name], str):
+                                    text = tree[field_name]
+                                    if text and not text.isspace() and _is_game_text(text):
+                                        path = ["Asset", obj.type.name, str(obj.path_id), field_name]
+                                        parts = []
+                                        if go_name:
+                                            parts.append(f"GameObject: {go_name}")
+                                        if script_name:
+                                            parts.append(f"Script: {script_name}")
+                                        if field_name not in ("m_Text", "m_text"):
+                                            parts.append(f"Field: {field_name}")
+                                        parts.append(f"File: {os.path.basename(fpath)}")
+                                        parts.append(f"PathID: {obj.path_id}")
+
+                                        context = ", ".join(parts)
+                                        results.append(self._mk(rel_path, path, text, context))
+                                        typetree_found += 1
+                                        n_typetree += 1
+
+                            # 2. I2 Localization (mTerms / mSource.mTerms)
+                            terms_list = None
+                            if "mTerms" in tree and isinstance(tree["mTerms"], list):
+                                terms_list = tree["mTerms"]
+                            elif "mSource" in tree and isinstance(tree["mSource"], dict):
+                                ms = tree["mSource"]
+                                if "mTerms" in ms and isinstance(ms.get("mTerms"), list):
+                                    terms_list = ms["mTerms"]
+
+                            if terms_list:
+                                for term in terms_list:
+                                    if isinstance(term, dict):
+                                        term_key = term.get("Term")
+                                        langs = term.get("Languages")
+                                        if term_key and isinstance(langs, list) and langs:
+                                            val = langs[0]
+                                            if isinstance(val, str) and val and not val.isspace() and _is_game_text(val):
+                                                path = ["Asset", "I2Term", str(obj.path_id), str(term_key)]
+                                                context = f"I2 Localization: {term_key}, File: {os.path.basename(fpath)}, PathID: {obj.path_id}"
+                                                results.append(self._mk(rel_path, path, val, context))
+                                                typetree_found += 1
+                                                n_typetree += 1
+
+                            # 3. PixelCrushers Dialogue System (conversations -> dialogueEntries -> fields)
+                            if "conversations" in tree and isinstance(tree["conversations"], list):
+                                for conv in tree["conversations"]:
+                                    if isinstance(conv, dict):
+                                        conv_title = conv.get("Title", "")
+                                        entries = conv.get("dialogueEntries")
+                                        if isinstance(entries, list):
+                                            for entry in entries:
+                                                if isinstance(entry, dict):
+                                                    entry_id = entry.get("id", 0)
+                                                    fields = entry.get("fields")
+                                                    if isinstance(fields, list):
+                                                        actor_name = ""
+                                                        for fld in fields:
+                                                            if isinstance(fld, dict) and fld.get("title") == "Actor":
+                                                                actor_name = str(fld.get("value", ""))
+                                                        for fld in fields:
+                                                            if isinstance(fld, dict):
+                                                                title = fld.get("title")
+                                                                if title in ("Dialogue Text", "Menu Text"):
+                                                                    val = fld.get("value")
+                                                                    if isinstance(val, str) and val and not val.isspace() and _is_game_text(val):
+                                                                        path = ["Asset", "DialogueEntry", str(obj.path_id), str(entry_id), str(title)]
+                                                                        ctx_parts = []
+                                                                        if conv_title:
+                                                                            ctx_parts.append(f"Conversation: {conv_title}")
+                                                                        if actor_name:
+                                                                            ctx_parts.append(f"Actor: {actor_name}")
+                                                                        ctx_parts.append(f"Entry: {entry_id} ({title})")
+                                                                        ctx_parts.append(f"File: {os.path.basename(fpath)}")
+                                                                        ctx_parts.append(f"PathID: {obj.path_id}")
+                                                                        context = ", ".join(ctx_parts)
+                                                                        results.append(self._mk(rel_path, path, val, context))
+                                                                        typetree_found += 1
+                                                                        n_typetree += 1
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "Text":
@@ -1763,7 +1865,8 @@ class UnityParser(BaseParser):
     def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str],
                              env: Any = None, font_bytes: bytes | None = None,
                              target_lang: str | None = None,
-                             already_changed: bool = False) -> int:
+                             already_changed: bool = False,
+                             skip_pids: set[int] | None = None) -> int:
         """Inject into MonoBehaviour raw via length-changing string rebuild.
 
         Prefers path-addressed slots ``AssetRaw / type / path_id / offset``.
@@ -1785,6 +1888,8 @@ class UnityParser(BaseParser):
             objects_changed = 0
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
+                    continue
+                if skip_pids and obj.path_id in skip_pids:
                     continue
                 try:
                     raw = bytes(obj.get_raw_data())
@@ -2095,6 +2200,7 @@ class UnityParser(BaseParser):
 
                 changed = False
                 fonts_to_replace = set()
+                typetree_modified_pids: set[int] = set()
 
                 for obj in env.objects:
                     if obj.type.name in ("MonoBehaviour", "Text"):
@@ -2116,29 +2222,81 @@ class UnityParser(BaseParser):
                                 data = obj.read()
                                 tree = data.read_typetree()
 
-                            field_name = None
-                            if "m_Text" in tree and isinstance(tree["m_Text"], str):
-                                field_name = "m_Text"
-                            elif "m_text" in tree and isinstance(tree["m_text"], str):
-                                field_name = "m_text"
+                            obj_modified = False
 
-                            if field_name:
-                                original = tree[field_name]
-                                if original and not original.isspace() and _is_game_text(original):
-                                    path = ["Asset", obj.type.name, str(obj.path_id), field_name]
-                                    sid = make_id(self.engine, rel_path, path, original)
+                            # 1. Direct text fields (Unity UI, TextMeshPro, Fungus Say/Menu, localizedText)
+                            for field_name in ("m_Text", "m_text", "storyText", "description", "localizedText"):
+                                if field_name in tree and isinstance(tree[field_name], str):
+                                    original = tree[field_name]
+                                    if original and not original.isspace() and _is_game_text(original):
+                                        path = ["Asset", obj.type.name, str(obj.path_id), field_name]
+                                        sid = make_id(self.engine, rel_path, path, original)
+                                        if sid in translations:
+                                            tree[field_name] = translations[sid]
+                                            obj_modified = True
+                                            written += 1
+                                            typetree_found += 1
+                                            n_typetree += 1
 
-                                    if sid in translations:
-                                        translated = translations[sid]
-                                        tree[field_name] = translated
-                                        if obj.type.name == "MonoBehaviour":
-                                            obj.save_typetree(tree)
-                                        else:
-                                            data.save_typetree(tree)
-                                        changed = True
-                                        written += 1
-                                        typetree_found += 1
-                                        n_typetree += 1
+                            # 2. I2 Localization (mTerms / mSource.mTerms)
+                            terms_list = None
+                            if "mTerms" in tree and isinstance(tree["mTerms"], list):
+                                terms_list = tree["mTerms"]
+                            elif "mSource" in tree and isinstance(tree["mSource"], dict):
+                                ms = tree["mSource"]
+                                if "mTerms" in ms and isinstance(ms.get("mTerms"), list):
+                                    terms_list = ms["mTerms"]
+
+                            if terms_list:
+                                for term in terms_list:
+                                    if isinstance(term, dict):
+                                        term_key = term.get("Term")
+                                        langs = term.get("Languages")
+                                        if term_key and isinstance(langs, list) and langs:
+                                            orig_val = langs[0]
+                                            if isinstance(orig_val, str) and orig_val:
+                                                path = ["Asset", "I2Term", str(obj.path_id), str(term_key)]
+                                                sid = make_id(self.engine, rel_path, path, orig_val)
+                                                if sid in translations:
+                                                    langs[0] = translations[sid]
+                                                    obj_modified = True
+                                                    written += 1
+                                                    typetree_found += 1
+                                                    n_typetree += 1
+
+                            # 3. PixelCrushers Dialogue System (conversations -> dialogueEntries -> fields)
+                            if "conversations" in tree and isinstance(tree["conversations"], list):
+                                for conv in tree["conversations"]:
+                                    if isinstance(conv, dict):
+                                        entries = conv.get("dialogueEntries")
+                                        if isinstance(entries, list):
+                                            for entry in entries:
+                                                if isinstance(entry, dict):
+                                                    entry_id = entry.get("id", 0)
+                                                    fields = entry.get("fields")
+                                                    if isinstance(fields, list):
+                                                        for fld in fields:
+                                                            if isinstance(fld, dict):
+                                                                title = fld.get("title")
+                                                                if title in ("Dialogue Text", "Menu Text"):
+                                                                    orig_val = fld.get("value")
+                                                                    if isinstance(orig_val, str) and orig_val:
+                                                                        path = ["Asset", "DialogueEntry", str(obj.path_id), str(entry_id), str(title)]
+                                                                        sid = make_id(self.engine, rel_path, path, orig_val)
+                                                                        if sid in translations:
+                                                                            fld["value"] = translations[sid]
+                                                                            obj_modified = True
+                                                                            written += 1
+                                                                            typetree_found += 1
+                                                                            n_typetree += 1
+
+                            if obj_modified:
+                                if obj.type.name == "MonoBehaviour":
+                                    obj.save_typetree(tree)
+                                else:
+                                    data.save_typetree(tree)
+                                changed = True
+                                typetree_modified_pids.add(obj.path_id)
                         except Exception:
                             failed_count += 1
 
@@ -2159,6 +2317,42 @@ class UnityParser(BaseParser):
                         except Exception:
                             failed_count += 1
 
+                # Dynamic TTF font replacement for TMP_FontAsset
+                script = _target_script(target_lang)
+                if fonts_to_replace and font_bytes and (script is not None or target_lang is None):
+                    for obj in env.objects:
+                        if obj.type.name == "Font" and obj.path_id in fonts_to_replace:
+                            try:
+                                tree = obj.read_typetree()
+                                blob = bytes(tree.get("m_FontData") or b"")
+                                if script and _ttf_covers_script(blob, script) is True:
+                                    continue
+                                existing_fdata = tree.get("m_FontData")
+                                if isinstance(existing_fdata, list):
+                                    tree["m_FontData"] = list(font_bytes)
+                                else:
+                                    tree["m_FontData"] = font_bytes
+                                obj.save_typetree(tree)
+                                changed = True
+                                typetree_modified_pids.add(obj.path_id)
+                            except Exception:
+                                try:
+                                    data = obj.read()
+                                    blob = bytes(getattr(data, "m_FontData", b"") or b"")
+                                    if script and _ttf_covers_script(blob, script) is True:
+                                        continue
+                                    if hasattr(data, "m_FontData"):
+                                        existing_fdata = getattr(data, "m_FontData")
+                                        if isinstance(existing_fdata, list):
+                                            data.m_FontData = list(font_bytes)
+                                        else:
+                                            data.m_FontData = font_bytes
+                                        data.save()
+                                        changed = True
+                                        typetree_modified_pids.add(obj.path_id)
+                                except Exception as e_font:
+                                    print(f"Failed to replace font in Font path_id={obj.path_id}: {e_font}", file=sys.stderr)
+
                 # Always attempt raw inject: content blobs (Naninovel/I2/…) never use m_Text.
                 # Font-gap PPtr rewrite runs INSIDE raw inject, AFTER any UnityPy
                 # save — a pre-save disk patch would be clobbered by env.file.save().
@@ -2167,6 +2361,7 @@ class UnityParser(BaseParser):
                     env=env, font_bytes=font_bytes,
                     target_lang=target_lang,
                     already_changed=changed,
+                    skip_pids=typetree_modified_pids,
                 )
                 if raw_written > 0:
                     written += raw_written
@@ -2546,8 +2741,13 @@ class UnityParser(BaseParser):
 
                 if changed:
                     self.backup_file(root, bundle_path)
+                    saved_bytes = None
+                    try:
+                        saved_bytes = env.file.save(packer="original")
+                    except Exception:
+                        saved_bytes = env.file.save(packer="none")
                     with open(bundle_path, "wb") as f:
-                        f.write(env.file.save(packer="none"))
+                        f.write(saved_bytes)
 
             except Exception as e:
                 print(f"Error injecting into bundle {bundle_path}: {e}", file=sys.stderr)
