@@ -340,14 +340,14 @@ def _classify_probe(status: int, body: str) -> str:
 
 
 def _probe(url: str, header: str, api_key: str, x_provider: str | None) -> str:
-    import httpx
     headers = {}
     if api_key:
         headers[header] = api_key if header != "authorization" else f"Bearer {api_key}"
     if x_provider:
         headers["x-provider"] = x_provider
     try:
-        resp = httpx.get(url, headers=headers, timeout=12)
+        from providers.base import get_http_client
+        resp = get_http_client().get(url, headers=headers, timeout=12)
         return _classify_probe(resp.status_code, resp.text)
     except Exception:
         return "unreachable"  # DNS/TLS/connect failure → network-level block
@@ -1552,6 +1552,8 @@ def _collect_validatable_files(engine: str, root: str, target_lang: str) -> list
                 continue
         for fn in filenames:
             if engine == "renpy" and fn.endswith(".rpy"):
+                if fn in ("_interprex_font.rpy", "_ui_style_fixes.rpy"):
+                    continue
                 files.append(os.path.join(dirpath, fn))
             elif engine == "i18n" and fn.endswith((".json", ".ini", ".properties")):
                 files.append(os.path.join(dirpath, fn))
@@ -1624,51 +1626,62 @@ def _llm_fix(api_key: str, model: str, base_url: str, file_path: str, content: s
     lines = content.split("\n")
     broken_line = lines[line_no - 1].strip() if line_no <= len(lines) else ""
 
+    from providers.base import get_http_client
+
+    prompt = (
+        "Fix this broken Python line in a Ren'Py script.\n"
+        f"Line {line_no}: {broken_line}\n"
+        f"Error: {error.message}\n\n"
+        "Return ONLY a JSON object: {\"line\":N,\"old\":\"<exact broken line>\",\"new\":\"<fixed line>\"}"
+    )
+
     is_openai = base_url and "generativelanguage" not in base_url
     if is_openai:
-        import httpx, json
-        prompt = (
-            "Fix this broken Python line in a Ren'Py script.\n"
-            f"Line {line_no}: {broken_line}\n"
-            f"Error: {error.message}\n\n"
-            "Return ONLY a JSON object: {\"line\":N,\"old\":\"<exact broken line>\",\"new\":\"<fixed line>\"}"
-        )
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        }
         try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=60)
+            resp = get_http_client().post(url, json=body, headers=headers, timeout=60)
             resp.raise_for_status()
             text = resp.json()["choices"][0]["message"]["content"]
         except Exception:
             return None
     else:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        if base_url:
+            url = url.replace("https://generativelanguage.googleapis.com", base_url.rstrip("/"))
+        headers = {
+            "x-goog-api-key": api_key,
+            "x-provider": "gemini",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "line": {"type": "INTEGER"},
+                        "old": {"type": "STRING"},
+                        "new": {"type": "STRING"},
+                    },
+                    "required": ["line", "old", "new"],
+                },
+            },
+        }
         try:
-            from google import genai
-            from google.genai import types
-            from pydantic import BaseModel
-
-            class LineFix(BaseModel):
-                line: int
-                old: str
-                new: str
-
-            client = genai.Client(api_key=api_key)
-            prompt = (
-                "Fix this broken Python line in a Ren'Py script.\n"
-                f"Line {line_no}: {broken_line}\n"
-                f"Error: {error.message}\n\n"
-                "Return the fix with the corrected line."
-            )
-            response = client.models.generate_content(
-                model=model, contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    response_schema=LineFix,
-                ),
-            )
-            text = response.text
+            resp = get_http_client().post(url, json=body, headers=headers, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(part["text"] for part in parts if not part.get("thought"))
         except Exception:
             return None
 
@@ -2132,6 +2145,7 @@ def renpy_translate_python(req: RenpyPythonReq) -> StreamingResponse:
     import threading
     import renpy_python_translator
 
+    renpy_python_translator.set_aborted(False)
     log_queue = queue.Queue()
     
     # Configure custom handler for renpy_python_translator
@@ -2184,11 +2198,14 @@ def renpy_translate_python(req: RenpyPythonReq) -> StreamingResponse:
     threading.Thread(target=run_translator, daemon=True).start()
     
     def event_generator():
-        while True:
-            msg = log_queue.get()
-            if msg is None:
-                break
-            yield msg + "\n"
+        try:
+            while True:
+                msg = log_queue.get()
+                if msg is None:
+                    break
+                yield msg + "\n"
+        finally:
+            renpy_python_translator.set_aborted(True)
             
     return StreamingResponse(event_generator(), media_type="text/plain")
 

@@ -935,6 +935,16 @@ class TranslationScheduler:
                     cd = self.key_cooldown.get(worker_key, 0.0)
                     wait_for = cd - time.time()
                     if wait_for > 0:
+                        wait_left = int(math.ceil(wait_for))
+                        if wait_for >= 1.5:
+                            bnum = self.worker_batch_no.get(worker_idx, 0)
+                            self._emit(
+                                worker_idx,
+                                "waiting_delay",
+                                status=f"Key cooldown ({wait_left}s left)...",
+                                wait_left=wait_left,
+                                batch_num=bnum or None,
+                            )
                         self.cond.wait(timeout=min(wait_for, 1.0))
                         continue
 
@@ -1074,10 +1084,10 @@ class TranslationScheduler:
         )
         return kept
 
-    def finish_batch(self, worker_idx: int, batch: list, tr_map: dict[str, str], key_died: bool) -> None:
+    def finish_batch(self, worker_idx: int, batch: list, tr_map: dict[str, str], key_died: bool, safety_skip: bool = False) -> None:
         """Fold a finished batch back into shared state. ALWAYS call from finally:
-        if key_died, un-translated strings return to the pool so a surviving key
-        picks them up — a crash here must never strand them."""
+        un-translated strings return to the pool (up to max_reclaims) so a partial batch
+        or dead key never silently loses strings."""
         with self.cond:
             self.in_flight_workers.discard(worker_idx)
             if tr_map:
@@ -1086,12 +1096,13 @@ class TranslationScheduler:
                 self.avg_batch_items = (
                     (1 - a) * self.avg_batch_items + a * len(batch)
                 )
-            if key_died:
+            if not safety_skip and not self.aborted:
                 leftover = [it for it in batch if it.id not in tr_map]
-                for it in leftover:
+                max_reclaims = max(2, len(self.keys_to_use) + 1)
+                for it in reversed(leftover):
                     n = self.reclaim_count.get(it.id, 0) + 1
                     self.reclaim_count[it.id] = n
-                    if n <= len(self.keys_to_use):
+                    if n <= max_reclaims:
                         fname = self.item_file.get(it.id, "")
                         self.pool.setdefault(fname, [])
                         self.pool[fname].insert(0, it)
@@ -1849,6 +1860,7 @@ class TranslationScheduler:
             t0 = time.time()
             tr_map: dict[str, str] = {}
             key_died = False
+            _safety = False
             try:
                 tr_map, key_died, _safety = self._translate_with_retries(
                     batch, cal, worker_idx, worker_key
@@ -1859,7 +1871,7 @@ class TranslationScheduler:
                 # race sibling workers: a late completed event could carry a
                 # STALE lower done than a peer already reported → main progress
                 # bar jumped 89→15→40 as NDJSON reordered concurrent emits.
-                self.finish_batch(worker_idx, batch, tr_map, key_died)
+                self.finish_batch(worker_idx, batch, tr_map, key_died, _safety)
 
             # Emit translations after result is updated so `done` includes this
             # batch. Frontend still monotonic-maxes done as a belt-and-suspenders.

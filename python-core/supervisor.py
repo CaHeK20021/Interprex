@@ -67,7 +67,9 @@ def parse_app_settings() -> Dict[str, Any]:
     known_providers = ["gemini", "openai", "openrouter", "nvidia", "custom", "anthropic", "deepseek", "ollama", "lmstudio", "kaggle"]
     provider_keys_arrays: Dict[str, List[str]] = {}
 
-    for f in sorted(glob.glob(os.path.join(db_dir, "*.log")) + glob.glob(os.path.join(db_dir, "*.ldb"))):
+    db_files = glob.glob(os.path.join(db_dir, "*.ldb")) + glob.glob(os.path.join(db_dir, "*.log"))
+    db_files.sort(key=lambda p: os.path.getmtime(p))
+    for f in db_files:
         try:
             with open(f, "rb") as fp:
                 raw = fp.read()

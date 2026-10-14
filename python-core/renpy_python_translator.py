@@ -39,13 +39,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("renpy_python_translator")
 
 _should_pause = False
+_should_abort = False
 
 def set_paused(value: bool):
     global _should_pause
     _should_pause = value
 
+def set_aborted(value: bool):
+    global _should_abort
+    _should_abort = value
+
+def is_aborted() -> bool:
+    return _should_abort
+
 def _wait_if_paused():
-    while _should_pause:
+    while _should_pause and not _should_abort:
         time.sleep(0.3)
 
 # Ensure we can import parsers and providers relative to this script
@@ -744,10 +752,14 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
             accounted[0] += 1
 
     def is_all_done():
+        if _should_abort:
+            return True
         with accounted_lock:
             return accounted[0] >= total
 
     def worker(worker_idx: int, key: str):
+        if _should_abort:
+            return
         auth_fails = 0
         # Initial stagger across threads on the same key so they don't fire simultaneously
         thread_rank = worker_idx % threads if threads > 1 else 0
@@ -755,13 +767,15 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
         if stagger > 0:
             stagger_start = time.time()
             while time.time() - stagger_start < stagger:
-                if is_all_done():
+                if is_all_done() or _should_abort:
                     return
                 time.sleep(min(0.2, stagger - (time.time() - stagger_start)))
 
         while True:
+            if _should_abort or is_all_done():
+                return
             _wait_if_paused()  # pause only at the claim boundary, never mid-request
-            if is_all_done():
+            if _should_abort or is_all_done():
                 return
             with dead_lock:
                 if key in dead_keys:
@@ -773,7 +787,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
             wait = cd - time.time()
             if wait > 0:
                 while wait > 0:
-                    if is_all_done():
+                    if is_all_done() or _should_abort:
                         return
                     time.sleep(min(wait, 0.2))
                     wait = cd - time.time()
@@ -786,7 +800,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                 gap = delay_seconds - (time.time() - last)
                 if gap > 0:
                     while gap > 0:
-                        if is_all_done():
+                        if is_all_done() or _should_abort:
                             return
                         time.sleep(min(gap, 0.2))
                         gap = delay_seconds - (time.time() - last)
@@ -795,7 +809,7 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
             try:
                 batch_idx, batch, attempts, rate_attempts = work.get_nowait()
             except queue.Empty:
-                if is_all_done():
+                if is_all_done() or _should_abort:
                     return
                 time.sleep(0.2)
                 continue
@@ -849,15 +863,13 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                     # never exits (the infinite-translation hang). Cap it, then fall
                     # to the caller's safe default like "other" does.
                     if rate_attempts + 1 < _POOL_RATE_TRIES * len(keys):
-                        if delay_seconds > 0:
-                            with cd_lock:
-                                key_cooldown[key] = max(
-                                    key_cooldown.get(key, 0.0), time.time() + delay_seconds
-                                )
-                        else:
-                            # No pacing configured → no cooldown set above, so sleep
-                            # here or we busy-spin the CPU re-claiming instantly.
-                            time.sleep(_POOL_RATE_MIN_BACKOFF)
+                        m_retry = re.search(r'"retryDelay"\s*:\s*"([0-9.]+)s?"', str(e))
+                        retry_after = float(m_retry.group(1)) if m_retry else 0.0
+                        cooldown_s = max(retry_after, delay_seconds if delay_seconds > 0 else 15.0)
+                        with cd_lock:
+                            key_cooldown[key] = max(
+                                key_cooldown.get(key, 0.0), time.time() + cooldown_s
+                            )
                         work.put((batch_idx, batch, attempts, rate_attempts + 1))
                         continue
                     logger.error(
@@ -2237,6 +2249,9 @@ def main(args_list=None):
                 batches, keys, args.threads, args.delay_seconds, "Classified", _classify_pf,
                 on_batch_done=_on_classify_batch_done
             )
+            if _should_abort:
+                logger.info("Process aborted by user.")
+                sys.exit(0)
 
             for entry in uncached_entries:
                 decision, reason = decisions_map.get(entry["value"], ("SKIP", "Failed to classify/error"))
@@ -2337,6 +2352,9 @@ def main(args_list=None):
             batches, keys, args.threads, args.delay_seconds, "Translated", _translate_pf,
             on_batch_done=_on_translate_batch_done
         )
+        if _should_abort:
+            logger.info("Process aborted by user.")
+            sys.exit(0)
 
         # Retry strings the model silently dropped from their batch (a real failure
         # mode: hard=True strings like the blog line came back missing). One small
