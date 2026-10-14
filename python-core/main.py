@@ -1339,7 +1339,8 @@ def _extract_stream(req: ExtractReq):
             return ""
 
     def real_extract(mod_path: str) -> list[dict]:
-        return [s.to_dict() for s in parser.extract(req.root, [mod_path])]
+        local_parser = get_parser(req.engine)
+        return [s.to_dict() for s in local_parser.extract(req.root, [mod_path])]
 
     # 1. Split mods into cache hits vs misses. Emit hits FIRST (instant), so
     #    already-known mods light up immediately while misses are still crunching.

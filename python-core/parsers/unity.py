@@ -1762,7 +1762,8 @@ class UnityParser(BaseParser):
 
     def _inject_raw_fallback(self, fpath: str, root: str, translations: dict[str, str],
                              env: Any = None, font_bytes: bytes | None = None,
-                             target_lang: str | None = None) -> int:
+                             target_lang: str | None = None,
+                             already_changed: bool = False) -> int:
         """Inject into MonoBehaviour raw via length-changing string rebuild.
 
         Prefers path-addressed slots ``AssetRaw / type / path_id / offset``.
@@ -1840,7 +1841,7 @@ class UnityParser(BaseParser):
                         file=sys.stderr,
                     )
 
-            if objects_changed == 0:
+            if objects_changed == 0 and not already_changed:
                 # No string edits — still try a conservative font-gap patch if
                 # the target script needs glyphs the game's fonts don't have.
                 if _target_script(target_lang):
@@ -2165,6 +2166,7 @@ class UnityParser(BaseParser):
                     fpath, root, translations,
                     env=env, font_bytes=font_bytes,
                     target_lang=target_lang,
+                    already_changed=changed,
                 )
                 if raw_written > 0:
                     written += raw_written

@@ -53,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parsers import rpa as rpamod
 from parsers.base import INTERPREX_DIR, make_id
 from parsers.renpy import RenPyParser
+from providers.base import get_http_client
 
 # Reuse the SAME error bucketing the main scheduler uses, so this path fails over
 # identically (no duplicated marker lists to drift out of sync).
@@ -954,26 +955,20 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
         if response_schema:
             body["generationConfig"]["responseSchema"] = response_schema
         
-    max_retries = 5
-    initial_delay = 2.0
-    backoff_factor = 2.0
-    
-    for attempt in range(max_retries):
+    client = get_http_client()
+    net_retries = 2
+    for attempt in range(net_retries):
         try:
-            resp = httpx.post(
+            resp = client.post(
                 url, json=body, headers=headers,
                 timeout=httpx.Timeout(_HTTP_TIMEOUT_S, connect=20.0),
             )
             if resp.status_code == 429:
-                delay = initial_delay * (backoff_factor ** attempt)
-                logger.warning("Rate limit hit (429). Retrying in %.1f seconds...", delay)
-                time.sleep(delay)
-                continue
-            if resp.status_code in (500, 503, 504):
-                delay = initial_delay * (backoff_factor ** attempt)
-                logger.warning("Server error (%d). Retrying in %.1f seconds...", resp.status_code, delay)
-                time.sleep(delay)
-                continue
+                raise RuntimeError(f"API rate limit (429): {resp.text[:300]}")
+            if resp.status_code in (401, 403):
+                raise RuntimeError(f"API auth error ({resp.status_code}): {resp.text[:300]}")
+            if resp.status_code in (500, 502, 503, 504):
+                raise RuntimeError(f"API server error ({resp.status_code}): {resp.text[:300]}")
             resp.raise_for_status()
             data = resp.json()
             try:
@@ -988,21 +983,13 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
             except Exception as e:
                 logger.warning("Failed to parse model response (%.200s): %s", text, e)
                 raise RuntimeError(f"Unexpected response from model: {data}") from e
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code in (429, 500, 503, 504):
-                delay = initial_delay * (backoff_factor ** attempt)
-                logger.warning("HTTP status error (%d). Retrying in %.1f seconds...", e.response.status_code, delay)
-                time.sleep(delay)
-                continue
-            raise e
         except (httpx.RequestError, httpx.TimeoutException) as e:
-            if attempt == max_retries - 1:
-                raise e
-            delay = initial_delay * (backoff_factor ** attempt)
-            logger.warning("Network error (%s). Retrying in %.1f seconds...", e, delay)
-            time.sleep(delay)
+            if attempt == net_retries - 1:
+                raise RuntimeError(f"Network error: {e}") from e
+            logger.warning("Network connection error (%s). Retrying in 1.5s...", e)
+            time.sleep(1.5)
             
-    raise RuntimeError("Max retries exceeded for API call.")
+    raise RuntimeError("Max network retries exceeded for API call.")
 
 
 CLASSIFICATION_BATCH_PROMPT = """

@@ -459,13 +459,24 @@ function getModPathForString(
   return byName ? byName.path : null;
 }
 
+const foreignCaptureCache = new Map<TargetLang, RegExp>();
+function getForeignCaptureRegex(targetLang: TargetLang): RegExp {
+  let re = foreignCaptureCache.get(targetLang);
+  if (!re) {
+    const foreignRegex = getForeignWordRegex(targetLang);
+    re = new RegExp(`(${foreignRegex.source})`, 'g');
+    foreignCaptureCache.set(targetLang, re);
+  }
+  return re;
+}
+
 // Highlight foreign words inside translations, ignoring Ren'Py formatting tags and technical tokens.
 function highlightLatin(text: string, targetLang: TargetLang) {
   if (!text) return "";
   
   // Split by Ren'Py format tags {...} and variables [...]
   const parts = text.split(/(\{.*?\}|\[.*?\])/g);
-  const foreignRegex = getForeignWordRegex(targetLang);
+  const foreignRegexCapture = getForeignCaptureRegex(targetLang);
   
   // We need to match keeping track of absolute character indices to verify isTechnicalWord
   return parts.map((part, index) => {
@@ -474,8 +485,7 @@ function highlightLatin(text: string, targetLang: TargetLang) {
       return <span key={index} className="tag-node">{part}</span>;
     }
     
-    // Split the text part by foreign words
-    const foreignRegexCapture = new RegExp(`(${foreignRegex.source})`, 'g');
+    // Split the text part by foreign words. Capturing group ensures odd indices are matches.
     const subParts = part.split(foreignRegexCapture);
     
     // Accumulate characters offset to find exact word index
@@ -483,7 +493,7 @@ function highlightLatin(text: string, targetLang: TargetLang) {
     return (
       <span key={index}>
         {subParts.map((subPart, subIndex) => {
-          const isForeign = new RegExp(`^(${foreignRegex.source})$`).test(subPart);
+          const isForeign = subIndex % 2 === 1;
           const startIdx = currentOffset;
           currentOffset += subPart.length;
 
@@ -2669,6 +2679,33 @@ export default function App() {
       }
       const status = await getBackupStatus(root);
       setHasBackup(status.has_backup);
+      if (!dryRun && engine) {
+        try {
+          const fresh = await loadProject(root, engine);
+          if (fresh) {
+            setProject(fresh);
+            setStrings((prev) => {
+              const existingIds = new Set(prev.map((s) => s.id));
+              const added: TranslationString[] = [];
+              for (const [id, entry] of Object.entries(fresh.strings)) {
+                if (!existingIds.has(id)) {
+                  added.push({
+                    id,
+                    original: entry.original,
+                    context: (entry as any).context || "",
+                    file: (entry as any).file || "",
+                    path: (entry as any).path || [],
+                    engine: ((entry as any).engine || engine) as Engine,
+                  });
+                }
+              }
+              return added.length > 0 ? [...prev, ...added] : prev;
+            });
+          }
+        } catch (e) {
+          console.error("Failed to reload project after python translation:", e);
+        }
+      }
     } catch (err: any) {
       setPythonLogs((prev) => [...prev, `[ERROR] ${err.message || err}`]);
     } finally {

@@ -1,7 +1,9 @@
+import os
 import re
 import logging
+import hashlib
 from pathlib import Path
-from .base import BaseParser, TranslationString
+from .base import BaseParser, TranslationString, update_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -715,8 +717,9 @@ class UnrealParser(BaseParser):
                     
                 target_path = Path(*parts)
                 
+                file_pre_existed = target_path.exists()
                 # If target file exists, back it up
-                if target_path.exists():
+                if file_pre_existed:
                     self.backup_file(root, str(target_path))
 
                 # Reconstruct content
@@ -779,9 +782,13 @@ class UnrealParser(BaseParser):
                             # Note: unquoted values shouldn't have quotes added
                             output_lines.append(f"{el.before_eq}={el.after_eq}{val_to_write}{el.inline_comment}\n")
                             
-                # Join content and write using helper
                 output_content = "".join(output_lines)
                 write_with_bom(target_path, output_content, encoding, has_bom)
+
+                if not file_pre_existed:
+                    rel_to_root = os.path.relpath(str(target_path), root).replace("\\", "/")
+                    mod_sha = hashlib.sha256(output_content.encode(encoding, errors="replace")).hexdigest()
+                    update_metadata(root, rel_to_root, "", mod_sha, "created")
                 
             except Exception as e:
                 logger.error(f"Failed to inject into {rel_source}: {e}")

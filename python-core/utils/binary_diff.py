@@ -45,7 +45,7 @@ def make_patch(orig_bytes: bytes, mod_bytes: bytes) -> bytes:
     j = 0
     last_sync_i = 0
     last_sync_j = 0
-    W = 1048576 # 1 MB window
+    W = 131072 # 128 KB window (bounded search prevents CPU lockup on large mismatches)
     instructions = []
     
     len_A = len(orig_bytes)

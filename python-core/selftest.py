@@ -2771,7 +2771,7 @@ def check_i18n() -> None:
         }
     }
     with open(os.path.join(root, "i18n", "default.json"), "w", encoding="utf-8") as f:
-        json.dump(stardew_data, f, ensure_ascii=False)
+        f.write('{\n  // Stardew comment\n  "simple_key": "original simple",\n  "nested_section": {\n    /* block comment */\n    "nested_key": "original nested",\n  },\n}\n')
 
     # 2. RimWorld Languages
     os.makedirs(os.path.join(root, "Languages", "English", "Keyed"), exist_ok=True)
@@ -2828,6 +2828,10 @@ def check_i18n() -> None:
         ru_data = json.load(f)
     assert ru_data["simple_key"] == "ORIGINAL SIMPLE"
     assert ru_data["nested_section"]["nested_key"] == "ORIGINAL NESTED"
+
+    with open(os.path.join(root, ".interprex_backups", "metadata.json"), "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    assert meta.get("i18n/ru.json", {}).get("type") == "created", f"i18n/ru.json not registered as created: {meta.get('i18n/ru.json')}"
 
     # Verify injected RimWorld XMLs
     ru_keyed_path = os.path.join(root, "Languages", "Russian (Русский)", "Keyed", "Keys.xml")
@@ -3696,6 +3700,10 @@ def check_unreal() -> None:
 
     rus_dir = os.path.join(root, "Localization", "RUS")
     assert os.path.isdir(rus_dir)
+
+    with open(os.path.join(root, ".interprex_backups", "metadata.json"), "r", encoding="utf-8") as f:
+        ue_meta = json.load(f)
+    assert ue_meta.get("Localization/RUS/Game.RUS", {}).get("type") == "created", f"Game.RUS not registered as created: {ue_meta.get('Localization/RUS/Game.RUS')}"
 
     # Check Game.RUS
     game_rus_path = os.path.join(rus_dir, "Game.RUS")

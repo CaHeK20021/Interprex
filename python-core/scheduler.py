@@ -1587,6 +1587,12 @@ class TranslationScheduler:
                         TranslateItem(id=it.id, text=it.text, context=it.context,
                                       max_chars=tighter)
                     )
+            if cfg and getattr(cfg, "api_key", None):
+                with self.cond:
+                    cd = self.key_cooldown.get(cfg.api_key, 0.0)
+                wait = cd - time.time()
+                if wait > 0:
+                    time.sleep(wait)
             try:
                 retry_prompt = build_prompt(
                     retry_batch, self.req.target_lang, self.req.glossary,
@@ -1955,12 +1961,18 @@ class TranslationScheduler:
                             prep = next(
                                 (p for p in self._prepared_by_file.get(f, [])
                                  if p.id == it.id),
-                                TranslateItem(id=it.id, text=it.text, context=it.context),
+                                TranslateItem(
+                                    id=it.id, text=it.text, context=it.context,
+                                    max_chars=getattr(it, "max_chars", 0),
+                                    max_pixels=getattr(it, "max_pixels", 0),
+                                    max_lines=getattr(it, "max_lines", 0),
+                                ),
                             )
                             self.pool.setdefault(f, []).append(prep)
                         self.in_flight = 0
                         self.in_flight_workers.clear()
                         self.worker_last_request.clear()
+                        self.reclaim_count.clear()
                     sweep_assignment = []
                     sweep_threads = max(1, self.threads)
                     for i, key in enumerate(alive_keys):

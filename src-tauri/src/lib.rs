@@ -86,10 +86,23 @@ fn start_sidecar(app: &AppHandle) {
         std::thread::sleep(std::time::Duration::from_millis(150));
     }
 
-    // Always overwrite the sidecar to ensure the latest compiled python code is executed.
-    let _ = std::fs::remove_file(&path);
-    if let Err(e) = std::fs::write(&path, SIDECAR_BYTES) {
-        eprintln!("[sidecar] failed to extract sidecar: {e}");
+    // Extract sidecar only if it doesn't exist or content has changed.
+    let needs_extract = match std::fs::metadata(&path) {
+        Ok(meta) => {
+            if meta.len() != SIDECAR_BYTES.len() as u64 {
+                true
+            } else {
+                std::fs::read(&path).map(|existing| existing != SIDECAR_BYTES).unwrap_or(true)
+            }
+        }
+        Err(_) => true,
+    };
+
+    if needs_extract {
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = std::fs::write(&path, SIDECAR_BYTES) {
+            eprintln!("[sidecar] failed to extract sidecar: {e}");
+        }
     }
 
     match Command::new(&path).spawn() {

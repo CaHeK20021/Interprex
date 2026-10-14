@@ -239,8 +239,14 @@ class GeminiProvider(BaseProvider):
         resp.raise_for_status()
         data = resp.json()
         try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except (KeyError, IndexError) as e:
+            parts = data["candidates"][0]["content"]["parts"]
+            text = "".join(
+                p.get("text", "") for p in parts
+                if isinstance(p, dict) and not p.get("thought")
+            )
+            if not text:
+                raise KeyError("empty non-thought parts in Gemini response")
+        except (KeyError, IndexError, TypeError) as e:
             candidates = data.get("candidates", [])
             if candidates and candidates[0].get("finishReason") in ("SAFETY", "PROHIBITED_CONTENT", "OTHER"):
                 reason = candidates[0].get("finishReason")

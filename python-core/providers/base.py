@@ -70,9 +70,9 @@ def get_http_client() -> httpx.Client:
             _http_client = httpx.Client(
                 transport=httpx.HTTPTransport(retries=2),
                 limits=httpx.Limits(
-                    max_keepalive_connections=20,
-                    max_connections=40,
-                    keepalive_expiry=30.0,
+                    max_keepalive_connections=64,
+                    max_connections=160,
+                    keepalive_expiry=90.0,
                 ),
             )
         return _http_client

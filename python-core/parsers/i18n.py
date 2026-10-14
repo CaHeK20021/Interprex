@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import xml.etree.ElementTree as ET
-from .base import BaseParser, TranslationString, make_id
+from .base import BaseParser, TranslationString, make_id, update_metadata
 
 # Mappings from user-selected languages (codes or full names) to RimWorld
 # Languages/ folder names. These MUST match the base game's .tar names
@@ -1163,7 +1164,7 @@ class I18nParser(BaseParser):
                 # Load original default JSON
                 try:
                     with open(stardew_default, "r", encoding="utf-8-sig") as f:
-                        default_data = json.load(f)
+                        default_data = json.loads(_strip_json_comments(f.read()))
                 except Exception as e:
                     print(f"Error loading Stardew default.json: {e}")
                     default_data = {}
@@ -1171,17 +1172,17 @@ class I18nParser(BaseParser):
                 if isinstance(default_data, dict):
                     # Load existing target JSON if present
                     existing_target = {}
-                    if os.path.isfile(target_filepath):
+                    file_pre_existed = os.path.isfile(target_filepath)
+                    if file_pre_existed:
                         try:
                             with open(target_filepath, "r", encoding="utf-8-sig") as f:
-                                existing_target = json.load(f)
+                                existing_target = json.loads(_strip_json_comments(f.read()))
                             if not isinstance(existing_target, dict):
                                 existing_target = {}
                         except Exception:
                             pass
 
-                    # Back up the target file if it already exists
-                    if os.path.isfile(target_filepath):
+                        # Back up the target file if it already exists
                         self.backup_file(root, target_filepath)
 
                     # Merge translations
@@ -1193,10 +1194,16 @@ class I18nParser(BaseParser):
                             written += 1
                             has_updates = True
 
-                    if has_updates or os.path.isfile(target_filepath):
+                    if has_updates or file_pre_existed:
                         os.makedirs(os.path.dirname(target_filepath), exist_ok=True)
+                        json_str = json.dumps(existing_target, ensure_ascii=False, indent=2)
                         with open(target_filepath, "w", encoding="utf-8-sig") as f:
-                            json.dump(existing_target, f, ensure_ascii=False, indent=2)
+                            f.write(json_str)
+
+                        if not file_pre_existed:
+                            rel_to_root = os.path.relpath(target_filepath, root).replace("\\", "/")
+                            mod_sha = hashlib.sha256(json_str.encode("utf-8-sig")).hexdigest()
+                            update_metadata(root, rel_to_root, "", mod_sha, "created")
 
             # 2. Inject RimWorld XMLs — root + version subfolders
             rimworld_english_dirs = _find_rimworld_english_dirs(base_path)
@@ -1298,8 +1305,6 @@ class I18nParser(BaseParser):
 
                                 # A newly-created file must be registered type='created'
                                 if not file_pre_existed:
-                                    import hashlib
-                                    from .base import update_metadata
                                     rel_to_root = os.path.relpath(target_filepath, root).replace("\\", "/")
                                     mod_sha = hashlib.sha256(xml_bytes).hexdigest()
                                     update_metadata(root, rel_to_root, "", mod_sha, "created")
@@ -1378,8 +1383,6 @@ class I18nParser(BaseParser):
                     # A newly-created file must be registered type='created' so
                     # backup restore deletes it (it had no original to revert to).
                     if not file_pre_existed:
-                        import hashlib
-                        from .base import update_metadata
                         rel_to_root = os.path.relpath(target_filepath, root).replace("\\", "/")
                         mod_sha = hashlib.sha256(xml_bytes).hexdigest()
                         update_metadata(root, rel_to_root, "", mod_sha, "created")
