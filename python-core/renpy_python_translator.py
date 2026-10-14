@@ -2363,8 +2363,9 @@ def main(args_list=None):
         missing = [e for e in uncached_to_translate if e["value"] not in fresh]
         if missing:
             logger.info("Retrying %d string(s) the model dropped from their batch...", len(missing))
+            missing_batches = [missing[i : i + max_b] for i in range(0, len(missing), max_b)]
             retry = _run_batches_over_keypool(
-                [[e] for e in missing], keys, args.threads, args.delay_seconds, "Retried", _translate_pf,
+                missing_batches, keys, args.threads, args.delay_seconds, "Retried", _translate_pf,
                 on_batch_done=_on_translate_batch_done
             )
             fresh.update(retry)

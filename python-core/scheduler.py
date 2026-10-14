@@ -730,35 +730,59 @@ class TranslationScheduler:
                 0,
                 self.tpm_limit - self._tpm_used_locked(worker_key, time.time()),
             )
-        if free <= 0:
-            return batch  # nothing free — full wait, don't splinter
         est = self._est_batch_tokens(batch, cal)
         if est <= free:
             return batch
-        # Largest prefix whose estimate fits free (at least 1 item — a single
-        # oversized item still waits the normal gate).
-        lo, hi = 1, len(batch)
-        best = 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            e = self._est_batch_tokens(batch[:mid], cal)
-            if e <= free:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
+
+        # Case A: Batch fits within total TPM limit (normal case).
+        # We only need to shrink if free tokens are insufficient.
+        # But do NOT splinter into tiny scraps (< min_keep items).
+        # If even min_keep cannot fit in current free TPM, return whole batch
+        # so the worker waits in _wait_tpm for the window to drain.
+        if est <= self.tpm_limit:
+            if free <= 0:
+                return batch
+            max_b = getattr(self.req, "max_batch_size", 30) or 30
+            min_target = max(8, max_b // 3) if max_b >= 16 else 1
+            min_keep = min(len(batch), min_target)
+            est_min = self._est_batch_tokens(batch[:min_keep], cal)
+            if est_min > free:
+                return batch
+
+            lo, hi = min_keep, len(batch)
+            best = min_keep
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                e = self._est_batch_tokens(batch[:mid], cal)
+                if e <= free:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+        else:
+            # Case B: Batch is oversized (est > self.tpm_limit).
+            # It can never fit in tpm_limit as a whole, so it MUST shrink.
+            # Fit into current free if possible, otherwise fit into self.tpm_limit.
+            target_cap = free if (free > 0 and self._est_batch_tokens(batch[:1], cal) <= free) else self.tpm_limit
+            lo, hi = 1, len(batch)
+            best = 1
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                e = self._est_batch_tokens(batch[:mid], cal)
+                if e <= target_cap:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
         if best >= len(batch):
             return batch
         leftover = batch[best:]
         kept = batch[:best]
         with self.cond:
-            cur = self.pool.get(fname)
-            if cur is None:
-                self.pool[fname] = list(leftover)
-            else:
-                # Prefer prepend so the same scene continues next claim.
-                self.pool[fname] = list(leftover) + list(cur)
-            self.pool.move_to_end(fname, last=False)
+            for it in reversed(leftover):
+                fn = self.item_file.get(it.id, fname) or fname
+                self.pool.setdefault(fn, []).insert(0, it)
+                self.pool.move_to_end(fn, last=False)
             self.cond.notify_all()
         logger.info(
             "TPM shrink: free=%d est=%d → batch %d→%d (rest requeued)",
@@ -1018,14 +1042,50 @@ class TranslationScheduler:
                             self.cond.wait(timeout=0.5)
                             continue
 
-                        # Token-pack one batch from the front of this file; never mix files.
+                        # Token-pack one batch from the front of this file; balance tails so
+                        # two threads get healthy halves instead of a full batch + tiny scrap.
                         end = cal.next_batch(items, self.window, req.glossary, 0,
                                              req.max_batch_size)
-                        batch = items[:end]
+                        tail = len(items) - end
+                        min_tail = max(6, req.max_batch_size // 4)
+                        if 0 < tail < min_tail and len(items) <= req.max_batch_size * 2:
+                            end = (len(items) + 1) // 2
+
+                        batch = list(items[:end])
                         del items[:end]
-                        if not items:
-                            # Keep the key in the map but emptied; cleaned lazily.
-                            pass
+                        if not items and fname in self.pool:
+                            del self.pool[fname]
+
+                        # Remnant / small file bundling:
+                        # If batch has fewer items than min_fill and there are other files in the pool,
+                        # greedily take items from subsequent files up to req.max_batch_size and token budget.
+                        group_mode = getattr(req, "group_small_files", "auto")
+                        min_fill = max(10, req.max_batch_size // 2)
+                        if group_mode != "off" and len(batch) < min_fill:
+                            budget = cal.input_budget(self.window, req.glossary)
+                            used_tokens = sum(
+                                cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                for it in batch
+                            )
+                            for other_fn, other_items in list(self.pool.items()):
+                                if not other_items:
+                                    continue
+                                take_count = 0
+                                for it in other_items:
+                                    if len(batch) >= req.max_batch_size:
+                                        break
+                                    cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                    if used_tokens + cost > budget:
+                                        break
+                                    used_tokens += cost
+                                    batch.append(it)
+                                    take_count += 1
+                                if take_count > 0:
+                                    del other_items[:take_count]
+                                    if not other_items and other_fn in self.pool:
+                                        del self.pool[other_fn]
+                                if len(batch) >= req.max_batch_size:
+                                    break
                     self.in_flight += 1
                     self.in_flight_workers.add(worker_idx)
                     # Per-worker Nth claim (1, 2, 3…) for the card. Global
@@ -1071,12 +1131,10 @@ class TranslationScheduler:
         leftover = batch[best:]
         kept = batch[:best]
         with self.cond:
-            cur = self.pool.get(fname)
-            if cur is None:
-                self.pool[fname] = list(leftover)
-            else:
-                self.pool[fname] = list(leftover) + list(cur)
-            self.pool.move_to_end(fname, last=False)
+            for it in reversed(leftover):
+                fn = self.item_file.get(it.id, fname) or fname
+                self.pool.setdefault(fn, []).insert(0, it)
+                self.pool.move_to_end(fn, last=False)
             self.cond.notify_all()
         logger.info(
             "Exact context shrink: batch %d→%d (rest requeued for %s)",
