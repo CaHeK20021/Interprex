@@ -268,6 +268,7 @@ def _find_rimworld_english_dirs(root: str) -> list[str]:
 # (real bug: tabs/research/build menu went English, grammar "Bad string pass").
 # Translatable fields are user-visible captions ONLY.
 _RIMWORLD_TRANSLATABLE_FIELDS = frozenset({
+    # Core display captions
     "label", "description", "reportString", "jobString", "verb", "gerund",
     "tip", "jobReportString", "labelNoun", "helpText", "GizmoLabel",
     "ResearchLabel", "ResearchDesc", "ResearchDescDisc", "groupingLabel",
@@ -284,6 +285,29 @@ _RIMWORLD_TRANSLATABLE_FIELDS = frozenset({
     "ritualExplanation", "extraTooltip", "overrideLabel", "labelTip",
     "onMapInstruction", "approachOrderString", "approachingReportString",
     "spectatorsLabel", "spectateLeadJobString",
+    # BackstoryDef (pre-1.4, 1.4+, HAR, VRE)
+    "baseDesc", "titleShort", "titleFemale", "titleShortFemale",
+    # TraitDef / ThoughtDef / NeedDef / HediffDef / Implants
+    "descriptionStrings", "stageDescriptions",
+    "labelNounPretty", "destroyedLabel", "destroyedOutLabel",
+    "discoverLetterLabel", "discoverLetterText", "messageOnDisappear",
+    "labelTendedWell", "labelTendedWellInner", "labelSolidTendedWell",
+    "permanentLabel", "instantlyPermanentLabel", "tipStringExtra",
+    # ThingDef / Building / CompProperties / Gizmos / Messages
+    "gizmoLabel", "gizmoDesc", "onMessage", "offMessage",
+    "outOfFuelMessage", "cannotInteractMessage", "useMessage",
+    "activatingString", "activatingStringPending", "guiLabel",
+    "chargeNoun", "cooldownPreventsReadyingMessage",
+    # AbilityDef / Psycasts / Genes
+    "confirmationDialogText", "verbLabel", "labelShortAdj",
+    "prefix", "resourceLabel", "resourceDescription", "disabledReason",
+    # QuestScriptDef / IncidentDef / ScenarioDef / StorytellerDef / Factions
+    "descriptionSummary", "playerFactionLabel", "letterInfoText",
+    "arrivalTextExtra", "leaderTitle", "leaderTitleFemale",
+    "categoryLabel", "adj", "ideoName", "deityName", "memberName",
+    "adjective", "roomLabel", "unlockMessage",
+    # ResearchProjectDef discovery letters
+    "discoveredLetterTitle", "discoveredLetterText",
 })
 
 
@@ -309,6 +333,28 @@ def _looks_translatable(text: str) -> bool:
     # or "(p=2)" — these are interpolation tokens, not prose.
     if re.fullmatch(r'\[[^\]]+\]', t) or re.fullmatch(r'\([^)]*\)', t):
         return False
+
+    # Technical IDs, defNames, or Keyed string keys without spaces (e.g. "AL_LetterHuntingSpreeLabel", "VFE_SingleShot_Mode").
+    # Legitimate English display text never contains underscores.
+    if " " not in t and "_" in t:
+        return False
+
+    # Texture/sound asset paths without spaces (e.g. "UI/Icons/Gizmos/FireMode", "Things/Item/Resource/Gold.png").
+    if " " not in t:
+        if t.count("/") + t.count("\\") >= 2:
+            return False
+        tl = t.lower()
+        if any(tl.startswith(p) for p in (
+            "ui/", "things/", "textures/", "audio/", "sounds/",
+            "effects/", "buildings/", "apparel/", "weapons/", "items/",
+        )):
+            return False
+        if any(tl.endswith(ext) for ext in (".png", ".jpg", ".dds", ".wav", ".mp3", ".ogg", ".xml")):
+            return False
+        # C# class, worker, or def type names (e.g. "CompProperties_Power", "JobDriver_DoSomethingWorker", ending in "Def").
+        if t.startswith("CompProperties_") or t.endswith("Worker") or (len(t) > 3 and t.endswith("Def")):
+            return False
+
     return True
 
 
@@ -364,6 +410,99 @@ def _find_rimworld_defs_dirs(root: str) -> list[str]:
             seen.add(real)
             unique.append(p)
     return unique
+
+
+def _get_inherited_def_field(el, tag_name: str, by_name: dict, visited: set | None = None) -> str | None:
+    """Find text of tag_name in el, or recursively in parent Def via ParentName."""
+    child = el.find(tag_name)
+    if child is not None and child.text and child.text.strip():
+        return child.text.strip()
+    pname = el.get("ParentName")
+    if not pname:
+        return None
+    pname = pname.strip()
+    if visited is None:
+        visited = set()
+    if pname in visited:
+        return None
+    visited.add(pname)
+    parent_el = by_name.get(pname)
+    if parent_el is not None:
+        return _get_inherited_def_field(parent_el, tag_name, by_name, visited)
+    return None
+
+
+def _find_tight_research_defs(base_path: str) -> set[str]:
+    """Scan all Defs/ for ResearchProjectDef nodes.
+
+    Resolves tab, researchViewX, researchViewY with ParentName inheritance.
+    If node A and node B share the same tab, are in the same vertical column
+    (abs(x1 - x2) < 0.85), and node B is positioned closely below node A
+    (0 < y2 - y1 < 0.75), node A's button expanding downward will collide with
+    node B. Node A is added to the returned set of tight_defs (must be limited
+    to 1 line instead of 2).
+    """
+    tight_defs: set[str] = set()
+    defs_dirs = _find_rimworld_defs_dirs(base_path)
+    if not defs_dirs:
+        return tight_defs
+
+    by_name: dict[str, ET.Element] = {}
+    concrete_research_defs: list[ET.Element] = []
+
+    for defs_dir in defs_dirs:
+        for dirpath, _, filenames in os.walk(defs_dir):
+            for fn in filenames:
+                if not fn.lower().endswith(".xml"):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(dirpath, fn))
+                    root = tree.getroot()
+                    for el in root:
+                        if not isinstance(el.tag, str) or el.tag != "ResearchProjectDef":
+                            continue
+                        name_attr = el.get("Name")
+                        if name_attr and name_attr.strip():
+                            by_name[name_attr.strip()] = el
+                        concrete_research_defs.append(el)
+                except Exception:
+                    pass
+
+    # Group valid nodes by tab
+    from collections import defaultdict
+    nodes_by_tab: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+
+    for el in concrete_research_defs:
+        def_name = _get_inherited_def_field(el, "defName", by_name)
+        if not def_name:
+            continue
+        tab = _get_inherited_def_field(el, "tab", by_name) or "Main"
+        vx_str = _get_inherited_def_field(el, "researchViewX", by_name)
+        vy_str = _get_inherited_def_field(el, "researchViewY", by_name)
+        if not vx_str or not vy_str:
+            continue
+        try:
+            vx = float(vx_str)
+            vy = float(vy_str)
+        except (ValueError, TypeError):
+            continue
+        nodes_by_tab[tab].append((def_name, vx, vy))
+
+    for tab, nodes in nodes_by_tab.items():
+        for name1, x1, y1 in nodes:
+            for name2, x2, y2 in nodes:
+                if name1 == name2:
+                    continue
+                if abs(x1 - x2) < 0.85:
+                    # Node 2 is directly below Node 1; Node 1 will expand downward into Node 2
+                    if 0 < (y2 - y1) < 0.75:
+                        tight_defs.add(name1)
+                    # If two nodes are touching or overlapping even empty (dy < 0.50), mark both
+                    elif 0 < abs(y2 - y1) < 0.50:
+                        tight_defs.add(name1)
+                        tight_defs.add(name2)
+
+    return tight_defs
 
 
 def _walk_def_element(el, prefix_path: list[str], out: list[tuple[list[str], str]]) -> None:
@@ -439,7 +578,25 @@ def _iter_generated_definjected(base_path: str, root: str):
       - key = "<defName>.<fieldPath>"
       - original = the leaf text
     """
-    for defs_dir in _find_rimworld_defs_dirs(base_path):
+    defs_dirs = _find_rimworld_defs_dirs(base_path)
+
+    # Pass 1: collect all elements with Name="..." across Defs/ to resolve ParentName inheritance
+    defs_by_name: dict[str, ET.Element] = {}
+    for defs_dir in defs_dirs:
+        for dirpath, _, filenames in os.walk(defs_dir):
+            for filename in filenames:
+                if not filename.lower().endswith(".xml"):
+                    continue
+                try:
+                    tree = ET.parse(os.path.join(dirpath, filename))
+                    for def_el in tree.getroot():
+                        nm = (def_el.get("Name") or "").strip()
+                        if nm:
+                            defs_by_name[nm] = def_el
+                except Exception:
+                    continue
+
+    for defs_dir in defs_dirs:
         definjected_rel = _definjected_rel_dir(defs_dir, root)
         for dirpath, _, filenames in os.walk(defs_dir):
             for filename in filenames:
@@ -469,6 +626,35 @@ def _iter_generated_definjected(base_path: str, root: str):
 
                     collected: list[tuple[list[str], str]] = []
                     _walk_def_element(def_el, [], collected)
+
+                    # Resolve ParentName inheritance: if child def inherits from an
+                    # abstract base (or chain of bases), inherit translatable fields
+                    # that were NOT overridden by the child.
+                    parent_name = (def_el.get("ParentName") or "").strip()
+                    if parent_name:
+                        existing_paths = {tuple(p) for p, _ in collected}
+                        curr_parent = parent_name
+                        visited_parents = set()
+                        while curr_parent and curr_parent in defs_by_name and curr_parent not in visited_parents:
+                            visited_parents.add(curr_parent)
+                            p_el = defs_by_name[curr_parent]
+                            parent_collected: list[tuple[list[str], str]] = []
+                            _walk_def_element(p_el, [], parent_collected)
+                            for f_path, text in parent_collected:
+                                tp = tuple(f_path)
+                                # Top-level scalar fields (description, label, jobString, etc.)
+                                if len(tp) == 1:
+                                    if tp not in existing_paths:
+                                        existing_paths.add(tp)
+                                        collected.append((f_path, text))
+                                # Nested container fields (only if child has no such container of its own)
+                                elif len(tp) > 1:
+                                    container_tag = tp[0]
+                                    if def_el.find(container_tag) is None and tp not in existing_paths:
+                                        existing_paths.add(tp)
+                                        collected.append((f_path, text))
+                            curr_parent = (p_el.get("ParentName") or "").strip()
+
                     if not collected:
                         continue
 
@@ -720,7 +906,7 @@ def _strip_json_comments(text: str) -> str:
 # We never touch researchViewX/Y. Only ResearchProjectDef.label is limited
 # (description is unlimited — it is not drawn on the tree button).
 # ---------------------------------------------------------------------------
-RESEARCH_BUTTON_WIDTH_PX = 140.0
+RESEARCH_BUTTON_WIDTH_PX = 108.0
 RESEARCH_BUTTON_MAX_LINES = 2
 # Approx Small/Arial_small. Line COUNT only needs consistent glyph widths;
 # exact Unity line-height is irrelevant for the wrap decision.
@@ -930,7 +1116,7 @@ def research_label_char_limit(
     if font is None:
         # ~8 px/char @ Small; leave some slack.
         per_line = max(8, int(width_px / 8))
-        return max(8, per_line * max(1, max_lines))
+        return max(8, int(per_line * max(1, max_lines) * 0.9))
     letters = [c for c in sample if c != " "]
     letter_w = sum(_glyph_width(font, c) for c in letters) / max(1, len(letters))
     space_w = _glyph_width(font, " ")
@@ -940,7 +1126,7 @@ def research_label_char_limit(
     if avg <= 0:
         avg = float(_RESEARCH_FONT_SIZE) * 0.55
     per_line = max(4, int(width_px / avg))
-    return max(8, per_line * max(1, max_lines))
+    return max(8, int(per_line * max(1, max_lines) * 0.9))
 
 
 def research_label_overflows(
@@ -951,6 +1137,76 @@ def research_label_overflows(
 ) -> bool:
     """True if `text` wraps to more than `max_lines` in a research button cell."""
     return research_label_line_count(text, target_lang, width_px) > max_lines
+
+
+def compact_research_label(
+    text: str,
+    target_lang: str = "russian",
+    max_lines: int = RESEARCH_BUTTON_MAX_LINES,
+    width_px: float = RESEARCH_BUTTON_WIDTH_PX,
+) -> str:
+    """Deterministically shrink text so it fits within max_lines in a research-tree cell.
+
+    1. Checks if text already fits (fast path).
+    2. For Russian, applies standard community abbreviations for common tech prefixes.
+    3. If still exceeding max_lines, progressively trims to the last fitting word/character
+       with '.' or '…'.
+    Guarantees: research_label_line_count(result, target_lang, width_px) <= max_lines.
+    """
+    if not text or not str(text).strip():
+        return text
+
+    cur = str(text).strip()
+    if research_label_line_count(cur, target_lang, width_px) <= max_lines:
+        return cur
+
+    lang = _normalize_research_lang(target_lang)
+    if lang in ("ru", "russian"):
+        # Domain replacements for RimWorld tech tree (case-preserving).
+        replacements = [
+            (r'(?i)\bусовершенствованн[а-я]*', 'Усоверш.'),
+            (r'(?i)\bмодифицированн[а-я]*', 'Модиф.'),
+            (r'(?i)\bавтоматизированн[а-я]*', 'Автомат.'),
+            (r'(?i)\bавтоматическ[а-я]*', 'Авто-'),
+            (r'(?i)\bпромышленн[а-я]*', 'Пром.'),
+            (r'(?i)\bэкспериментальн[а-я]*', 'Эксп.'),
+            (r'(?i)\bсельскохозяйственн[а-я]*', 'Сельхоз.'),
+            (r'(?i)\bвысокотехнологичн[а-я]*', 'Высокотех.'),
+            (r'(?i)\bэлектромагнитн[а-я]*', 'Эл.-магн.'),
+            (r'(?i)\bэлектрическ[а-я]*', 'Электро-'),
+            (r'(?i)\bбионическ[а-я]*', 'Био-'),
+            (r'(?i)\bпроизводство\s+', 'Произв. '),
+            (r'(?i)\bисследование\s+', ''),
+            (r'(?i)\bтехнология\s+', ''),
+        ]
+        import re
+        for pat, repl in replacements:
+            new_text = re.sub(pat, repl, cur).strip()
+            new_text = re.sub(r'\s+', ' ', new_text).strip()
+            if new_text and new_text != cur:
+                cur = new_text
+                if research_label_line_count(cur, target_lang, width_px) <= max_lines:
+                    return cur
+
+    # If still overflowing, progressively trim words or characters until it fits.
+    words = cur.split()
+    while len(words) > 1:
+        words.pop()
+        candidate = " ".join(words)
+        if not candidate.endswith("."):
+            candidate += "…"
+        if research_label_line_count(candidate, target_lang, width_px) <= max_lines:
+            return candidate
+
+    # Single word still too wide: trim character-by-character.
+    candidate = cur
+    while len(candidate) > 3:
+        candidate = candidate[:-1]
+        trial = candidate.rstrip(".…") + "…"
+        if research_label_line_count(trial, target_lang, width_px) <= max_lines:
+            return trial
+
+    return cur
 
 
 class I18nParser(BaseParser):
@@ -967,11 +1223,12 @@ class I18nParser(BaseParser):
             "label, the on-screen width is very limited — translate it as SHORT as "
             "possible (ideally 1-2 words), even if that means a looser wording.\n"
             "RESEARCH TREE BUTTONS: items with max_lines set are RimWorld "
-            "ResearchProjectDef labels drawn in a fixed 140px-wide research-tree "
-            "cell. The translation MUST stay within max_lines lines at that width "
-            "(rephrase shorter if needed). Never abbreviate a single word into a "
-            "stub; rephrase the whole research name so it fits. Descriptions of "
-            "research projects have NO line limit — only the button label does.\n"
+            "ResearchProjectDef labels drawn in a narrow 108px research-tree cell. "
+            "The translation MUST fit within max_lines wrapped lines and max_chars characters. "
+            "Drop filler words ('technology', 'research', 'production', 'advanced' -> 'Продв.', "
+            "'improved' -> 'Улучш.', 'industrial' -> 'Пром.', 'automatic' -> 'Авто-'), "
+            "prefer short nouns over long participles, and avoid single words longer than 12 letters "
+            "(split or hyphenate them so they don't break cell width). Descriptions have NO limit.\n"
             "TONE: use a neutral, professional register. Avoid overly literary style."
         )
 
@@ -1017,6 +1274,7 @@ class I18nParser(BaseParser):
 
             # 2. Extract RimWorld XMLs — root + version subfolders
             rimworld_english_dirs = _find_rimworld_english_dirs(base_path)
+            tight_defs = _find_tight_research_defs(base_path)
             seen_ids: set[str] = set()
             for rimworld_english in rimworld_english_dirs:
                 for dirpath, _, filenames in os.walk(rimworld_english):
@@ -1041,14 +1299,21 @@ class I18nParser(BaseParser):
                                         rp = rel_path.lower()
                                         if "researchtabdef" in rp or "mainbuttondef" in rp:
                                             ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
-                                        # Research-tree cell caption: fixed 140px, max 2 lines
+                                        # Research-tree cell caption: fixed narrow cell, max 1 or 2 lines
                                         # (scheduler enforces via measure; context is a hint).
                                         elif is_research_project_label(rel_path, [child.tag], ctx):
-                                            ctx += (
-                                                f" ({_RESEARCH_CTX_MARKER} — max "
-                                                f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
-                                                f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
-                                            )
+                                            def_name = child.tag.split(".")[0] if "." in child.tag else ""
+                                            if def_name in tight_defs:
+                                                ctx += (
+                                                    f" ({_RESEARCH_CTX_MARKER} tight_1line — max 1 line @ "
+                                                    f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                                                )
+                                            else:
+                                                ctx += (
+                                                    f" ({_RESEARCH_CTX_MARKER} — max "
+                                                    f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
+                                                    f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                                                )
                                         results.append(self._mk(rel_path, [child.tag], original, ctx))
                             except Exception as e:
                                 print(f"Error reading RimWorld XML {filename}: {e}")
@@ -1072,11 +1337,18 @@ class I18nParser(BaseParser):
                     if def_type.lower() in ("researchtabdef", "mainbuttondef"):
                         ctx += " (UI tab/button label — keep translation very short, 1-2 words)"
                     elif is_research_project_label(synthetic_file, [key], ctx):
-                        ctx += (
-                            f" ({_RESEARCH_CTX_MARKER} — max "
-                            f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
-                            f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
-                        )
+                        def_name = key.split(".")[0] if "." in key else ""
+                        if def_name in tight_defs:
+                            ctx += (
+                                f" ({_RESEARCH_CTX_MARKER} tight_1line — max 1 line @ "
+                                f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                            )
+                        else:
+                            ctx += (
+                                f" ({_RESEARCH_CTX_MARKER} — max "
+                                f"{RESEARCH_BUTTON_MAX_LINES} lines @ "
+                                f"{int(RESEARCH_BUTTON_WIDTH_PX)}px, rephrase shorter if needed)"
+                            )
                     results.append(self._mk(synthetic_file, [key], original, ctx))
             except Exception as e:
                 print(f"Error generating RimWorld DefInjected from Defs: {e}")

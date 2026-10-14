@@ -2629,6 +2629,8 @@ def check_rimworld_research_lines() -> None:
         research_label_char_limit,
         research_label_line_count,
         research_label_overflows,
+        compact_research_label,
+        _find_tight_research_defs,
     )
     from providers.base import TranslateItem, build_prompt
 
@@ -2670,7 +2672,7 @@ def check_rimworld_research_lines() -> None:
     # --- line measure: short fits, long wraps past max_lines -----------------
     assert research_label_line_count("Gun", "english") == 1
     assert research_label_line_count("Печь", "russian") == 1
-    # A deliberately long RU phrase must wrap past 2 lines at 140px.
+    # A deliberately long RU phrase must wrap past 2 lines at 108px.
     long_ru = (
         "очень длинное название исследовательского проекта для проверки "
         "переноса строк в ячейке дерева технологий"
@@ -2684,7 +2686,7 @@ def check_rimworld_research_lines() -> None:
     assert not research_label_overflows("Gun turrets", "english")
     assert not research_label_overflows("Станки", "russian")
 
-    # Explicit \\n counts as a break (model prompt keeps literal escapes).
+    # Explicit \n counts as a break (model prompt keeps literal escapes).
     assert research_label_line_count("one\\ntwo\\nthree", "english") >= 3
 
     # Char hint is positive and scales with max_lines.
@@ -2695,6 +2697,19 @@ def check_rimworld_research_lines() -> None:
     lim_ja = research_label_char_limit("Japanese", 2)
     lim_en = research_label_char_limit("English", 2)
     assert lim_ja > 0 and lim_en > 0
+
+    # --- compact_research_label tests ---------------------------------------
+    short_lbl = "Оружие"
+    assert compact_research_label(short_lbl, "russian", 2) == short_lbl
+    long_ru_adv = "Усовершенствованное вооружение"
+    compacted_adv = compact_research_label(long_ru_adv, "russian", 2)
+    assert "Усоверш." in compacted_adv
+    assert research_label_line_count(compacted_adv, "russian") <= 2
+
+    giant_ru = "Очень длинное и громоздкое название проекта исследования для проверки"
+    compacted_1line = compact_research_label(giant_ru, "russian", 1)
+    assert research_label_line_count(compacted_1line, "russian") <= 1
+    assert compacted_1line.endswith("…") or compacted_1line.endswith(".")
 
     # --- prompt surfaces max_lines as a first-class field --------------------
     prompt = build_prompt(
@@ -2709,7 +2724,7 @@ def check_rimworld_research_lines() -> None:
     plain = build_prompt([TranslateItem("b", "Hello")], "Russian", {})
     assert '"max_lines":' not in plain
 
-    # --- extract marks ResearchProjectDef.label context ----------------------
+    # --- extract marks ResearchProjectDef.label context & tight detection ---
     import shutil
     root = tempfile.mkdtemp(prefix="interprex_rimworld_research_")
     try:
@@ -2728,34 +2743,187 @@ def check_rimworld_research_lines() -> None:
             f.write(
                 '<?xml version="1.0" encoding="utf-8"?>\n'
                 '<Defs>\n'
-                '  <ResearchProjectDef>\n'
+                '  <ResearchProjectDef Name="BaseVE" Abstract="True">\n'
+                '    <tab>VE_Tab</tab>\n'
+                '    <researchViewX>2.0</researchViewX>\n'
+                '  </ResearchProjectDef>\n'
+                '  <ResearchProjectDef ParentName="BaseVE">\n'
                 '    <defName>AdvAnalyzer</defName>\n'
                 '    <label>advanced multi-analyzer</label>\n'
                 '    <description>A long description that must NOT be line-limited.</description>\n'
-                '    <baseCost>1000</baseCost>\n'
-                '    <techLevel>Industrial</techLevel>\n'
-                '    <researchViewX>0</researchViewX>\n'
-                '    <researchViewY>0</researchViewY>\n'
+                '    <researchViewY>1.0</researchViewY>\n'
+                '  </ResearchProjectDef>\n'
+                '  <ResearchProjectDef ParentName="BaseVE">\n'
+                '    <defName>AdvTurrets</defName>\n'
+                '    <label>turrets</label>\n'
+                '    <researchViewY>1.5</researchViewY>\n'
                 '  </ResearchProjectDef>\n'
                 '</Defs>\n'
             )
         from parsers import get_parser, detect_engine
         assert detect_engine(root) == "i18n"
+
+        tight_set = _find_tight_research_defs(root)
+        assert "AdvAnalyzer" in tight_set, f"AdvAnalyzer must be detected as tight node: {tight_set}"
+        assert "AdvTurrets" not in tight_set, f"AdvTurrets should not be tight: {tight_set}"
+
         strings = get_parser("i18n").extract(root)
         labels = [s for s in strings if s.path and s.path[0].endswith(".label")
                   and "ResearchProjectDef" in (s.context or "")]
         descs = [s for s in strings if s.path and s.path[0].endswith(".description")
                  and "ResearchProjectDef" in (s.context or "")]
-        assert len(labels) == 1, f"expected 1 research label, got {labels}"
-        assert "research tree button" in labels[0].context, labels[0].context
+        assert len(labels) == 2, f"expected 2 research labels, got {labels}"
         assert len(descs) == 1
-        assert "research tree button" not in descs[0].context
-        assert is_research_project_label(labels[0].file, labels[0].path, labels[0].context)
+
+        adv_lbl = next(s for s in labels if "AdvAnalyzer" in s.path[0])
+        turret_lbl = next(s for s in labels if "AdvTurrets" in s.path[0])
+
+        assert "tight_1line" in adv_lbl.context, adv_lbl.context
+        assert "tight_1line" not in turret_lbl.context, turret_lbl.context
+        assert is_research_project_label(adv_lbl.file, adv_lbl.path, adv_lbl.context)
+        assert is_research_project_label(turret_lbl.file, turret_lbl.path, turret_lbl.context)
         assert not is_research_project_label(descs[0].file, descs[0].path, descs[0].context)
+
+        # Verify Scheduler uses tight_1line -> max_lines=1
+        import scheduler
+        import types
+        items = [
+            types.SimpleNamespace(
+                id=s.id, text=s.original, context=s.context, file=s.file, path=s.path
+            )
+            for s in labels
+        ]
+        dreq = types.SimpleNamespace(
+            items=items,
+            target_lang="Russian",
+            engine="i18n",
+            root=root,
+            provider="openrouter",
+            api_key="test",
+            api_key_2="",
+            threads=1,
+            max_batch_size=10,
+            max_context_tokens=0,
+            free_only=False,
+            extra_instruction="",
+            glossary={},
+            base_url="",
+            model="",
+            delay_seconds=0.0,
+        )
+
+        sched = scheduler.TranslationScheduler(dreq, should_pause=lambda: False)
+        assert sched.item_max_lines[adv_lbl.id] == 1, (
+            f"Expected max_lines 1 for AdvAnalyzer, got {sched.item_max_lines.get(adv_lbl.id)}"
+        )
+        assert sched.item_max_lines[turret_lbl.id] == 2, (
+            f"Expected max_lines 2 for AdvTurrets, got {sched.item_max_lines.get(turret_lbl.id)}"
+        )
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
     print("check_rimworld_research_lines OK")
+
+
+def check_rimworld_defs_coverage() -> None:
+    """Verify that RimWorld Defs extraction covers extended fields (Backstories,
+    Gizmos, Hediffs, Traits, Genes, Quests), safely filters non-text IDs/paths,
+    and resolves ParentName inheritance for un-overridden description/fields."""
+    from parsers.i18n import _looks_translatable
+    import shutil
+
+    # 1. _looks_translatable safety tests
+    assert _looks_translatable("Pistol")
+    assert _looks_translatable("A heavy modular turret.")
+    assert _looks_translatable("Gun turrets")
+    assert _looks_translatable("CoreBlast")
+    assert _looks_translatable("ThrownSlag")
+    assert _looks_translatable("He/Him")
+    assert _looks_translatable("and/or")
+    assert _looks_translatable("{0} in the {1}")
+
+    # Rejection of technical IDs, asset paths, and grammar
+    assert not _looks_translatable("UI/Icons/Gizmos/FireMode")
+    assert not _looks_translatable("Things/Item/Gold.png")
+    assert not _looks_translatable("VFE_SingleShot_Mode")
+    assert not _looks_translatable("AL_LetterHuntingSpreeLabel")
+    assert not _looks_translatable("CompProperties_Power")
+    assert not _looks_translatable("ThingDef")
+    assert not _looks_translatable("JobDriver_DoSomethingWorker")
+    assert not _looks_translatable("r_logentry->hit [target]")
+    assert not _looks_translatable("[INITIATOR_label]")
+    assert not _looks_translatable("(p=2)")
+
+    # 2. Defs extraction: BackstoryDef fields + ParentName inheritance
+    root = tempfile.mkdtemp(prefix="interprex_rimworld_coverage_")
+    try:
+        defs = os.path.join(root, "Defs")
+        os.makedirs(os.path.join(defs, "Things"), exist_ok=True)
+        os.makedirs(os.path.join(defs, "Backstories"), exist_ok=True)
+        about = os.path.join(root, "About")
+        os.makedirs(about, exist_ok=True)
+        with open(os.path.join(about, "About.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<ModMetaData><name>CovTest</name><packageId>t.cov</packageId>'
+                '<author>t</author><description>t</description></ModMetaData>\n'
+            )
+
+        # Parent ThingDef with description, jobString, gizmoLabel
+        with open(os.path.join(defs, "Things", "Turrets.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<Defs>\n'
+                '  <ThingDef Name="BaseTurret" Abstract="True">\n'
+                '    <label>base turret</label>\n'
+                '    <description>Heavy automated defense turret.</description>\n'
+                '    <jobString>aiming</jobString>\n'
+                '  </ThingDef>\n'
+                '  <ThingDef ParentName="BaseTurret">\n'
+                '    <defName>ChildTurret</defName>\n'
+                '    <label>sniper turret</label>\n'
+                '  </ThingDef>\n'
+                '</Defs>\n'
+            )
+
+        # BackstoryDef with baseDesc and titleShort
+        with open(os.path.join(defs, "Backstories", "BS.xml"), "w", encoding="utf-8") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<Defs>\n'
+                '  <BackstoryDef>\n'
+                '    <defName>TestColonistBS</defName>\n'
+                '    <title>mechanic apprentice</title>\n'
+                '    <titleShort>apprentice</titleShort>\n'
+                '    <baseDesc>Learned to fix machines in childhood.</baseDesc>\n'
+                '  </BackstoryDef>\n'
+                '</Defs>\n'
+            )
+
+        from parsers import get_parser
+        strings = get_parser("i18n").extract(root)
+        keys = {s.path[0]: s.original for s in strings if s.path}
+
+        # Verify inherited fields from BaseTurret
+        assert "ChildTurret.description" in keys, f"ChildTurret should inherit description: {keys}"
+        assert keys["ChildTurret.description"] == "Heavy automated defense turret."
+        assert "ChildTurret.jobString" in keys
+        assert keys["ChildTurret.jobString"] == "aiming"
+        # ChildTurret must keep its own overridden label
+        assert keys.get("ChildTurret.label") == "sniper turret"
+
+        # Verify BackstoryDef fields
+        assert "TestColonistBS.baseDesc" in keys, f"Backstory baseDesc must be extracted: {keys}"
+        assert keys["TestColonistBS.baseDesc"] == "Learned to fix machines in childhood."
+        assert "TestColonistBS.titleShort" in keys
+        assert keys["TestColonistBS.titleShort"] == "apprentice"
+        assert "TestColonistBS.title" in keys
+        assert keys["TestColonistBS.title"] == "mechanic apprentice"
+
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("check_rimworld_defs_coverage OK")
 
 
 def check_i18n() -> None:
@@ -6895,6 +7063,7 @@ def main() -> int:
     check_i18n()
     check_i18n_rimworld_defs()
     check_rimworld_research_lines()
+    check_rimworld_defs_coverage()
     check_fusion()
     check_mmf2()
     check_qsp()

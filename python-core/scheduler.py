@@ -358,7 +358,8 @@ class TranslationScheduler:
                         RESEARCH_BUTTON_WIDTH_PX,
                         research_label_char_limit,
                     )
-                    max_lines = RESEARCH_BUTTON_MAX_LINES
+                    ctx_str = context or getattr(c, "context", "") or ""
+                    max_lines = 1 if "tight_1line" in ctx_str else RESEARCH_BUTTON_MAX_LINES
                     max_chars = research_label_char_limit(
                         req.target_lang, max_lines, RESEARCH_BUTTON_WIDTH_PX
                     )
@@ -1640,9 +1641,13 @@ class TranslationScheduler:
                     # Line-limit: tighten char hint ~15% per re-ask so the model
                     # gets a concrete smaller number, not just "shorter".
                     tighter = max(4, int(min(base, len(prev)) * (0.85 ** (round_no + 1))))
+                    retry_ctx = (
+                        f"PREVIOUS TRANSLATION '{prev}' WAS TOO LONG ({len(prev)} chars, wrapped to >{max_lines} lines)! "
+                        f"Shorten or rephrase to AT MOST {tighter} chars / {max_lines} line(s). | {it.context}"
+                    )
                     retry_batch.append(
                         TranslateItem(
-                            id=it.id, text=it.text, context=it.context,
+                            id=it.id, text=it.text, context=retry_ctx,
                             max_chars=tighter, max_lines=max_lines,
                         )
                     )
@@ -1698,14 +1703,20 @@ class TranslationScheduler:
             if not oversized:
                 return reask_billed
 
-        # Still overflowing: Ren'Py → font-shrink; research → keep text + warn.
+        # Still overflowing: Ren'Py → font-shrink; research → compact_research_label fallback!
         for it in oversized:
             if it.id in self.item_max_lines:
-                logger.warning(
-                    "Research button id '%s' still exceeds %d lines after re-asks; "
-                    "keeping model text (no truncate, no font-shrink available).",
-                    it.id, self.item_max_lines[it.id],
+                from parsers.i18n import compact_research_label, RESEARCH_BUTTON_WIDTH_PX
+                lang = self.item_line_lang.get(it.id) or self.req.target_lang
+                limit_lines = self.item_max_lines[it.id]
+                compacted = compact_research_label(
+                    batch_tr[it.id], lang, limit_lines, RESEARCH_BUTTON_WIDTH_PX
                 )
+                logger.info(
+                    "Compacted overflowing research label id '%s' from '%s' to '%s' (max %d lines)",
+                    it.id, batch_tr[it.id], compacted, limit_lines,
+                )
+                batch_tr[it.id] = compacted
             else:
                 self._record_font_shrink(it.id, batch_tr[it.id])
         return reask_billed
