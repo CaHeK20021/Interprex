@@ -19,6 +19,8 @@ import os
 import sys
 import re
 import json
+import csv
+import io
 import struct
 import tempfile
 import subprocess
@@ -29,6 +31,7 @@ from .unity_sources import (
     SOURCE_CONTENT,
     SOURCE_DLL,
     SOURCE_FONT_GAP,
+    SOURCE_IL2CPP_METADATA,
     SOURCE_STRING_TABLE,
     SOURCE_TYPETREE,
     SOURCE_UI_RAW,
@@ -858,6 +861,177 @@ def _pack_aligned_string(text: str) -> bytes:
     return blob
 
 
+# ── Generic TypeTree and TextAsset Helpers ────────────────────────────────────
+
+_TEXT_FIELD_KEYWORDS = frozenset({
+    "text", "title", "description", "desc", "caption", "label",
+    "dialogue", "dialog", "message", "msg", "prompt", "tooltip",
+    "hint", "bio", "lore", "story", "sentence", "phrase", "line",
+    "header", "subtitle", "summary", "question", "answer", "choice",
+    "option", "content", "bark", "greeting", "note", "quote",
+    "storytext", "localizedtext", "flavor", "flavortext", "itemname",
+    "questname", "skillname", "spellname", "displayname",
+})
+
+_TEXT_FIELD_SUFFIXES = (
+    "text", "title", "desc", "description", "label", "message",
+    "tooltip", "dialogue", "dialog", "caption", "name",
+)
+
+_TECHNICAL_NAME_EXCLUSIONS = frozenset({
+    "prefabname", "scenename", "assetname", "filename", "shadername",
+    "methodname", "typename", "bonename", "layername", "tagname",
+    "statename", "animname", "clipname", "parametername", "variablename",
+    "keyname", "idname", "objectname", "scriptname", "gamename",
+    "soundname", "audioname", "fontname", "texturename", "materialname",
+    "guid", "type", "guidname", "meshname", "skinname", "jointname",
+})
+
+_SKIP_TYPETREE_BRANCHES = frozenset({
+    "m_GameObject", "m_Script", "m_Enabled", "m_Name", "m_Father",
+    "m_Children", "m_Component", "m_Transform", "m_ObjectHideFlags",
+    "m_CorrespondingSourceObject", "m_PrefabInstance", "m_PrefabAsset",
+})
+
+
+def _is_typetree_text_field(field_name: str) -> bool:
+    clean = field_name.lower().removeprefix("m_")
+    if clean in _TEXT_FIELD_KEYWORDS:
+        return True
+    if any(clean.endswith(sfx) for sfx in _TEXT_FIELD_SUFFIXES):
+        if clean not in _TECHNICAL_NAME_EXCLUSIONS:
+            return True
+    return False
+
+
+def _walk_typetree_generic(node: Any, path_parts: list[str]) -> list[tuple[list[str], str]]:
+    """Recursively yield (path_parts, text) for translatable string fields in a typetree."""
+    out: list[tuple[list[str], str]] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _SKIP_TYPETREE_BRANCHES:
+                continue
+            if isinstance(v, str):
+                if _is_typetree_text_field(k) and _is_game_text(v):
+                    out.append((path_parts + [k], v))
+            elif isinstance(v, (dict, list)):
+                out.extend(_walk_typetree_generic(v, path_parts + [k]))
+    elif isinstance(node, list):
+        for idx, item in enumerate(node):
+            if isinstance(item, (dict, list)):
+                out.extend(_walk_typetree_generic(item, path_parts + [str(idx)]))
+            elif isinstance(item, str) and path_parts and _is_typetree_text_field(path_parts[-1]) and _is_game_text(item):
+                out.append((path_parts + [str(idx)], item))
+    return out
+
+
+def _set_typetree_by_path(tree: Any, path_parts: list[str], value: str) -> bool:
+    """Set value at nested path inside a dictionary / list structure."""
+    if not path_parts:
+        return False
+    cur = tree
+    for p in path_parts[:-1]:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        elif isinstance(cur, list) and p.isdigit() and int(p) < len(cur):
+            cur = cur[int(p)]
+        else:
+            return False
+    last = path_parts[-1]
+    if isinstance(cur, dict) and last in cur:
+        cur[last] = value
+        return True
+    elif isinstance(cur, list) and last.isdigit() and int(last) < len(cur):
+        cur[int(last)] = value
+        return True
+    return False
+
+
+def _walk_json_leaves(node: Any, path: list[str]) -> list[tuple[list[str], str]]:
+    """Recursively find string leaves in generic JSON."""
+    out: list[tuple[list[str], str]] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k.lower() in ("id", "guid", "type", "version", "hash", "key", "$type", "m_script"):
+                continue
+            if isinstance(v, str):
+                out.append((path + [k], v))
+            elif isinstance(v, (dict, list)):
+                out.extend(_walk_json_leaves(v, path + [k]))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            if isinstance(item, str):
+                out.append((path + [str(i)], item))
+            elif isinstance(item, (dict, list)):
+                out.extend(_walk_json_leaves(item, path + [str(i)]))
+    return out
+
+
+def _walk_ink_root(root_node: Any, current_idx: list[int]) -> list[tuple[int, str]]:
+    """Walk Ink JSON root container to extract strings starting with '^'."""
+    out: list[tuple[int, str]] = []
+    if isinstance(root_node, list):
+        for item in root_node:
+            if isinstance(item, str):
+                idx = current_idx[0]
+                current_idx[0] += 1
+                if item.startswith("^"):
+                    out.append((idx, item))
+            elif isinstance(item, (list, dict)):
+                out.extend(_walk_ink_root(item, current_idx))
+    elif isinstance(root_node, dict):
+        for k, v in root_node.items():
+            if isinstance(v, (list, dict)):
+                out.extend(_walk_ink_root(v, current_idx))
+            elif isinstance(v, str):
+                idx = current_idx[0]
+                current_idx[0] += 1
+                if v.startswith("^"):
+                    out.append((idx, v))
+    return out
+
+
+def _replace_ink_root(root_node: Any, current_idx: list[int], replacements: dict[int, str]) -> bool:
+    """Walk Ink JSON and replace strings by index."""
+    modified = False
+    if isinstance(root_node, list):
+        for i, item in enumerate(root_node):
+            if isinstance(item, str):
+                idx = current_idx[0]
+                current_idx[0] += 1
+                if idx in replacements:
+                    root_node[i] = "^" + replacements[idx]
+                    modified = True
+            elif isinstance(item, (list, dict)):
+                if _replace_ink_root(item, current_idx, replacements):
+                    modified = True
+    elif isinstance(root_node, dict):
+        for k, v in root_node.items():
+            if isinstance(v, (list, dict)):
+                if _replace_ink_root(v, current_idx, replacements):
+                    modified = True
+            elif isinstance(v, str):
+                idx = current_idx[0]
+                current_idx[0] += 1
+                if idx in replacements:
+                    root_node[k] = "^" + replacements[idx]
+                    modified = True
+    return modified
+
+
+def _detect_csv_delim(text: str) -> str | None:
+    """Detect CSV delimiter (comma, tab, semicolon) from first non-empty line."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        counts = {",": line.count(","), "\t": line.count("\t"), ";": line.count(";")}
+        best = max(counts, key=counts.get)
+        if counts[best] > 0:
+            return best
+    return None
+
+
 def _blob_is_content(raw: bytes) -> bool:
     """True if this MonoBehaviour looks like story/localization payload."""
     if any(m in raw for m in _CONTENT_MARKERS):
@@ -1285,10 +1459,19 @@ class UnityParser(BaseParser):
     def _scan_asset_files(self, root: str, sub_paths: list[str] | None = None) -> tuple[list[str], list[str]]:
         compiled_files = []
         source_files = []
+        aa_dir = find_aa_dir(root)
+        aa_dir_abs = os.path.abspath(aa_dir) if aa_dir else None
+
         for fpath in iter_files(root, sub_paths):
             f = os.path.basename(fpath)
             f_lower = f.lower()
-            if f_lower.endswith(".assets") or (f_lower.startswith("level") and "." not in f):
+            if f_lower == "data.unity3d" or f_lower.endswith(".assetbundle"):
+                compiled_files.append(fpath)
+            elif f_lower.endswith(".bundle"):
+                f_abs = os.path.abspath(fpath)
+                if not aa_dir_abs or not f_abs.startswith(aa_dir_abs):
+                    compiled_files.append(fpath)
+            elif f_lower.endswith(".assets") or (f_lower.startswith("level") and "." not in f):
                 if not f_lower.endswith(".manifest") and not f_lower.endswith(".resS") and not f_lower.endswith(".resource") and f_lower != "level":
                     compiled_files.append(fpath)
             elif f_lower.endswith(".unity") or f_lower.endswith(".prefab") or f_lower.endswith(".asset"):
@@ -1364,6 +1547,10 @@ class UnityParser(BaseParser):
             f_lower = f.lower()
             if is_custom_dll(f):
                 return True
+            if f_lower in ("data.unity3d", "global-metadata.dat", "gameassembly.dll", "gameassembly.so"):
+                return True
+            if f_lower.endswith(".assetbundle") or f_lower.endswith(".bundle"):
+                return True
             if f_lower.endswith(".assets") or f_lower.startswith("level"):
                 if not f_lower.endswith(".manifest") and not f_lower.endswith(".resS") and not f_lower.endswith(".resource"):
                     return True
@@ -1383,8 +1570,13 @@ class UnityParser(BaseParser):
             before = len(results)
             results.extend(self._extract_dlls(root, sub_paths))
             report.record(SOURCE_DLL, len(results) - before, enabled=True)
+        # ── il2cpp_metadata ───────────────────────────────────────────────
+        if any(s.id == SOURCE_IL2CPP_METADATA and s.enabled for s in report.sources):
+            before = len(results)
+            results.extend(self._extract_il2cpp_metadata(root, sub_paths))
+            report.record(SOURCE_IL2CPP_METADATA, len(results) - before, enabled=True)
         else:
-            report.record(SOURCE_DLL, 0, enabled=False, reason="skipped by plan")
+            report.record(SOURCE_IL2CPP_METADATA, 0, enabled=False, reason="not an IL2CPP build")
 
         # ── compiled assets: typetree + content_blob + conditional ui_raw ──
         # YAML is scanned in the same helper (separate source id in report).
@@ -1613,6 +1805,26 @@ class UnityParser(BaseParser):
                                                                         results.append(self._mk(rel_path, path, val, context))
                                                                         typetree_found += 1
                                                                         n_typetree += 1
+
+                            # 4. Generic deep typetree walk for custom ScriptableObjects / MonoBehaviours
+                            generic_hits = _walk_typetree_generic(tree, [])
+                            for p_parts, val in generic_hits:
+                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations"):
+                                    continue
+                                dot_path = ".".join(p_parts)
+                                path = ["AssetTree", str(obj.path_id), dot_path]
+                                parts = []
+                                if go_name:
+                                    parts.append(f"GameObject: {go_name}")
+                                if script_name:
+                                    parts.append(f"Script: {script_name}")
+                                parts.append(f"Field: {dot_path}")
+                                parts.append(f"File: {os.path.basename(fpath)}")
+                                parts.append(f"PathID: {obj.path_id}")
+                                context = ", ".join(parts)
+                                results.append(self._mk(rel_path, path, val, context))
+                                typetree_found += 1
+                                n_typetree += 1
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "Text":
@@ -1641,6 +1853,104 @@ class UnityParser(BaseParser):
                                 results.append(self._mk(rel_path, path, text, context))
                                 typetree_found += 1
                                 n_typetree += 1
+                        except Exception:
+                            failed_count += 1
+                    elif obj.type.name == "TextAsset":
+                        try:
+                            script_content = None
+                            asset_name = ""
+                            try:
+                                tree = obj.read_typetree()
+                                script_content = tree.get("m_Script")
+                                asset_name = tree.get("m_Name", "")
+                            except Exception:
+                                pass
+                            if not script_content:
+                                try:
+                                    data = obj.read()
+                                    script_content = getattr(data, "m_Script", None) or getattr(data, "script", None)
+                                    asset_name = getattr(data, "m_Name", None) or getattr(data, "name", "")
+                                except Exception:
+                                    pass
+
+                            if isinstance(script_content, bytes):
+                                try:
+                                    script_content = script_content.decode("utf-8")
+                                except Exception:
+                                    try:
+                                        script_content = script_content.decode("latin-1")
+                                    except Exception:
+                                        script_content = None
+
+                            if script_content and isinstance(script_content, str):
+                                if not asset_name:
+                                    asset_name = f"TextAsset_{obj.path_id}"
+
+                                is_ink = False
+                                if "inkVersion" in script_content and "root" in script_content:
+                                    try:
+                                        ink_data = json.loads(script_content)
+                                        if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
+                                            is_ink = True
+                                            ink_hits = _walk_ink_root(ink_data.get("root"), [0])
+                                            for idx, raw_ink_text in ink_hits:
+                                                ink_text = raw_ink_text[1:]
+                                                if _is_game_text(ink_text):
+                                                    path = ["TextAsset", str(obj.path_id), "ink", str(idx)]
+                                                    context = f"TextAsset (Ink): {asset_name}, Index: {idx}, File: {os.path.basename(fpath)}"
+                                                    results.append(self._mk(rel_path, path, ink_text, context))
+                                                    typetree_found += 1
+                                                    n_typetree += 1
+                                    except Exception:
+                                        pass
+
+                                if not is_ink and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
+                                    try:
+                                        json_obj = json.loads(script_content)
+                                        leaves = _walk_json_leaves(json_obj, [])
+                                        for jpath, val in leaves:
+                                            if _is_game_text(val):
+                                                dot_path = ".".join(jpath)
+                                                path = ["TextAsset", str(obj.path_id), "json", dot_path]
+                                                context = f"TextAsset (JSON): {asset_name}, Path: {dot_path}, File: {os.path.basename(fpath)}"
+                                                results.append(self._mk(rel_path, path, val, context))
+                                                typetree_found += 1
+                                                n_typetree += 1
+                                        is_ink = True
+                                    except Exception:
+                                        pass
+
+                                if not is_ink and ("\n" in script_content or "\r" in script_content):
+                                    delim = _detect_csv_delim(script_content)
+                                    if delim:
+                                        try:
+                                            reader = csv.reader(io.StringIO(script_content), delimiter=delim)
+                                            rows = list(reader)
+                                            if rows:
+                                                header = [h.strip().lower() for h in rows[0]]
+                                                text_col_indices = []
+                                                target_names = {"en", "english", "text", "value", "translation", "dialogue", "dialog", "content", "string", "caption", "message"}
+                                                for ci, col in enumerate(header):
+                                                    if col in target_names or any(tn in col for tn in ("text", "dialog")):
+                                                        text_col_indices.append(ci)
+                                                if not text_col_indices and len(rows[0]) >= 2:
+                                                    text_col_indices.append(1)
+
+                                                for r_idx in range(1, len(rows)):
+                                                    row = rows[r_idx]
+                                                    key_prefix = row[0] if len(row) > 0 else str(r_idx)
+                                                    for ci in text_col_indices:
+                                                        if ci < len(row):
+                                                            val = row[ci]
+                                                            if val and _is_game_text(val):
+                                                                col_name = header[ci] if ci < len(header) else str(ci)
+                                                                path = ["TextAsset", str(obj.path_id), "csv", str(r_idx), str(ci)]
+                                                                context = f"TextAsset (CSV): {asset_name}, Row: {r_idx} (key={key_prefix}), Col: {col_name}, File: {os.path.basename(fpath)}"
+                                                                results.append(self._mk(rel_path, path, val, context))
+                                                                typetree_found += 1
+                                                                n_typetree += 1
+                                        except Exception:
+                                            pass
                         except Exception:
                             failed_count += 1
             except Exception as e:
@@ -1956,7 +2266,15 @@ class UnityParser(BaseParser):
             self.backup_file(root, fpath)
             # UnityPy Environment.save writes into out_path dir; use file.save bytes.
             try:
-                data = env.file.save()
+                data = None
+                f_lower = os.path.basename(fpath).lower()
+                if f_lower.endswith((".bundle", ".assetbundle")) or f_lower == "data.unity3d":
+                    try:
+                        data = env.file.save(packer="original")
+                    except Exception:
+                        pass
+                if not data:
+                    data = env.file.save()
                 if isinstance(data, (bytes, bytearray)) and len(data) > 0:
                     with open(fpath, "wb") as f:
                         f.write(data)
@@ -2077,6 +2395,13 @@ class UnityParser(BaseParser):
             report.record(SOURCE_DLL, n, enabled=True)
         else:
             report.record(SOURCE_DLL, 0, enabled=False, reason="skipped by plan")
+
+        if any(s.id == SOURCE_IL2CPP_METADATA and s.enabled for s in report.sources):
+            n = self._inject_il2cpp_metadata(root, translations, target_lang, sub_paths)
+            written += n
+            report.record(SOURCE_IL2CPP_METADATA, n, enabled=True)
+        else:
+            report.record(SOURCE_IL2CPP_METADATA, 0, enabled=False, reason="not an IL2CPP build")
 
         # Assets: typetree + raw (content/ui slots) + yaml + font_gap inside
         n_assets = self._inject_assets(
@@ -2290,6 +2615,21 @@ class UnityParser(BaseParser):
                                                                             typetree_found += 1
                                                                             n_typetree += 1
 
+                            # 4. Generic deep typetree injection
+                            generic_hits = _walk_typetree_generic(tree, [])
+                            for p_parts, orig_val in generic_hits:
+                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations"):
+                                    continue
+                                dot_path = ".".join(p_parts)
+                                path = ["AssetTree", str(obj.path_id), dot_path]
+                                sid = make_id(self.engine, rel_path, path, orig_val)
+                                if sid in translations:
+                                    if _set_typetree_by_path(tree, p_parts, translations[sid]):
+                                        obj_modified = True
+                                        written += 1
+                                        typetree_found += 1
+                                        n_typetree += 1
+
                             if obj_modified:
                                 if obj.type.name == "MonoBehaviour":
                                     obj.save_typetree(tree)
@@ -2297,6 +2637,154 @@ class UnityParser(BaseParser):
                                     data.save_typetree(tree)
                                 changed = True
                                 typetree_modified_pids.add(obj.path_id)
+                        except Exception:
+                            failed_count += 1
+                    elif obj.type.name == "TextAsset":
+                        try:
+                            script_content = None
+                            tree = None
+                            try:
+                                tree = obj.read_typetree()
+                                script_content = tree.get("m_Script")
+                            except Exception:
+                                pass
+                            if not script_content:
+                                try:
+                                    data = obj.read()
+                                    script_content = getattr(data, "m_Script", None) or getattr(data, "script", None)
+                                except Exception:
+                                    pass
+
+                            if isinstance(script_content, bytes):
+                                try:
+                                    script_content = script_content.decode("utf-8")
+                                except Exception:
+                                    try:
+                                        script_content = script_content.decode("latin-1")
+                                    except Exception:
+                                        script_content = None
+
+                            if script_content and isinstance(script_content, str):
+                                asset_modified = False
+                                is_ink = False
+
+                                # 1. Ink JSON
+                                if "inkVersion" in script_content and "root" in script_content:
+                                    try:
+                                        ink_data = json.loads(script_content)
+                                        if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
+                                            is_ink = True
+                                            ink_hits = _walk_ink_root(ink_data.get("root"), [0])
+                                            ink_replacements: dict[int, str] = {}
+                                            for idx, raw_ink_text in ink_hits:
+                                                ink_text = raw_ink_text[1:]
+                                                path = ["TextAsset", str(obj.path_id), "ink", str(idx)]
+                                                sid = make_id(self.engine, rel_path, path, ink_text)
+                                                if sid in translations:
+                                                    ink_replacements[idx] = translations[sid]
+                                            if ink_replacements:
+                                                if _replace_ink_root(ink_data.get("root"), [0], ink_replacements):
+                                                    script_content = json.dumps(ink_data, ensure_ascii=False)
+                                                    asset_modified = True
+                                                    written += len(ink_replacements)
+                                                    typetree_found += len(ink_replacements)
+                                                    n_typetree += len(ink_replacements)
+                                    except Exception:
+                                        pass
+
+                                # 2. Generic JSON
+                                if not is_ink and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
+                                    try:
+                                        json_obj = json.loads(script_content)
+                                        leaves = _walk_json_leaves(json_obj, [])
+                                        j_written = 0
+                                        for jpath, orig_val in leaves:
+                                            dot_path = ".".join(jpath)
+                                            path = ["TextAsset", str(obj.path_id), "json", dot_path]
+                                            sid = make_id(self.engine, rel_path, path, orig_val)
+                                            if sid in translations:
+                                                if _set_typetree_by_path(json_obj, jpath, translations[sid]):
+                                                    j_written += 1
+                                        if j_written > 0:
+                                            script_content = json.dumps(json_obj, ensure_ascii=False, indent=2)
+                                            asset_modified = True
+                                            written += j_written
+                                            typetree_found += j_written
+                                            n_typetree += j_written
+                                        is_ink = True
+                                    except Exception:
+                                        pass
+
+                                # 3. CSV / TSV table
+                                if not is_ink and ("\n" in script_content or "\r" in script_content):
+                                    delim = _detect_csv_delim(script_content)
+                                    if delim:
+                                        try:
+                                            reader = csv.reader(io.StringIO(script_content), delimiter=delim)
+                                            rows = list(reader)
+                                            csv_written = 0
+                                            if rows:
+                                                header = [h.strip().lower() for h in rows[0]]
+                                                text_col_indices = []
+                                                target_names = {"en", "english", "text", "value", "translation", "dialogue", "dialog", "content", "string", "caption", "message"}
+                                                for ci, col in enumerate(header):
+                                                    if col in target_names or any(tn in col for tn in ("text", "dialog")):
+                                                        text_col_indices.append(ci)
+                                                if not text_col_indices and len(rows[0]) >= 2:
+                                                    text_col_indices.append(1)
+
+                                                for r_idx in range(1, len(rows)):
+                                                    row = rows[r_idx]
+                                                    for ci in text_col_indices:
+                                                        if ci < len(row):
+                                                            orig_val = row[ci]
+                                                            path = ["TextAsset", str(obj.path_id), "csv", str(r_idx), str(ci)]
+                                                            sid = make_id(self.engine, rel_path, path, orig_val)
+                                                            if sid in translations:
+                                                                row[ci] = translations[sid]
+                                                                csv_written += 1
+
+                                            if csv_written > 0:
+                                                out_io = io.StringIO()
+                                                writer = csv.writer(out_io, delimiter=delim, lineterminator="\n")
+                                                writer.writerows(rows)
+                                                script_content = out_io.getvalue()
+                                                asset_modified = True
+                                                written += csv_written
+                                                typetree_found += csv_written
+                                                n_typetree += csv_written
+                                        except Exception:
+                                            pass
+
+                                if asset_modified:
+                                    saved = False
+                                    if tree is not None:
+                                        try:
+                                            tree["m_Script"] = script_content
+                                            obj.save_typetree(tree)
+                                            saved = True
+                                        except Exception:
+                                            pass
+                                    if not saved:
+                                        try:
+                                            data = obj.read()
+                                            if hasattr(data, "m_Script"):
+                                                data.m_Script = script_content
+                                            elif hasattr(data, "script"):
+                                                data.script = script_content
+                                            data.save()
+                                            saved = True
+                                        except Exception:
+                                            pass
+                                    if not saved:
+                                        try:
+                                            raw_bytes = script_content.encode("utf-8")
+                                            obj.set_raw_data(struct.pack("<I", len(raw_bytes)) + raw_bytes)
+                                            saved = True
+                                        except Exception:
+                                            pass
+                                    changed = True
+                                    typetree_modified_pids.add(obj.path_id)
                         except Exception:
                             failed_count += 1
 
@@ -2752,4 +3240,211 @@ class UnityParser(BaseParser):
             except Exception as e:
                 print(f"Error injecting into bundle {bundle_path}: {e}", file=sys.stderr)
 
+        if written > 0:
+            aa_dir = find_aa_dir(root)
+            if aa_dir:
+                for dirpath, _, filenames in os.walk(aa_dir):
+                    for f in filenames:
+                        if f.startswith("catalog") and f.endswith(".json"):
+                            cat_file = os.path.join(dirpath, f)
+                            self._disable_catalog_crc(cat_file)
+
         return written
+
+    def _disable_catalog_crc(self, catalog_path: str) -> bool:
+        """Set m_UseCrcForCachedBundles=false and m_Crc=0 in Addressables catalog.json."""
+        if not os.path.isfile(catalog_path):
+            return False
+        try:
+            with open(catalog_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            data = json.loads(content)
+            modified = False
+
+            def _disable_crc_recursive(node: Any) -> bool:
+                inner_mod = False
+                if isinstance(node, dict):
+                    if "m_UseCrcForCachedBundles" in node and node["m_UseCrcForCachedBundles"] is True:
+                        node["m_UseCrcForCachedBundles"] = False
+                        inner_mod = True
+                    if "m_Crc" in node and node["m_Crc"] != 0:
+                        node["m_Crc"] = 0
+                        inner_mod = True
+                    for v in node.values():
+                        if isinstance(v, (dict, list)):
+                            if _disable_crc_recursive(v):
+                                inner_mod = True
+                elif isinstance(node, list):
+                    for item in node:
+                        if isinstance(item, (dict, list)):
+                            if _disable_crc_recursive(item):
+                                inner_mod = True
+                return inner_mod
+
+            if isinstance(data, (dict, list)):
+                if _disable_crc_recursive(data):
+                    modified = True
+
+            if modified:
+                root = getattr(self, "_current_root", None)
+                if root:
+                    try:
+                        self.backup_file(root, catalog_path)
+                    except Exception:
+                        pass
+                with open(catalog_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                return True
+        except Exception as e:
+            print(f"Error disabling catalog CRC in {catalog_path}: {e}", file=sys.stderr)
+        return False
+
+    def _find_global_metadata(self, root: str) -> str | None:
+        """Find global-metadata.dat inside root."""
+        std_candidates = [
+            os.path.join(root, "il2cpp_data", "Metadata", "global-metadata.dat"),
+        ]
+        for name in os.listdir(root):
+            if name.lower().endswith("_data"):
+                std_candidates.append(os.path.join(root, name, "il2cpp_data", "Metadata", "global-metadata.dat"))
+        for cand in std_candidates:
+            if os.path.isfile(cand):
+                return cand
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d.lower() not in IGNORE_DIRS and not d.startswith(".")]
+            for f in filenames:
+                if f.lower() == "global-metadata.dat":
+                    return os.path.join(dirpath, f)
+        return None
+
+    def _extract_il2cpp_metadata(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
+        """Extract hardcoded string literals from global-metadata.dat."""
+        self._current_root = root
+        gm_path = self._find_global_metadata(root)
+        if not gm_path or not os.path.isfile(gm_path):
+            return []
+
+        rel_path = os.path.relpath(gm_path, root).replace("\\", "/")
+        if sub_paths and not any(rel_path.startswith(sp.replace("\\", "/")) for sp in sub_paths):
+            return []
+
+        try:
+            with open(gm_path, "rb") as f:
+                raw = f.read()
+
+            if len(raw) < 256:
+                return []
+            magic = struct.unpack_from("<I", raw, 0)[0]
+            if magic != 0xFAB11BAF:
+                return []
+
+            lit_offset, lit_size, data_offset, data_size = struct.unpack_from("<IIII", raw, 8)
+            if lit_offset + lit_size > len(raw) or data_offset + data_size > len(raw):
+                return []
+
+            count = lit_size // 8
+            results: list[TranslationString] = []
+            for idx in range(count):
+                length, data_idx = struct.unpack_from("<II", raw, lit_offset + idx * 8)
+                if data_idx + length > data_size:
+                    continue
+                chunk = raw[data_offset + data_idx : data_offset + data_idx + length]
+                try:
+                    s = chunk.decode("utf-8")
+                    if _is_game_text(s):
+                        path = ["Il2CppMetadata", str(idx)]
+                        ctx = f"IL2CPP StringLiteral #{idx}, File: {os.path.basename(gm_path)}"
+                        results.append(self._mk(rel_path, path, s, ctx))
+                except UnicodeDecodeError:
+                    pass
+            return results
+        except Exception as e:
+            print(f"Error extracting IL2CPP metadata {gm_path}: {e}", file=sys.stderr)
+            return []
+
+    def _inject_il2cpp_metadata(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
+        """Inject translations into global-metadata.dat string literals."""
+        self._current_root = root
+        gm_path = self._find_global_metadata(root)
+        if not gm_path or not os.path.isfile(gm_path):
+            return 0
+
+        rel_path = os.path.relpath(gm_path, root).replace("\\", "/")
+        if sub_paths and not any(rel_path.startswith(sp.replace("\\", "/")) for sp in sub_paths):
+            return 0
+
+        try:
+            with open(gm_path, "rb") as f:
+                raw = bytearray(f.read())
+
+            if len(raw) < 256:
+                return 0
+            magic = struct.unpack_from("<I", raw, 0)[0]
+            if magic != 0xFAB11BAF:
+                return 0
+
+            lit_offset, lit_size, data_offset, data_size = struct.unpack_from("<IIII", raw, 8)
+            if lit_offset + lit_size > len(raw) or data_offset + data_size > len(raw):
+                return 0
+
+            count = lit_size // 8
+            replacements: dict[int, str] = {}
+            for idx in range(count):
+                length, data_idx = struct.unpack_from("<II", raw, lit_offset + idx * 8)
+                if data_idx + length > data_size:
+                    continue
+                chunk = raw[data_offset + data_idx : data_offset + data_idx + length]
+                try:
+                    s = chunk.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+
+                path = ["Il2CppMetadata", str(idx)]
+                sid = make_id(self.engine, rel_path, path, s)
+                if sid in translations and translations[sid] != s:
+                    replacements[idx] = translations[sid]
+
+            if not replacements:
+                return 0
+
+            new_data = bytearray()
+            new_descriptors = bytearray()
+            for idx in range(count):
+                length, data_idx = struct.unpack_from("<II", raw, lit_offset + idx * 8)
+                if idx in replacements:
+                    chunk = replacements[idx].encode("utf-8")
+                else:
+                    chunk = bytes(raw[data_offset + data_idx : data_offset + data_idx + length])
+                new_descriptors.extend(struct.pack("<II", len(chunk), len(new_data)))
+                new_data.extend(chunk)
+
+            pad = (4 - (len(new_data) % 4)) % 4
+            if pad:
+                new_data.extend(b"\x00" * pad)
+
+            new_data_size = len(new_data)
+            delta = new_data_size - data_size
+
+            # The header ends at the start of the first data section (lit_offset)
+            header_end = min(lit_offset, 512)
+            for p in range(8, header_end, 8):
+                sec_off = struct.unpack_from("<I", raw, p)[0]
+                if sec_off >= data_offset + data_size:
+                    struct.pack_into("<I", raw, p, sec_off + delta)
+
+            struct.pack_into("<I", raw, 20, new_data_size)
+
+            actual_lit_offset = lit_offset + delta if lit_offset >= data_offset + data_size else lit_offset
+            raw[actual_lit_offset : actual_lit_offset + len(new_descriptors)] = new_descriptors
+
+            new_file = raw[:data_offset] + new_data + raw[data_offset + data_size:]
+
+            self.backup_file(root, gm_path)
+            with open(gm_path, "wb") as f:
+                f.write(new_file)
+
+            return len(replacements)
+        except Exception as e:
+            print(f"Error injecting IL2CPP metadata {gm_path}: {e}", file=sys.stderr)
+            return 0

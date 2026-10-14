@@ -2484,6 +2484,232 @@ def check_unity_frameworks_typetree() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_unity_v2_advanced_sources() -> None:
+    """Test generic typetree, TextAsset (Ink/JSON/CSV), IL2CPP global-metadata, and Addressables CRC bypass."""
+    import shutil
+    import struct
+    import json
+    from unittest.mock import MagicMock, patch
+    from parsers.unity import UnityParser, _walk_typetree_generic, _set_typetree_by_path
+    from parsers.unity_sources import detect_unity_capabilities
+
+    p = UnityParser()
+    root = tempfile.mkdtemp(prefix="interprex_unity_v2_")
+    try:
+        # ── 1. Generic Deep TypeTree Walk & Set ───────────────────────────
+        tree = {
+            "m_GameObject": {"m_PathID": 1},
+            "m_Enabled": 1,
+            "questData": {
+                "questTitle": "The Lost Relic of the Ancient Temple",
+                "objectives": [
+                    {"desc": "Find the golden key hidden in the catacombs"},
+                    {"desc": "Return the key to the village elder"},
+                ],
+                "rewardItem": {
+                    "itemName": "Sword of Dawn",
+                    "damage": 50,
+                }
+            }
+        }
+        hits = _walk_typetree_generic(tree, [])
+        paths = [".".join(p) for p, _ in hits]
+        texts = [t for _, t in hits]
+        assert "questData.questTitle" in paths
+        assert "questData.objectives.0.desc" in paths
+        assert "questData.objectives.1.desc" in paths
+        assert "questData.rewardItem.itemName" in paths
+        assert "The Lost Relic of the Ancient Temple" in texts
+        assert "Sword of Dawn" in texts
+
+        assert _set_typetree_by_path(tree, ["questData", "rewardItem", "itemName"], "Меч Рассвета")
+        assert tree["questData"]["rewardItem"]["itemName"] == "Меч Рассвета"
+
+        # ── 2. TextAsset (Ink, Generic JSON, CSV) ───────────────────────
+        fpath = os.path.join(root, "resources.assets")
+        with open(fpath, "wb") as f:
+            f.write(b"\x00" * 100)
+
+        # Ink JSON TextAsset
+        ink_json_content = json.dumps({
+            "inkVersion": 20,
+            "root": [
+                "^Greetings, adventurer! Welcome to our land.\n",
+                ["^What brings you here?\n", {"#": "tags"}],
+                "ev", "str", "^Take this potion.\n", "/str", "out", "/ev",
+                ["done", {"#f": 5}]
+            ]
+        })
+        mock_ink_obj = MagicMock()
+        mock_ink_obj.type.name = "TextAsset"
+        mock_ink_obj.path_id = 501
+        mock_ink_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_ink_obj.assets_file.objects = {}
+        mock_ink_obj.read_typetree.return_value = {"m_Name": "intro_ink", "m_Script": ink_json_content}
+        mock_ink_data = MagicMock()
+        mock_ink_data.name = "intro_ink"
+        mock_ink_data.m_Script = ink_json_content
+        mock_ink_obj.read.return_value = mock_ink_data
+
+        # Generic JSON TextAsset
+        generic_json_content = json.dumps({
+            "chapterTitle": "Chapter 1: The Dark Forest",
+            "dialogues": [
+                {"speaker": "Guide", "message": "Stay close to the lantern light."}
+            ]
+        })
+        mock_json_obj = MagicMock()
+        mock_json_obj.type.name = "TextAsset"
+        mock_json_obj.path_id = 502
+        mock_json_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_json_obj.assets_file.objects = {}
+        mock_json_obj.read_typetree.return_value = {"m_Name": "chapter1", "m_Script": generic_json_content}
+        mock_json_data = MagicMock()
+        mock_json_data.name = "chapter1"
+        mock_json_data.m_Script = generic_json_content
+        mock_json_obj.read.return_value = mock_json_data
+
+        # CSV TextAsset
+        csv_content = (
+            "key,en,ru\n"
+            "UI_PLAY,Play Game,Играть\n"
+            "UI_SETTINGS,Game Settings,Настройки\n"
+        )
+        mock_csv_obj = MagicMock()
+        mock_csv_obj.type.name = "TextAsset"
+        mock_csv_obj.path_id = 503
+        mock_csv_obj.assets_file.unity_version = "2021.3.0f1"
+        mock_csv_obj.assets_file.objects = {}
+        mock_csv_obj.read_typetree.return_value = {"m_Name": "localization_csv", "m_Script": csv_content}
+        mock_csv_data = MagicMock()
+        mock_csv_data.name = "localization_csv"
+        mock_csv_data.m_Script = csv_content
+        mock_csv_obj.read.return_value = mock_csv_data
+
+        mock_env = MagicMock()
+        mock_env.objects = [mock_ink_obj, mock_json_obj, mock_csv_obj]
+        mock_env.file.save.return_value = b"SAVED_TEXTASSETS"
+
+        with patch("UnityPy.load", return_value=mock_env):
+            extracted = p._extract_assets(root)["strings"]
+
+        ext_texts = [s.original for s in extracted]
+        assert "Greetings, adventurer! Welcome to our land.\n" in ext_texts
+        assert "What brings you here?\n" in ext_texts
+        assert "Take this potion.\n" in ext_texts
+        assert "Chapter 1: The Dark Forest" in ext_texts
+        assert "Stay close to the lantern light." in ext_texts
+        assert "Play Game" in ext_texts
+        assert "Game Settings" in ext_texts
+
+        # Translate TextAssets
+        translations = {s.id: f"[RU] {s.original.strip()}" for s in extracted}
+        with patch("UnityPy.load", return_value=mock_env):
+            written = p._inject_assets(root, translations)
+
+        assert written >= 7, f"Expected at least 7 TextAsset written, got {written}"
+
+        # ── 3. Archive & Custom Bundle Scanning ─────────────────────────
+        data_u3d = os.path.join(root, "data.unity3d")
+        with open(data_u3d, "wb") as f:
+            f.write(b"data")
+        custom_bundle = os.path.join(root, "custom.assetbundle")
+        with open(custom_bundle, "wb") as f:
+            f.write(b"bundle")
+        c_files, _ = p._scan_asset_files(root)
+        c_bases = [os.path.basename(f) for f in c_files]
+        assert "data.unity3d" in c_bases
+        assert "custom.assetbundle" in c_bases
+
+        # ── 4. IL2CPP global-metadata.dat extract & inject with delta shift ─
+        il2cpp_dir = os.path.join(root, "il2cpp_data", "Metadata")
+        os.makedirs(il2cpp_dir, exist_ok=True)
+        gm_file = os.path.join(il2cpp_dir, "global-metadata.dat")
+
+        lit_off = 256
+        lit_sz = 16
+        data_off = 272
+        str0 = "Press Start Button".encode("utf-8")
+        str1 = "Game Over".encode("utf-8")
+        initial_data = str0 + str1 + b"\x00" * 5
+        data_sz = len(initial_data)
+        tail_off = data_off + data_sz
+        tail_sz = 64
+        tail_content = b"TAIL_DATA_BLOCK" * 4
+
+        header = bytearray(256)
+        struct.pack_into("<I", header, 0, 0xFAB11BAF)
+        struct.pack_into("<I", header, 4, 24)
+        struct.pack_into("<II", header, 8, lit_off, lit_sz)
+        struct.pack_into("<II", header, 16, data_off, data_sz)
+        struct.pack_into("<II", header, 24, tail_off, tail_sz)
+
+        descs = struct.pack("<II", len(str0), 0) + struct.pack("<II", len(str1), len(str0))
+
+        synthetic_gm = bytes(header) + descs + initial_data + tail_content
+        with open(gm_file, "wb") as f:
+            f.write(synthetic_gm)
+
+        caps = detect_unity_capabilities(root)
+        assert caps.has_il2cpp is True
+
+        gm_strings = p._extract_il2cpp_metadata(root)
+        assert len(gm_strings) == 2, f"Expected 2 strings, got {len(gm_strings)}"
+        assert gm_strings[0].original == "Press Start Button"
+        assert gm_strings[1].original == "Game Over"
+
+        tr_map = {
+            gm_strings[0].id: "Нажмите кнопку старта для продолжения приключения",
+            gm_strings[1].id: "Игра окончена. Попробуйте еще раз!",
+        }
+        written_gm = p._inject_il2cpp_metadata(root, tr_map)
+        assert written_gm == 2
+
+        with open(gm_file, "rb") as f:
+            mod_gm = f.read()
+
+        mod_magic, mod_ver = struct.unpack_from("<II", mod_gm, 0)
+        assert mod_magic == 0xFAB11BAF
+        mod_lit_off, mod_lit_sz, mod_data_off, mod_data_sz = struct.unpack_from("<IIII", mod_gm, 8)
+        mod_tail_off, mod_tail_sz = struct.unpack_from("<II", mod_gm, 24)
+
+        delta = mod_data_sz - data_sz
+        assert delta > 0, f"Expected expansion delta > 0, got {delta}"
+        assert mod_tail_off == tail_off + delta, f"Expected tail_off {tail_off + delta}, got {mod_tail_off}"
+        assert mod_gm[mod_tail_off : mod_tail_off + len(tail_content)] == tail_content
+
+        mod_extracted = p._extract_il2cpp_metadata(root)
+        assert mod_extracted[0].original == "Нажмите кнопку старта для продолжения приключения"
+        assert mod_extracted[1].original == "Игра окончена. Попробуйте еще раз!"
+
+        # ── 5. Addressables Catalog CRC Check Bypass ────────────────────
+        cat_path = os.path.join(root, "catalog.json")
+        cat_data = {
+            "m_LocatorId": "AddressablesMainContentCatalog",
+            "m_UseCrcForCachedBundles": True,
+            "m_BucketData": [
+                {"m_InternalId": "CAB-12345", "m_Crc": 987654321, "m_UseCrcForCachedBundles": True},
+                {"m_InternalId": "CAB-67890", "m_Crc": 123456789}
+            ]
+        }
+        with open(cat_path, "w", encoding="utf-8") as f:
+            json.dump(cat_data, f)
+
+        assert p._disable_catalog_crc(cat_path) is True
+        with open(cat_path, "r", encoding="utf-8") as f:
+            fixed_cat = json.load(f)
+
+        assert fixed_cat["m_UseCrcForCachedBundles"] is False
+        assert fixed_cat["m_BucketData"][0]["m_UseCrcForCachedBundles"] is False
+        assert fixed_cat["m_BucketData"][0]["m_Crc"] == 0
+        assert fixed_cat["m_BucketData"][1]["m_Crc"] == 0
+
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    print("OK — unity v2 advanced sources (generic typetree, textasset, il2cpp metadata delta shift, catalog crc bypass)")
+
+
 def check_i18n_rimworld_defs() -> None:
     """RimWorld Defs/ -> generated DefInjected. Most mods ship no curated
     English DefInjected; the translatable text lives in Defs/*.xml. We generate
@@ -7189,6 +7415,7 @@ def main() -> int:
     check_unity()
     check_unity_localization()
     check_unity_frameworks_typetree()
+    check_unity_v2_advanced_sources()
     check_i18n()
     check_i18n_rimworld_defs()
     check_rimworld_research_lines()

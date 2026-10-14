@@ -28,6 +28,7 @@ from typing import Any
 # ── Source catalog (documentation + enablement policy) ──────────────────────
 
 SOURCE_DLL = "dll"
+SOURCE_IL2CPP_METADATA = "il2cpp_metadata"
 SOURCE_TYPETREE = "typetree_text"
 SOURCE_CONTENT = "content_blob"
 SOURCE_UI_RAW = "ui_raw"
@@ -38,6 +39,7 @@ SOURCE_FONT_GAP = "font_gap"
 # Ordered for reports (extract order where it matters).
 SOURCE_ORDER: tuple[str, ...] = (
     SOURCE_DLL,
+    SOURCE_IL2CPP_METADATA,
     SOURCE_TYPETREE,
     SOURCE_CONTENT,
     SOURCE_UI_RAW,
@@ -50,6 +52,10 @@ SOURCE_META: dict[str, dict[str, str]] = {
     SOURCE_DLL: {
         "title": "Game DLLs",
         "summary": "Assembly-CSharp* string literals via DllEditor (middleware denied).",
+    },
+    SOURCE_IL2CPP_METADATA: {
+        "title": "IL2CPP String Literals",
+        "summary": "Hardcoded C# string literals from global-metadata.dat.",
     },
     SOURCE_TYPETREE: {
         "title": "Typetree UI text",
@@ -300,11 +306,16 @@ def detect_unity_capabilities(
         fl = f.lower()
         if is_custom_dll_fn(f):
             dll_n += 1
+        if fl == "global-metadata.dat":
+            caps.has_il2cpp = True
         if fl.endswith(".assets"):
             if not fl.endswith((".manifest", ".ress", ".resource")):
                 caps.has_compiled_assets = True
         elif fl.startswith("level") and "." not in fl:
             caps.has_compiled_assets = True
+        elif fl == "data.unity3d" or fl.endswith((".bundle", ".assetbundle")):
+            if "/aa/" not in fpath.replace("\\", "/").lower():
+                caps.has_compiled_assets = True
         if fl.endswith((".unity", ".prefab", ".asset")):
             caps.has_yaml_assets = True
 
@@ -335,6 +346,12 @@ def plan_sources(caps: UnityCapabilities, *, phase: str) -> UnityPipelineReport:
     else:
         why = "IL2CPP / no Assembly-CSharp*" if caps.has_il2cpp else "no game DLLs"
         report.plan_disabled(SOURCE_DLL, why)
+
+    # il2cpp_metadata
+    if caps.has_il2cpp:
+        report.plan_enabled(SOURCE_IL2CPP_METADATA, "IL2CPP global-metadata.dat present")
+    else:
+        report.plan_disabled(SOURCE_IL2CPP_METADATA, "not an IL2CPP build")
 
     # compiled asset sources share has_compiled_assets
     if caps.has_compiled_assets:
