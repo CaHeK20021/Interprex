@@ -976,7 +976,7 @@ def gemini_post(prompt: str, api_key: str, model: str, response_schema: dict = N
                 timeout=httpx.Timeout(_HTTP_TIMEOUT_S, connect=20.0),
             )
             if resp.status_code == 429:
-                raise RuntimeError(f"API rate limit (429): {resp.text[:300]}")
+                raise RuntimeError(f"API rate limit (429): {resp.text[:1500]}")
             if resp.status_code in (401, 403):
                 raise RuntimeError(f"API auth error ({resp.status_code}): {resp.text[:300]}")
             if resp.status_code in (500, 502, 503, 504):

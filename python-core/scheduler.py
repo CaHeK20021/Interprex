@@ -434,7 +434,7 @@ class TranslationScheduler:
                 self.cal._samples = smp
 
         # --- shared state, all guarded by self.cond -----------------------------
-        self.cond = threading.Condition()
+        self.cond = threading.Condition(threading.RLock())
         self.pool: "OrderedDict[str, list]" = OrderedDict()  # filled in run()
         self.in_flight = 0
         # Which worker indices are CURRENTLY holding a batch (busy). The ramp-down

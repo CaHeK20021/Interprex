@@ -2751,7 +2751,7 @@ export default function App() {
     if (!wrote) return;
 
     // 3. Ren'Py source-literal translation (engine-specific). Same backup store.
-    if (engine === "renpy") {
+    if (engine === "renpy" && translationMode !== "mods" && includePythonStrings) {
       await handleTranslatePython(false);
     }
 

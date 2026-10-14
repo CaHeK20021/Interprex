@@ -1635,7 +1635,8 @@ def _llm_fix(api_key: str, model: str, base_url: str, file_path: str, content: s
         "Return ONLY a JSON object: {\"line\":N,\"old\":\"<exact broken line>\",\"new\":\"<fixed line>\"}"
     )
 
-    is_openai = base_url and "generativelanguage" not in base_url
+    is_gemini = model.strip().lower().startswith(("gemini", "gemma"))
+    is_openai = not is_gemini and bool(base_url)
     if is_openai:
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
