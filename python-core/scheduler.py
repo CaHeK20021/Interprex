@@ -1004,17 +1004,58 @@ class TranslationScheduler:
                     if self.should_pause():
                         break
 
-                    # Honour this key's cooldown and cluster outage cooldown without blocking other keys:
-                    # a short timed wait on the shared condition lets sibling keys proceed.
-                    cd = max(self.key_cooldown.get(worker_key, 0.0), self.cluster_cooldown_until)
-                    wait_for = cd - time.time()
+                    # 1. СНАЧАЛА проверяем наличие работы в пуле!
+                    rem = self._remaining_locked()
+                    if rem == 0:
+                        if self._run_done_locked():
+                            self.cond.notify_all()
+                            return (_DONE, None)
+                        # В пуле пусто, но кто-то держит батч in-flight — тихо уходим в Resting!
+                        return (_REST, None)
+
+                    # 2. СНАЧАЛА проверяем Priority ramp-down (b_est)!
+                    effective_avg = max(
+                        self.avg_batch_items,
+                        float(self.req.max_batch_size or 30) * 0.5,
+                    )
+                    b_est = max(1, math.ceil(rem / max(1.0, effective_avg)))
+
+                    # Если идет кластерный шторм или мы на хвосте (<= max_batch_size) при сбоях,
+                    # разрешаем работу СТРОГО 1 воркеру во всем пуле (включая in_flight)!
+                    if self.cluster_error_streak >= 3 or (
+                        (rem + self.in_flight * effective_avg) <= (self.req.max_batch_size or 30)
+                        and self.cluster_error_streak >= 1
+                    ):
+                        if self.in_flight >= 1:
+                            if self._run_done_locked():
+                                return (_DONE, None)
+                            return (_REST, None)
+
+                    # Ранг среди СВОБОДНЫХ воркеров сравнивается с числом доступных батчей в пуле (b_est)
+                    if self._effective_rank_locked(worker_idx) >= b_est:
+                        if self._run_done_locked():
+                            return (_DONE, None)
+                        return (_REST, None)
+
+                    # 3. ТОЛЬКО ТЕПЕРЬ (когда поток гарантированно должен взять батч) ждём кулдаун!
+                    now = time.time()
+                    # Если активен кластерный шторм — выравниваем всех по единому таймеру кластера,
+                    # чтобы Key 1 и Key 2 не мигали разными секундами.
+                    if self.cluster_error_streak >= 3 and self.cluster_cooldown_until > now:
+                        cd = max(self.cluster_cooldown_until, self.key_cooldown.get(worker_key, 0.0))
+                        is_cluster_cd = True
+                    else:
+                        cd = self.key_cooldown.get(worker_key, 0.0)
+                        is_cluster_cd = False
+
+                    wait_for = cd - now
                     if wait_for > 0:
                         wait_left = int(math.ceil(wait_for))
                         if wait_for >= 1.5:
                             bnum = self.worker_batch_no.get(worker_idx, 0)
                             status_msg = (
                                 f"Cluster cooldown ({wait_left}s left)..."
-                                if cd == self.cluster_cooldown_until and self.cluster_error_streak >= 3
+                                if is_cluster_cd
                                 else f"Key cooldown ({wait_left}s left)..."
                             )
                             self._emit(
@@ -1026,28 +1067,6 @@ class TranslationScheduler:
                             )
                         self.cond.wait(timeout=min(wait_for, 1.0))
                         continue
-
-                    rem = self._remaining_locked()
-                    if rem == 0:
-                        if self._run_done_locked():
-                            self.cond.notify_all()
-                            return (_DONE, None)
-                        # Pool's empty but a peer still holds a batch that might be
-                        # reclaimed — wait to be woken rather than exit prematurely.
-                        self.cond.wait(timeout=0.5)
-                        continue
-
-                    # Priority ramp-down: with B_est batches left, only the B_est
-                    # highest-priority LIVE workers should engage. avg_batch_items is a
-                    # shared running estimate (exact count is unknowable cheaply with
-                    # adaptive sizing). Bound by at least 50% max_batch_size to protect
-                    # the tail from over-concurrency when tiny fragments appear.
-                    effective_avg = max(self.avg_batch_items, float(self.req.max_batch_size or 30) * 0.5)
-                    b_est = max(1, math.ceil(rem / max(1.0, effective_avg)))
-                    if self._effective_rank_locked(worker_idx) >= b_est:
-                        if self._run_done_locked():
-                            return (_DONE, None)
-                        return (_REST, None)
 
                     if self.auto_group_small_files:
                         # Собираем кандидатов из разных файлов
@@ -1104,7 +1123,11 @@ class TranslationScheduler:
                                              req.max_batch_size)
                         tail = len(items) - end
                         min_tail = max(6, req.max_batch_size // 4)
-                        if 0 < tail < min_tail and len(items) <= req.max_batch_size * 2:
+                        if (
+                            0 < tail < min_tail
+                            and len(items) <= req.max_batch_size * 2
+                            and self.cluster_error_streak == 0
+                        ):
                             end = (len(items) + 1) // 2
 
                         batch = list(items[:end])
@@ -1479,31 +1502,31 @@ class TranslationScheduler:
                         self.batches += 1
                     return ({}, False, True)
 
-                # Cluster-wide outage detector:
+                # Cluster-wide outage detector (без Extension Storm):
                 if reached and kind in ("server", "overload", "rate"):
                     with self.cond:
+                        now_err = time.time()
                         self.cluster_error_streak += 1
                         if self.cluster_error_streak >= 3:
-                            # Cluster-wide outage/overload detected across threads/keys.
-                            # Set global cooldown (10s, 20s, up to 30s) so all workers back off together
-                            # instead of amplifying load with rapid retry storms.
-                            cluster_cd = min(30.0, 6.0 + self.cluster_error_streak * 2.0)
-                            self.cluster_cooldown_until = max(
-                                self.cluster_cooldown_until,
-                                time.time() + cluster_cd,
-                            )
+                            # Взводим новый дедлайн ТОЛЬКО если предыдущий уже истек (или почти истек < 1s).
+                            # Это гарантирует строго монотонный обратный отсчет на UI без прыжков назад!
+                            if self.cluster_cooldown_until <= now_err + 1.0:
+                                waves = min(3, (self.cluster_error_streak - 1) // max(1, self.in_flight))
+                                cluster_cd = min(30.0, 12.0 + waves * 6.0)
+                                self.cluster_cooldown_until = now_err + cluster_cd
 
                 # Smart bisection and toxic-batch protection:
                 # 1) Do NOT accumulate server_500_hits when cluster is down (curr_streak >= 3)!
                 #    If the cluster is down, errors are cluster-wide, not batch toxicity.
-                # 2) Never split batches < 10 into 1-string dust.
+                # 2) Never split batches < 12 into 1-string dust.
                 # 3) Max 1 split per string life across ALL workers (self.split_item_ids).
-                # 4) If cluster is down (streak >= 3), forbid splitting to prevent request amplification storm.
+                # 4) If cluster is down (streak >= 2), forbid splitting to prevent request amplification storm.
                 # 5) If toxic batch causes repeated 500s while cluster is healthy, safety_skip to protect the run.
                 if kind in ("server", "other") and reached:
                     with self.cond:
                         curr_streak = self.cluster_error_streak
                         already_split = any(it.id in self.split_item_ids for it in batch)
+                        pool_rem = self._remaining_locked()
 
                     if curr_streak < 3:
                         server_500_hits += 1
@@ -1512,12 +1535,17 @@ class TranslationScheduler:
                         # so that once the cluster recovers, this batch is not falsely dropped!
                         server_500_hits = 0
 
+                    # Не режем мелкий хвостовой батч (<= 20 строк), когда пул уже пуст,
+                    # иначе второй воркер заберет половинку и начнет параллельный шторм!
+                    can_split_tail = (pool_rem > 0) or (len(batch) > 20)
+
                     if (
-                        server_500_hits >= 2
+                        server_500_hits >= 3
                         and splits_done == 0
                         and not already_split
-                        and len(batch) >= 10
-                        and curr_streak < 3
+                        and len(batch) >= 12
+                        and can_split_tail
+                        and curr_streak < 2
                     ):
                         mid = len(batch) // 2
                         leftover = batch[mid:]
@@ -1568,6 +1596,29 @@ class TranslationScheduler:
                         return ({}, True, False)
                 else:
                     auth_fails = 0
+
+                # Tail Storm Yield: если мы на самом хвосте (пул пуст или почти пуст),
+                # начались сбои сервера, и сразу несколько воркеров держат батчи в ретраях —
+                # младшие по приоритету воркеры сдают батч обратно в пул и уходят в Resting,
+                # оставляя СТРОГО ОДНОГО лидера (с минимальным worker_idx) пробивать сервер!
+                with self.cond:
+                    is_tail = self._remaining_locked() <= (self.req.max_batch_size or 30)
+                    is_failing = self.cluster_error_streak >= 2 or kind in ("server", "overload", "rate")
+                    if (
+                        is_tail
+                        and is_failing
+                        and self.in_flight > 1
+                        and worker_idx > min(self.in_flight_workers)
+                    ):
+                        # Сбрасываем счетчик reclaim для этих строк, чтобы добровольная сдача
+                        # не потратила лимит max_reclaims!
+                        for it in batch:
+                            self.reclaim_count[it.id] = max(0, self.reclaim_count.get(it.id, 0) - 1)
+                        logger.info(
+                            "[Worker %d] Yielding tail batch (%d items) back to pool so only 1 worker retries during server error.",
+                            worker_idx, len(batch),
+                        )
+                        return ({}, False, False)
 
                 if try_i < BATCH_TRIES - 1:
                     # User paused after/during this failure: hold the owned batch
@@ -1630,6 +1681,7 @@ class TranslationScheduler:
                     floor = rate_floor
                     with self.cond:
                         cluster_rem = self.cluster_cooldown_until - time.time()
+                        in_cluster_storm = self.cluster_error_streak >= 3
                         if cluster_rem > 0:
                             floor = max(floor, cluster_rem)
                     # Stagger sibling retries so threads that all hit an error at
@@ -1639,7 +1691,12 @@ class TranslationScheduler:
                     # second, keeping the peak RPM at N/delay ≤ 1 request per
                     # thread-period.
                     stagger = 0.0
-                    if kind in ("rate", "overload") and rate_floor > 0 and self.threads > 1:
+                    if (
+                        not in_cluster_storm
+                        and kind in ("rate", "overload")
+                        and rate_floor > 0
+                        and self.threads > 1
+                    ):
                         rank = worker_idx % self.threads
                         stagger = rate_floor * rank / self.threads
                     self._retry_sleep(
