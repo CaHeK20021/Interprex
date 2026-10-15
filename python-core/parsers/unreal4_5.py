@@ -603,12 +603,43 @@ def iter_locres_files(root: str):
         yield f
 
 
+UE_PAK_MAGIC = b"\xe1\x12\x6f\x5a"  # 0x5A6F12E1 little-endian (FPakInfo footer magic)
+_NON_UE_PAK_NAMES = frozenset({
+    "resources.pak", "chrome_100_percent.pak", "chrome_200_percent.pak",
+    "content_resources.pak", "keyboard_resources.pak", "cef.pak",
+    "cef_100_percent.pak", "cef_200_percent.pak", "cef_extensions.pak",
+    "devtools_resources.pak",
+})
+
+
+def _is_ue_pak(p: Path) -> bool:
+    """True only if `p` is a genuine Unreal Engine .pak archive (checks FPakInfo footer magic)."""
+    name_low = p.name.lower()
+    if name_low in _NON_UE_PAK_NAMES:
+        return False
+    if any(part.lower() == "locales" for part in p.parts):
+        return False
+    try:
+        sz = p.stat().st_size
+        if sz < 44:
+            return False
+        with open(p, "rb") as f:
+            tail_len = min(sz, 300)
+            f.seek(sz - tail_len)
+            tail = f.read(tail_len)
+        return UE_PAK_MAGIC in tail
+    except OSError:
+        return False
+
+
 def iter_pak_files(root: str):
-    """Yield `.pak` archives under root, skipping our own mod-paks and backups."""
+    """Yield genuine UE `.pak` archives under root, skipping our own mod-paks, backups, and non-UE paks."""
     for f in Path(root).rglob("*.pak"):
         if ".interprex_backups" in f.parts:
             continue
         if f.stem.endswith("_P"):   # our own (or other) mod-paks — never a source
+            continue
+        if not _is_ue_pak(f):
             continue
         yield f
 
@@ -1005,9 +1036,11 @@ class UnrealEngine4_5Parser(BaseParser):
         for p in r.glob("*.uplugin"):
             return True
         for p in r.glob("*.pak"):
-            return True
+            if _is_ue_pak(p):
+                return True
         for p in (r / "Content" / "Paks").rglob("*.pak"):
-            return True
+            if _is_ue_pak(p):
+                return True
         for p in (r / "Content" / "Paks").rglob("*.utoc"):
             return True
         for p in r.rglob("*.uasset"):

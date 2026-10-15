@@ -7480,7 +7480,125 @@ init python:
           "with priority, multi-line default, unrpyc comment dedent, end-to-end")
 
 
+def check_ue_pak_detection() -> None:
+    import shutil
+    from parsers.unreal4_5 import UnrealEngine4_5Parser, _is_ue_pak, UE_PAK_MAGIC
+
+    td = tempfile.mkdtemp(prefix="interprex_ue_pak_test_")
+    try:
+        p_td = Path(td)
+        # 1. Chromium data pack: version 4 header, no UE footer
+        res_pak = p_td / "resources.pak"
+        res_pak.write_bytes(b"\x04\x00\x00\x00" + b"\x00" * 1024)
+        assert not _is_ue_pak(res_pak), "resources.pak must NOT be recognized as UE pak"
+        assert not UnrealEngine4_5Parser.detect(td), "Folder with resources.pak must NOT detect as unreal4_5"
+
+        # 2. Genuine UE pak with FPakInfo footer magic
+        ue_pak = p_td / "Game-WindowsNoEditor.pak"
+        # FPakInfo magic in the last 256 bytes
+        ue_pak_payload = b"\x00" * 200 + UE_PAK_MAGIC + b"\x00" * 40
+        ue_pak.write_bytes(ue_pak_payload)
+        assert _is_ue_pak(ue_pak), "Game-WindowsNoEditor.pak with footer magic must be recognized as UE pak"
+        assert UnrealEngine4_5Parser.detect(td), "Folder with genuine UE pak must detect as unreal4_5"
+        print("OK — UE pak detection: reject Chromium pak, accept genuine UE pak footer magic")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def check_tyrano() -> None:
+    import shutil
+    from parsers.tyrano import TyranoParser
+
+    td = tempfile.mkdtemp(prefix="interprex_tyrano_test_")
+    try:
+        p_td = Path(td)
+        # Put dummy Electron files in root to test anti-collision with UE
+        (p_td / "resources.pak").write_bytes(b"\x04\x00\x00\x00" + b"\x00" * 500)
+        (p_td / "chrome_100_percent.pak").write_bytes(b"\x04\x00\x00\x00" + b"\x00" * 500)
+
+        app_dir = p_td / "resources" / "app"
+        tyrano_dir = app_dir / "tyrano"
+        scen_dir = app_dir / "data" / "scenario"
+        sys_dir = scen_dir / "system"
+        css_dir = tyrano_dir / "css"
+        scen_dir.mkdir(parents=True)
+        sys_dir.mkdir(parents=True)
+        css_dir.mkdir(parents=True)
+
+        (tyrano_dir / "tyrano.js").write_text("// tyrano engine", encoding="utf-8")
+        (css_dir / "font.css").write_text("/* original font css */", encoding="utf-8")
+
+        # System scenario (should be skipped)
+        (sys_dir / "_scene1.ks").write_text('[preload storage="img.png"]\n', encoding="utf-8")
+        # Preview scenario (should be skipped)
+        (scen_dir / "_preview.ks").write_text('Duplicated preview text[p]\n', encoding="utf-8")
+
+        # Game scenario
+        sample_ks = scen_dir / "scene1.ks"
+        sample_ks.write_text(
+            '; Comment line to skip\n'
+            '*start\n'
+            '[iscript]\n'
+            'var code = 123;\n'
+            '[endscript]\n'
+            '[tb_start_text mode=1 ]\n'
+            '#Teacher\n'
+            '[emb exp= "f.name" ], Tell the transfer student to come to the office.[p]\n'
+            '#\n'
+            'I looked down at the envelope.[p]\n'
+            '[_tb_end_text]\n'
+            '[tb_ptext_show x="100" y="200" text="Enter your name!→"]\n'
+            '[glink color="btn_26_red" text="Speak" target="*Speak" storage="scene1.ks"]\n',
+            encoding="utf-8",
+        )
+
+        assert detect_engine(td) == "tyrano", f"Expected tyrano, got {detect_engine(td)}"
+        parser = get_parser("tyrano")
+        assert isinstance(parser, TyranoParser)
+
+        strings = parser.extract(td)
+        assert len(strings) == 5, f"Expected 5 strings, got {len(strings)}: {[s.original for s in strings]}"
+
+        # Check stability across runs
+        ids1 = [s.id for s in strings]
+        ids2 = [s.id for s in parser.extract(td)]
+        assert ids1 == ids2, "Tyrano string IDs not stable across runs"
+
+        # Check injection
+        s_map = {s.original: s.id for s in strings}
+        tr = {
+            s_map["Teacher"]: "Учитель",
+            s_map['[emb exp= "f.name" ], Tell the transfer student to come to the office.']: '[emb exp="f.name"], Скажи новенькому зайти в учительскую.',
+            s_map["I looked down at the envelope."]: "Я посмотрел на конверт.",
+            s_map["Enter your name!→"]: "Введите ваше имя!→",
+            s_map["Speak"]: "Заговорить",
+        }
+
+        written = parser.inject(td, tr, target_lang="ru")
+        assert written == 5, f"Expected 5 written, got {written}"
+
+        after_content = sample_ks.read_text(encoding="utf-8")
+        assert "#Учитель" in after_content
+        assert '[emb exp= "f.name" ], Скажи новенькому зайти в учительскую.[p]' in after_content
+        assert "Я посмотрел на конверт.[p]" in after_content
+        assert 'text="Введите ваше имя!→"' in after_content
+        assert 'text="Заговорить" target="*Speak" storage="scene1.ks"' in after_content
+        assert "var code = 123;" in after_content
+
+        # Font & CSS check
+        dest_font = app_dir / "data" / "others" / "InterprexNoto.ttf"
+        assert dest_font.exists(), "InterprexNoto.ttf must be installed"
+        after_css = (css_dir / "font.css").read_text(encoding="utf-8")
+        assert "InterprexNoto" in after_css, "font.css must contain InterprexNoto"
+
+        print("OK — tyrano: detect (over Electron paks), extract, id-stability, UI text preservation, tag repair, font injection")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main() -> int:
+    check_ue_pak_detection()
+    check_tyrano()
     check_epic_games()
     check_steam_games()
     check_prompt_width()
@@ -7563,7 +7681,7 @@ def main() -> int:
     check_unreal4_5_inherited()
     check_unreal4_5_bytepatch()
 
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch + ue-pak-detection + tyrano) + scheduler all pass")
     return 0
 
 

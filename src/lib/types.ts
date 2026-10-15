@@ -30,7 +30,8 @@ export type Engine =
   | "qsp"
   | "sdf7d2d"
   | "twine"
-  | "skyrim";
+  | "skyrim"
+  | "tyrano";
 
 /** Human-readable engine names for the UI. The `Engine` id is byte-stable (it
  *  feeds the stable id hash) and must NEVER change; this label is display-only.
@@ -54,6 +55,7 @@ export const ENGINE_LABELS: Record<Engine, string> = {
   sdf7d2d: "7 Days to Die",
   twine: "Twine",
   skyrim: "Skyrim SE",
+  tyrano: "TyranoBuilder",
 };
 
 /** Display name for an engine, given whether we're translating mods. The only

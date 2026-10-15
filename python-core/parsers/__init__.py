@@ -17,25 +17,30 @@ from .unreal4_5 import UnrealEngine4_5Parser
 from .twine import TwineParser
 from .sdf7d2d import Sdf7d2dParser
 from .skyrim import SkyrimParser
+from .tyrano import TyranoParser
 
-# Order matters only for detect(): first match wins. RPG Maker and Ren'Py key
-# off different marker files/dirs, so the order between them is not significant.
-# Skyrim sits before Unity: a Data/ dump of .esp is unambiguous and must not
-# be swallowed by a looser detector.
+# Order matters only for detect(): first match wins.
+# Tier 1: Exclusive markers (100% unique structure / manifests)
+# Tier 2: Compiled 3D engines with binary signatures
+# Tier 3: Loose source code fallback (CSharpParser sits after Unity to avoid swallowing Unity Managed/ dlls)
 REGISTRY: list[type[BaseParser]] = [
+    # Tier 1
+    TyranoParser,
     RpgMakerParser,
     RenPyParser,
-    CSharpParser,
+    QspParser,
+    TwineParser,
+    Sdf7d2dParser,
+    SkyrimParser,
     I18nParser,
     FusionParser,
     Mmf2Parser,
-    QspParser,
-    SkyrimParser,
+    # Tier 2
     UnrealEngine4_5Parser,
     UnrealParser,
-    Sdf7d2dParser,
     UnityParser,
-    TwineParser,
+    # Tier 3
+    CSharpParser,
 ]
 
 
