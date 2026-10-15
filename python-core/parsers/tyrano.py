@@ -146,7 +146,7 @@ class TyranoParser(BaseParser):
 
         for ks_path in self._iter_ks_files(root):
             rel_file = ks_path.relative_to(r_path).as_posix()
-            if sub_paths is not None:
+            if sub_paths:
                 if not (rel_file in sub_paths or any(rel_file.startswith(sp) for sp in sub_paths)):
                     continue
 
@@ -270,7 +270,7 @@ class TyranoParser(BaseParser):
 
         for ks_path in self._iter_ks_files(root):
             rel_file = ks_path.relative_to(r_path).as_posix()
-            if sub_paths is not None:
+            if sub_paths:
                 if not (rel_file in sub_paths or any(rel_file.startswith(sp) for sp in sub_paths)):
                     continue
 

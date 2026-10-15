@@ -7558,6 +7558,7 @@ def check_tyrano() -> None:
 
         strings = parser.extract(td)
         assert len(strings) == 5, f"Expected 5 strings, got {len(strings)}: {[s.original for s in strings]}"
+        assert len(parser.extract(td, [])) == 5, "extract with empty sub_paths list must not filter out all files"
 
         # Check stability across runs
         ids1 = [s.id for s in strings]
