@@ -292,7 +292,7 @@ def check_renpy_font() -> None:
 
     # Pickle safety stubs must be emitted in init python: so that loading saves
     # from the main menu (before translate blocks run) does not raise AttributeError.
-    init_m = re.search(r'init python:\n(.*?)(?=\ntranslate |\Z)', src, re.S)
+    init_m = re.search(r'init (?:-?\d+\s+)?python:\n(.*?)(?=\ntranslate |\Z)', src, re.S)
     assert init_m, "init python: block missing from _interprex_font.rpy"
     init_body = init_m.group(1)
     for expected_stub in ("_set_dominant_role", "_get_dominant_role", "_set_role_name",
@@ -327,7 +327,7 @@ def check_renpy_font() -> None:
     # add_ping_hyperlinks mock below).
     _ts_ns = {"calls": calls}
     exec(
-        "def translate_string(s):\n"
+        "def translate_string(s, language=None):\n"
         "    calls.append(('trans', s))\n"
         "    if s.startswith('1. '):\n"
         "        return s  # simulate translation missing\n"
@@ -595,6 +595,22 @@ def check_renpy_font() -> None:
     assert _gui.text_font == "default_pixel_font", "gui alias value must be preserved"
     assert _gui.interface_text_font == "fonts/NotoSans-Regular.ttf", \
         "gui direct-file font not repointed"
+
+    # Zero-Store-Pollution & Pickle safety:
+    # 1. No module objects (types, re) leaked into the store environment
+    import types as _t, pickle as _pkl
+    leaked_modules = [k for k, v in env.items() if isinstance(v, _t.ModuleType)]
+    assert not leaked_modules, f"module objects leaked into store: {leaked_modules}"
+
+    # 2. TranslatingString must reduce to pure built-in str on pickle.dumps
+    # (prevents corrupting saves when user removes/restores the translation)
+    ts_cls = env.get("TranslatingString")
+    if ts_cls:
+        test_ts = ts_cls("Sweet Serial Killer")
+        dumped = _pkl.dumps(test_ts)
+        restored = _pkl.loads(dumped)
+        assert restored == "Sweet Serial Killer"
+        assert type(restored) is str, f"TranslatingString must unpickle as str, got {type(restored)}"
 
     # Restore deletes the generated font file (registered type=created).
     from main import backup_restore, BackupRestoreReq
