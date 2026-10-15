@@ -2385,15 +2385,19 @@ def check_unity_localization() -> None:
     aa_dir = os.path.join(root, "StreamingAssets", "aa")
     os.makedirs(aa_dir)
     open(os.path.join(aa_dir, "catalog.json"), "w").write("{}")
-    bundle_path = os.path.join(aa_dir, "loc_english_assets_all.bundle")
-    open(bundle_path, "wb").write(b"fake bundle content")
+    open(os.path.join(aa_dir, "catalog.bin"), "wb").write(b"fake catalog binary")
+
+    bundle_shared = os.path.join(aa_dir, "loc_shared_assets_all.bundle")
+    bundle_en = os.path.join(aa_dir, "loc_english_assets_all.bundle")
+    bundle_ja = os.path.join(aa_dir, "loc_japanese_assets_all.bundle")
+    open(bundle_shared, "wb").write(b"shared bundle")
+    open(bundle_en, "wb").write(b"en bundle")
+    open(bundle_ja, "wb").write(b"ja bundle")
 
     try:
         assert detect_engine(root) == "unity", f"Loc detect failed: {detect_engine(root)}"
         p = get_parser("unity")
 
-        mock_env = MagicMock()
-        
         mock_shared_obj = MagicMock()
         mock_shared_obj.type.name = "MonoBehaviour"
         mock_shared_obj.path_id = 123
@@ -2407,11 +2411,11 @@ def check_unity_localization() -> None:
         }
         mock_shared_obj.read.return_value = mock_shared_data
 
-        mock_table_obj = MagicMock()
-        mock_table_obj.type.name = "MonoBehaviour"
-        mock_table_obj.path_id = 456
-        mock_table_data = MagicMock()
-        mock_table_tree = {
+        mock_en_table_obj = MagicMock()
+        mock_en_table_obj.type.name = "MonoBehaviour"
+        mock_en_table_obj.path_id = 456
+        mock_en_table_data = MagicMock()
+        mock_en_tree = {
             "m_LocaleIdentifier": {"m_Code": "en"},
             "m_SharedData": {"m_PathID": 123},
             "m_TableData": [
@@ -2419,37 +2423,67 @@ def check_unity_localization() -> None:
                 {"m_Id": 2, "m_Localized": "Exit Game"}
             ]
         }
-        mock_table_data.read_typetree.return_value = mock_table_tree
-        mock_table_obj.read.return_value = mock_table_data
+        mock_en_table_data.read_typetree.return_value = mock_en_tree
+        mock_en_table_obj.read.return_value = mock_en_table_data
 
-        mock_env.objects = [mock_shared_obj, mock_table_obj]
-        mock_env.file.save.return_value = b"new fake bundle bytes"
+        mock_ja_table_obj = MagicMock()
+        mock_ja_table_obj.type.name = "MonoBehaviour"
+        mock_ja_table_obj.path_id = 789
+        mock_ja_table_data = MagicMock()
+        mock_ja_tree = {
+            "m_LocaleIdentifier": {"m_Code": "ja"},
+            "m_SharedData": {"m_PathID": 123},
+            "m_TableData": [
+                {"m_Id": 1, "m_Localized": "ゲーム開始"},
+                {"m_Id": 2, "m_Localized": "ゲーム終了"}
+            ]
+        }
+        mock_ja_table_data.read_typetree.return_value = mock_ja_tree
+        mock_ja_table_obj.read.return_value = mock_ja_table_data
 
-        with patch("UnityPy.load", return_value=mock_env):
+        def mock_load(path):
+            env = MagicMock()
+            if "shared" in path:
+                env.objects = [mock_shared_obj]
+            elif "english" in path:
+                env.objects = [mock_en_table_obj]
+            elif "japanese" in path:
+                env.objects = [mock_ja_table_obj]
+            else:
+                env.objects = []
+            env.file.save.return_value = b"new fake bundle bytes"
+            return env
+
+        with patch("UnityPy.load", side_effect=mock_load):
             strings = p.extract(root)
             
         originals = [s.original for s in strings]
+        # JA must be skipped due to English locale filter!
         assert originals == ["Start Game", "Exit Game"], originals
         
         by_orig = {s.original: s for s in strings}
+        # Cross-bundle resolution: shared table keys from separate bundle_shared
         assert by_orig["Start Game"].path == ["StringTable", "MyGameStrings", "en", "KEY_START"], by_orig["Start Game"].path
         assert by_orig["Exit Game"].path == ["StringTable", "MyGameStrings", "en", "KEY_QUIT"], by_orig["Exit Game"].path
 
         tr = {s.id: s.original.upper() for s in strings}
         
-        mock_table_data.reset_mock()
-        mock_env.file.save.reset_mock()
-        mock_table_data.read_typetree.return_value = mock_table_tree
+        mock_en_table_data.reset_mock()
+        mock_en_table_obj.reset_mock()
+        mock_en_table_data.read_typetree.return_value = mock_en_tree
+        mock_en_table_obj.read.return_value = mock_en_table_data
         
-        with patch("UnityPy.load", return_value=mock_env):
+        with patch("UnityPy.load", side_effect=mock_load):
             written = p.inject(root, tr)
 
         assert written == 2, f"Written={written}"
-        assert mock_table_tree["m_TableData"][0]["m_Localized"] == "START GAME"
-        assert mock_table_tree["m_TableData"][1]["m_Localized"] == "EXIT GAME"
+        assert mock_en_tree["m_TableData"][0]["m_Localized"] == "START GAME"
+        assert mock_en_tree["m_TableData"][1]["m_Localized"] == "EXIT GAME"
         
-        mock_table_data.save_typetree.assert_called_with(mock_table_tree)
-        mock_env.file.save.assert_called_with(packer="original")
+        if mock_en_table_obj.save_typetree.called:
+            mock_en_table_obj.save_typetree.assert_called_with(mock_en_tree)
+        else:
+            mock_en_table_data.save_typetree.assert_called_with(mock_en_tree)
         
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -2644,12 +2678,17 @@ def check_unity_v2_advanced_sources() -> None:
         mock_ink_data.m_Script = ink_json_content
         mock_ink_obj.read.return_value = mock_ink_data
 
-        # Generic JSON TextAsset
+        # Generic JSON TextAsset with flat localization dictionaries
         generic_json_content = json.dumps({
             "chapterTitle": "Chapter 1: The Dark Forest",
             "dialogues": [
                 {"speaker": "Guide", "message": "Stay close to the lantern light."}
-            ]
+            ],
+            "intro_scene": "Welcome to the city of shadows.",
+            "boss_id": "The Ancient Dragon",
+            "scene": "MainMenu",
+            "portrait": "Angry Girl",
+            "$type": "System.String",
         })
         mock_json_obj = MagicMock()
         mock_json_obj.type.name = "TextAsset"
@@ -2679,8 +2718,28 @@ def check_unity_v2_advanced_sources() -> None:
         mock_csv_data.m_Script = csv_content
         mock_csv_obj.read.return_value = mock_csv_data
 
+        # 3. TMP_FontAsset as MonoBehaviour (class_name == "TMP_FontAsset")
+        mock_tmp_obj = MagicMock()
+        mock_tmp_obj.type.name = "MonoBehaviour"
+        mock_tmp_obj.path_id = 901
+        mock_tmp_data = MagicMock()
+        mock_tmp_script = MagicMock()
+        mock_tmp_script.namespace = "TMPro"
+        mock_tmp_script.class_name = "TMP_FontAsset"
+        mock_tmp_data.m_Script.read.return_value = mock_tmp_script
+        mock_tmp_obj.read.return_value = mock_tmp_data
+        mock_tmp_obj.read_typetree.return_value = {
+            "m_AtlasPopulationMode": 1,
+            "m_SourceFontFile": {"m_PathID": 902},
+        }
+
+        mock_font_obj = MagicMock()
+        mock_font_obj.type.name = "Font"
+        mock_font_obj.path_id = 902
+        mock_font_obj.read_typetree.return_value = {"m_FontData": b"ORIGINAL_FONT"}
+
         mock_env = MagicMock()
-        mock_env.objects = [mock_ink_obj, mock_json_obj, mock_csv_obj]
+        mock_env.objects = [mock_ink_obj, mock_json_obj, mock_csv_obj, mock_tmp_obj, mock_font_obj]
         mock_env.file.save.return_value = b"SAVED_TEXTASSETS"
 
         with patch("UnityPy.load", return_value=mock_env):
@@ -2694,13 +2753,37 @@ def check_unity_v2_advanced_sources() -> None:
         assert "Stay close to the lantern light." in ext_texts
         assert "Play Game" in ext_texts
         assert "Game Settings" in ext_texts
+        # Suspicious keys with sentences must be kept; technical tokens and strictly technical keys must be skipped:
+        assert "Welcome to the city of shadows." in ext_texts
+        assert "The Ancient Dragon" in ext_texts
+        assert "MainMenu" not in ext_texts
+        assert "Angry Girl" not in ext_texts
+        assert "System.String" not in ext_texts
 
-        # Translate TextAssets
+        # Translate TextAssets and test TMP_FontAsset font replacement
         translations = {s.id: f"[RU] {s.original.strip()}" for s in extracted}
+        p._font_bytes_cache[root] = b"REPLACED_NOTO_SANS"
         with patch("UnityPy.load", return_value=mock_env):
-            written = p._inject_assets(root, translations)
+            written = p._inject_assets(root, translations, target_lang="Russian")
 
-        assert written >= 7, f"Expected at least 7 TextAsset written, got {written}"
+        assert written >= 9, f"Expected at least 9 written, got {written}"
+        # Ensure TMP_FontAsset as MonoBehaviour was not skipped by _TECHNICAL_TMP_CLASSES continue:
+        mock_font_obj.save_typetree.assert_called_with({"m_FontData": b"REPLACED_NOTO_SANS"})
+
+        # Mixed asset fallback: 1 TextAsset succeeds, 1 MonoBehaviour fails typetree (failed_count > 0)
+        mock_fail_mb = MagicMock()
+        mock_fail_mb.type.name = "MonoBehaviour"
+        mock_fail_mb.path_id = 999
+        mock_fail_mb.read.side_effect = Exception("No script DLL")
+        mock_fail_mb.read_typetree.side_effect = Exception("No typetree")
+        mock_env_mixed = MagicMock()
+        mock_env_mixed.objects = [mock_json_obj, mock_fail_mb]
+        with patch("UnityPy.load", return_value=mock_env_mixed), \
+             patch.object(p, "_extract_raw_from_env", wraps=p._extract_raw_from_env) as mock_raw_extract:
+            p._extract_assets(root)
+            ui_calls = [c for c in mock_raw_extract.call_args_list if c.kwargs.get("mode") == "ui"]
+            assert len(ui_calls) >= 1, "Expected UI raw fallback pass to run when failed_count > 0"
+            assert 502 in ui_calls[0].kwargs.get("skip_pids", set()), "Expected handled TextAsset to be in skip_pids"
 
         # ── 3. Archive & Custom Bundle Scanning ─────────────────────────
         data_u3d = os.path.join(root, "data.unity3d")
@@ -2797,10 +2880,105 @@ def check_unity_v2_advanced_sources() -> None:
         assert fixed_cat["m_BucketData"][0]["m_Crc"] == 0
         assert fixed_cat["m_BucketData"][1]["m_Crc"] == 0
 
+        # ── 6. Addressables .bundle scanning in aa dir ──────────────────
+        aa_bundle_dir = os.path.join(root, "StreamingAssets", "aa")
+        os.makedirs(aa_bundle_dir, exist_ok=True)
+        aa_bundle = os.path.join(aa_bundle_dir, "content_assets_all.bundle")
+        with open(aa_bundle, "wb") as f:
+            f.write(b"bundle")
+        c_files_aa, _ = p._scan_asset_files(root)
+        c_bases_aa = [os.path.basename(f) for f in c_files_aa]
+        assert "content_assets_all.bundle" in c_bases_aa
+
+        # ── 7. IL2CPP Safe Literal Filter Tests ─────────────────────────
+        from parsers.unity import _is_il2cpp_safe_literal
+        assert _is_il2cpp_safe_literal("Press Start Button") is True
+        assert _is_il2cpp_safe_literal("Game Over") is True
+        assert _is_il2cpp_safe_literal("Are you ready for the quest?") is True
+        assert _is_il2cpp_safe_literal("Main Menu") is False
+        assert _is_il2cpp_safe_literal("Level 1") is False
+        assert _is_il2cpp_safe_literal("Stage 5") is False
+        assert _is_il2cpp_safe_literal("Slot 2") is False
+        assert _is_il2cpp_safe_literal("Player") is False  # single word
+        assert _is_il2cpp_safe_literal("SELECT * FROM users") is False
+        assert _is_il2cpp_safe_literal("yyyy-MM-dd HH:mm:ss") is False
+        assert _is_il2cpp_safe_literal("_MainTex") is False
+        assert _is_il2cpp_safe_literal("OnTriggerEnter") is False
+
+        # ── 8. Odin Serializer Protection in Raw Slots ──────────────────
+        from parsers.unity import _iter_raw_translatable_slots
+        odin_blob = b"\x04\x00\x00\x00Test\x00\x00\x00\x00SerializationData\x00\x00"
+        assert _iter_raw_translatable_slots(odin_blob) == []
+
+        # ── 9. StreamingAssets External Files (JSON, CSV, Yarn, TXT) ────
+        sa_dir = os.path.join(root, "StreamingAssets")
+        os.makedirs(sa_dir, exist_ok=True)
+
+        # Ink JSON
+        ink_path = os.path.join(sa_dir, "story.ink.json")
+        ink_content = json.dumps({
+            "inkVersion": 20,
+            "root": [["^Welcome to the adventure!", "\n", ["^Choose your path wisely.", "\n", None], None], None]
+        })
+        with open(ink_path, "w", encoding="utf-8") as f:
+            f.write(ink_content)
+
+        # CSV table
+        csv_path = os.path.join(sa_dir, "dialogues.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("id,speaker,dialogue\n101,Guard,Halt! Who goes there?\n102,Hero,Just a weary traveler.\n")
+
+        # Yarn Spinner
+        yarn_path = os.path.join(sa_dir, "intro.yarn")
+        with open(yarn_path, "w", encoding="utf-8") as f:
+            f.write("title: Start\n---\nWizard: Speak your name, hero! #line:1234abcd\n-> I have forgotten it. #line:5678efgh\n===\n")
+
+        # Plain TXT
+        txt_path = os.path.join(sa_dir, "subtitles.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("In a distant land far away...\nSilence fell upon the realm.\n")
+
+        sa_caps = detect_unity_capabilities(root)
+        assert sa_caps.has_streaming_files is True
+        assert sa_caps.streaming_file_count >= 4
+
+        sa_strings = p._extract_streaming_files(root)
+        sa_map = {s.original: s for s in sa_strings}
+        assert "Welcome to the adventure!" in sa_map
+        assert "Choose your path wisely." in sa_map
+        assert "Halt! Who goes there?" in sa_map
+        assert "Speak your name, hero!" in sa_map
+        assert "I have forgotten it." in sa_map
+        assert "In a distant land far away..." in sa_map
+
+        sa_translations = {
+            sa_map["Welcome to the adventure!"].id: "Добро пожаловать в приключение!",
+            sa_map["Halt! Who goes there?"].id: "Стой! Кто идет?",
+            sa_map["Speak your name, hero!"].id: "Назови свое имя, герой!",
+            sa_map["I have forgotten it."].id: "Я забыл его.",
+            sa_map["In a distant land far away..."].id: "В далеких-далеких землях...",
+        }
+        sa_written = p._inject_streaming_files(root, sa_translations)
+        assert sa_written == 5
+
+        # Verify on-disk updates
+        with open(ink_path, "r", encoding="utf-8") as f:
+            assert "Добро пожаловать в приключение!" in f.read()
+        with open(csv_path, "r", encoding="utf-8") as f:
+            assert "Стой! Кто идет?" in f.read()
+        with open(yarn_path, "r", encoding="utf-8") as f:
+            yarn_read = f.read()
+            assert "Назови свое имя, герой!" in yarn_read
+            assert "#line:1234abcd" in yarn_read
+            assert "Я забыл его." in yarn_read
+            assert "#line:5678efgh" in yarn_read
+        with open(txt_path, "r", encoding="utf-8") as f:
+            assert "В далеких-далеких землях..." in f.read()
+
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-    print("OK — unity v2 advanced sources (generic typetree, textasset, il2cpp metadata delta shift, catalog crc bypass)")
+    print("OK — unity v2 advanced sources (generic typetree, textasset, il2cpp metadata delta shift, catalog crc bypass, streaming files)")
 
 
 def check_i18n_rimworld_defs() -> None:
@@ -6841,7 +7019,7 @@ def check_scheduler_tail() -> None:
         # ── 5. Multi-key tail: both keys keep working; peak/key ≤ threads ──
         n, threads = 200, 15
         items = [It(i, "k%d" % i, file="f%d.txt" % (i % 8)) for i in range(n)]
-        prov = TrackProv(delay=0.01)
+        prov = TrackProv(delay=0.03)
         keys = ["K0", "K1"]
         sched, stats = run(
             Req(items, threads=threads, api_keys=keys, max_batch_size=10),

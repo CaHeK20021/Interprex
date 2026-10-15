@@ -32,12 +32,14 @@ from .unity_sources import (
     SOURCE_DLL,
     SOURCE_FONT_GAP,
     SOURCE_IL2CPP_METADATA,
+    SOURCE_STREAMING_FILES,
     SOURCE_STRING_TABLE,
     SOURCE_TYPETREE,
     SOURCE_UI_RAW,
     SOURCE_YAML,
     UnityPipelineReport,
     detect_unity_capabilities,
+    is_valid_streaming_file,
     plan_sources,
 )
 
@@ -57,16 +59,17 @@ SKIP_NAMESPACES = {
     "UnityEngine.Timeline",
     "UnityEngine.Playables",
     "Unity.Collections",
-    "Unity.TextMeshPro",
-    "TMPro",
     "Unity.Analytics",
     "Unity.Services",
     "Newtonsoft.Json",
     "AstarPathfindingProject",
     "Pathfinding",
-    "Naninovel",
-    "Elringus",
 }
+
+_TECHNICAL_TMP_CLASSES = frozenset({
+    "TMP_FontAsset", "TMP_Settings", "TMP_StyleSheet", "TMP_SpriteAsset",
+    "TMP_ColorGradient", "TextMeshProFont",
+})
 
 IGNORE_DIRS = {
     "bin", "obj", ".vs", "node_modules", "venv", ".git", ".interprex_backups", "__macosx"
@@ -511,6 +514,8 @@ def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
 
     Other content: sequential slots that pass the player-facing gate.
     """
+    if b"SerializationData" in raw or b"SerializedBytes" in raw:
+        return []
     nano = _is_naninovel_script_blob(raw)
     seq = _sequential_aligned_strings(raw)
     out: list[tuple[int, str]] = []
@@ -591,6 +596,65 @@ def _is_game_text(text: str) -> bool:
 
     # Title-case singles: no auto-accept (Goto / Master / actor ids).
     return False
+
+
+def _is_il2cpp_safe_literal(s: str) -> bool:
+    """Strict filter for string literals in compiled global-metadata.dat.
+
+    Protects against modifying internal C# symbols:
+    - Scene names ("Main Menu", "Level 1", "TitleScreen")
+    - PlayerPrefs keys, tags, animation states
+    - SQL queries, date formats, shader/material properties
+    - Single-word UI button labels without punctuation ("Play", "Save", "Load")
+    """
+    if not _is_game_text(s):
+        return False
+
+    t = s.strip()
+    words = t.split()
+    if len(words) == 1:
+        # In IL2CPP code, 95% of single words are method names, scene names, tags, PlayerPrefs
+        return False
+
+    low = t.lower()
+
+    # Built-in Unity tags & input axes
+    if low in {
+        "main menu", "mainmenu", "title menu", "boot", "init",
+        "untagged", "respawn", "finish", "editoronly", "maincamera", "gamecontroller",
+        "mouse x", "mouse y", "mouse scrollwheel",
+    }:
+        return False
+
+    # Scene / screen / technical level identifiers (e.g. "Level 1", "Stage 2", "Slot 1", "TitleScreen")
+    if re.search(r"\b(Scene|Screen)\b", t, re.I):
+        return False
+    if re.search(r"^(Level|Stage|Slot)\s+\d+$", t, re.I):
+        return False
+
+    # SQL queries
+    if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE TABLE|DROP TABLE|ALTER TABLE|FROM|WHERE)\b", t, re.I):
+        return False
+
+    # Date / Time format strings (yyyy-MM-dd, HH:mm:ss, etc.)
+    if re.search(r"^(yyyy|MM|dd|HH|mm|ss)[-/ :.A-Za-z0-9%]*$", t):
+        return False
+
+    # Code identifiers / Coroutines / Callbacks:
+    # camelCase or PascalCase with internal capitals without spaces (e.g. "OnTriggerEnter", "FadeInCoroutine")
+    for w in words:
+        if re.search(r"^[a-z]+[A-Z]", w) or re.search(r"^[A-Z][a-z]+[A-Z]", w):
+            return False
+
+    # Shaders, material props, internal tags (starts with _ or contains / or \)
+    if t.startswith("_") or "/" in t or "\\" in t:
+        return False
+
+    # URLs, web protocols, asset extensions
+    if re.search(r"(http|https|ws|wss|file):|\.(unity|prefab|asset|mat|shader|dll|so|json|xml|txt|csv|png|jpg)$", t, re.I):
+        return False
+
+    return True
 
 
 # ── Length-prefix fallback: stricter filter for raw MonoBehaviour bytes ──────
@@ -771,17 +835,10 @@ def _is_game_text_raw(text: str) -> bool:
         "style", "sheet", "settings",
         "alt", "ctrl", "shift", "tab", "escape", "return", "delete",
         "vertical", "horizontal", "submit", "cancel",
-        "beer", "wine", "gin", "milk", "bread", "eggs", "chips",
-        "oranges", "tomatoes", "laptop", "naked", "out", "party",
-        "pushed", "toilet", "work", "university", "groceries",
-        "position", "link", "quote", "title",
-        "smiley", "wink", "whaaat!",
         "new text", "option a", "option b", "option c",
         "tmp settings", "default style sheet", "default sprite asset",
-        "panel title", "dialogue options", "drinking hint",
+        "panel title", "dialogue options",
         "scene name", "slot 1", "char name", "message text",
-        "storage room bj", "start massage", "continue massage",
-        "next foot",
         "blue to purple - vertical", "dark to light green - vertical",
         "light to dark green - vertical", "yellow to orange - vertical",
         "red:", "yellow:", "blue:", "green:", "white:", "black:",
@@ -790,16 +847,8 @@ def _is_game_text_raw(text: str) -> bool:
     }):
         return False
 
-    # ── Multi-line blacklist (long junk that's not dialogue) ────────────────
+    # ── Placeholder / test junk blacklist ───────────────────────────────────
     if low in frozenset({
-        "i can not decline this call",
-        "hold and move in circular motion",
-        "your phone is ringing. close the quest window and press 'o' to open your phone",
-        "when drinking alone and finishing a drink, the other character (including the player) finishes theirs as well but only gains one drunk point",
-        "continue the story (indicates important decision or skip the side dialogues)",
-        "unlocked dialogue through interactions in the world and other dialogues",
-        "regular dialogue (side dialogue)",
-        "starts sexual scene",
         "ghj ghj", "test 1 test 1", "asd hello",
     }):
         return False
@@ -989,16 +1038,53 @@ def _set_typetree_by_path(tree: Any, path_parts: list[str], value: str) -> bool:
     return False
 
 
+_JSON_STRICT_TECHNICAL_KEYS = frozenset({
+    "$type", "m_script", "guid", "hash", "version", "color", "shader", "material", "layer", "tag",
+})
+
+_JSON_SKIP_KEYS = frozenset({
+    "id", "guid", "type", "version", "hash", "key", "$type", "m_script",
+    "scene", "scenename", "prefab", "asset", "path", "file", "filename",
+    "event", "eventname", "audio", "sound", "sfx", "bgm", "music", "voice",
+    "anim", "animation", "animator", "sprite", "image", "icon", "portrait",
+    "texture", "material", "shader", "tag", "layer", "command", "cmd",
+    "action", "method", "callback", "target", "variable", "var", "flag",
+    "condition", "expression", "script", "node", "next", "goto", "branch",
+    "speakerid", "actorid", "characterid", "item_id", "quest_id", "color",
+})
+
+_JSON_ALLOWED_TEXT_SUFFIXES = frozenset({
+    "text", "title", "name", "desc", "caption", "message", "dialogue", "dialog", "content", "string",
+})
+
+
 def _walk_json_leaves(node: Any, path: list[str]) -> list[tuple[list[str], str]]:
     """Recursively find string leaves in generic JSON."""
     out: list[tuple[list[str], str]] = []
     if isinstance(node, dict):
         for k, v in node.items():
-            if k.lower() in ("id", "guid", "type", "version", "hash", "key", "$type", "m_script"):
+            k_low = k.lower()
+            if k_low in _JSON_STRICT_TECHNICAL_KEYS:
                 continue
+
+            is_suspicious_key = (
+                k_low in _JSON_SKIP_KEYS
+                or (
+                    k_low.endswith(("id", "_id", "key", "_key", "path", "file", "prefab", "scene", "sprite", "sound", "sfx", "anim"))
+                    and not any(k_low.endswith(suf) for suf in _JSON_ALLOWED_TEXT_SUFFIXES)
+                )
+            )
+
             if isinstance(v, str):
+                if is_suspicious_key:
+                    v_str = v.strip()
+                    is_sentence = (" " in v_str and len(v_str.split()) >= 3) or any(p in v_str for p in ".?!")
+                    if not is_sentence or "/" in v_str or "\\" in v_str:
+                        continue
                 out.append((path + [k], v))
             elif isinstance(v, (dict, list)):
+                if is_suspicious_key:
+                    continue
                 out.extend(_walk_json_leaves(v, path + [k]))
     elif isinstance(node, list):
         for i, item in enumerate(node):
@@ -1061,6 +1147,68 @@ def _replace_ink_root(root_node: Any, current_idx: list[int], replacements: dict
     return modified
 
 
+def _save_typetree_safe(obj: Any, data: Any, tree: dict) -> None:
+    """Save TypeTree safely across different UnityPy ObjectReader / Object versions."""
+    if hasattr(obj, "save_typetree"):
+        obj.save_typetree(tree)
+    elif data is not None and hasattr(data, "save_typetree"):
+        data.save_typetree(tree)
+    elif hasattr(obj, "save"):
+        obj.save()
+    elif data is not None and hasattr(data, "save"):
+        data.save()
+
+
+def _resolve_shared_table(
+    tree: dict,
+    obj: Any,
+    data: Any,
+    global_shared_tables: dict[int, dict],
+    all_shared_list: list[dict],
+) -> dict:
+    """Resolve matching SharedTableData for a StringTable using path_id, hash overlap, or collection name prefix."""
+    shared_path_id = tree.get("m_SharedData", {}).get("m_PathID")
+    if shared_path_id in global_shared_tables:
+        cand = global_shared_tables[shared_path_id]
+        table_ids = {e.get("m_Id") for e in tree.get("m_TableData", []) if isinstance(e, dict) and "m_Id" in e}
+        if not table_ids or (table_ids & cand["id_to_key"].keys()):
+            return cand
+
+    # Fallback 1: match by 64-bit m_Id key hash intersection
+    table_ids = {e.get("m_Id") for e in tree.get("m_TableData", []) if isinstance(e, dict) and "m_Id" in e}
+    if table_ids:
+        best_match = None
+        best_overlap = 0
+        for cand in all_shared_list:
+            overlap = len(table_ids & cand["id_to_key"].keys())
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_match = cand
+        if best_match is not None and best_overlap > 0:
+            return best_match
+
+    # Fallback 2: match by m_Name prefix (e.g. "UI_Strings_en" or "UI_Strings (en)" starts with "UI_Strings")
+    obj_name = (
+        tree.get("m_Name")
+        or getattr(obj, "name", None)
+        or getattr(data, "name", "")
+        or ""
+    )
+    if obj_name:
+        for cand in all_shared_list:
+            cname = cand.get("name") or ""
+            if cname and (
+                obj_name == cname
+                or obj_name.startswith(cname + "_")
+                or obj_name.startswith(cname + " ")
+                or obj_name.startswith(cname + "-")
+                or obj_name.startswith(cname + "(")
+            ):
+                return cand
+
+    return global_shared_tables.get(shared_path_id, {})
+
+
 def _detect_csv_delim(text: str) -> str | None:
     """Detect CSV delimiter (comma, tab, semicolon) from first non-empty line."""
     for line in text.splitlines():
@@ -1072,6 +1220,65 @@ def _detect_csv_delim(text: str) -> str | None:
         if counts[best] > 0:
             return best
     return None
+
+
+_NON_EN_LANG_SUFFIXES = (
+    "_fr", ".fr", " fr", "-fr",
+    "_de", ".de", " de", "-de",
+    "_es", ".es", " es", "-es",
+    "_ru", ".ru", " ru", "-ru",
+    "_ja", ".ja", " ja", "-ja", "_jp", ".jp", " jp", "-jp",
+    "_zh", ".zh", " zh", "-zh", "_cn", ".cn", " cn", "-cn",
+    "_ko", ".ko", " ko", "-ko", "_kr", ".kr", " kr", "-kr",
+    "_pt", ".pt", " pt", "-pt",
+    "_it", ".it", " it", "-it",
+    "_pl", ".pl", " pl", "-pl",
+    "_tr", ".tr", " tr", "-tr",
+    "_uk", ".uk", " uk", "-uk",
+)
+
+
+def _select_csv_text_columns(header: list[str]) -> list[int]:
+    """Select text columns from CSV header, prioritizing English/source and filtering other languages."""
+    if not header:
+        return []
+
+    cleaned_header = [h.strip().lower() for h in header]
+
+    # 1. Exact or suffix match for English / source columns
+    en_target_names = {
+        "en", "english", "en-us", "en_us", "en-gb", "en_gb",
+        "source", "original", "default",
+        "text_en", "text-en", "dialogue_en", "dialog_en",
+    }
+    en_cols = []
+    for ci, col in enumerate(cleaned_header):
+        if col in en_target_names or col.endswith(("_en", ".en", " en", "-en")):
+            en_cols.append(ci)
+    if en_cols:
+        return en_cols
+
+    # 2. Generic text column names, excluding explicit non-English suffixes
+    generic_target_names = {
+        "text", "value", "translation", "dialogue", "dialog",
+        "content", "string", "caption", "message", "desc", "description",
+    }
+    gen_cols = []
+    for ci, col in enumerate(cleaned_header):
+        if any(col.endswith(suf) or col == suf.strip(" ._-") for suf in _NON_EN_LANG_SUFFIXES):
+            continue
+        if col in generic_target_names or any(tn in col for tn in ("text", "dialog", "content", "message")):
+            gen_cols.append(ci)
+    if gen_cols:
+        return gen_cols
+
+    # 3. Fallback: if 2nd column exists and isn't non-English language tag, use column 1
+    if len(cleaned_header) >= 2:
+        col1 = cleaned_header[1]
+        if not any(col1.endswith(suf) or col1 == suf.strip(" ._-") for suf in _NON_EN_LANG_SUFFIXES):
+            return [1]
+
+    return []
 
 
 def _blob_is_content(raw: bytes) -> bool:
@@ -1501,18 +1708,11 @@ class UnityParser(BaseParser):
     def _scan_asset_files(self, root: str, sub_paths: list[str] | None = None) -> tuple[list[str], list[str]]:
         compiled_files = []
         source_files = []
-        aa_dir = find_aa_dir(root)
-        aa_dir_abs = os.path.abspath(aa_dir) if aa_dir else None
-
         for fpath in iter_files(root, sub_paths):
             f = os.path.basename(fpath)
             f_lower = f.lower()
-            if f_lower == "data.unity3d" or f_lower.endswith(".assetbundle"):
+            if f_lower == "data.unity3d" or f_lower.endswith((".bundle", ".assetbundle")):
                 compiled_files.append(fpath)
-            elif f_lower.endswith(".bundle"):
-                f_abs = os.path.abspath(fpath)
-                if not aa_dir_abs or not f_abs.startswith(aa_dir_abs):
-                    compiled_files.append(fpath)
             elif f_lower.endswith(".assets") or (f_lower.startswith("level") and "." not in f):
                 if not f_lower.endswith(".manifest") and not f_lower.endswith(".resS") and not f_lower.endswith(".resource") and f_lower != "level":
                     compiled_files.append(fpath)
@@ -1647,6 +1847,19 @@ class UnityParser(BaseParser):
                 reason="no Addressables/Localization signal",
             )
 
+        # ── streaming_files (External files under StreamingAssets) ─────────
+        if any(s.id == SOURCE_STREAMING_FILES and s.enabled for s in report.sources):
+            before = len(results)
+            results.extend(self._extract_streaming_files(root, sub_paths))
+            report.record(SOURCE_STREAMING_FILES, len(results) - before, enabled=True)
+        else:
+            report.record(
+                SOURCE_STREAMING_FILES,
+                0,
+                enabled=False,
+                reason="no external text files in StreamingAssets",
+            )
+
         report.finalize(len(results))
         print(f"[unity] {report.summary_line()}", file=sys.stderr)
         for note in caps.notes:
@@ -1726,6 +1939,7 @@ class UnityParser(BaseParser):
 
             failed_count = 0
             typetree_found = 0
+            typetree_handled_pids: set[int] = set()
             env = None
             try:
                 env = UnityPy.load(fpath)
@@ -1743,17 +1957,32 @@ class UnityParser(BaseParser):
                         try:
                             # Skip library classes, handle external script load failures gracefully
                             ns = ""
+                            class_name = ""
                             try:
                                 data = obj.read()
                                 script_data = data.m_Script.read()
                                 ns = getattr(script_data, "namespace", "")
+                                class_name = getattr(script_data, "class_name", "") or getattr(script_data, "m_ClassName", "")
                             except Exception:
                                 pass
 
                             if should_skip_type(ns):
                                 continue
 
+                            if class_name in _TECHNICAL_TMP_CLASSES:
+                                typetree_handled_pids.add(obj.path_id)
+                                continue
+
                             tree = obj.read_typetree()
+
+                            # Unity Localization tables are handled by SOURCE_STRING_TABLE
+                            if ("m_TableData" in tree and "m_LocaleIdentifier" in tree) or (
+                                "m_Entries" in tree and "m_TableCollectionName" in tree
+                            ):
+                                typetree_handled_pids.add(obj.path_id)
+                                continue
+
+                            obj_hits = 0
 
                             # Resolve GameObject name from tree
                             go_name = ""
@@ -1797,6 +2026,7 @@ class UnityParser(BaseParser):
                                         results.append(self._mk(rel_path, path, text, context))
                                         typetree_found += 1
                                         n_typetree += 1
+                                        obj_hits += 1
 
                             # 2. I2 Localization (mTerms / mSource.mTerms)
                             terms_list = None
@@ -1820,6 +2050,7 @@ class UnityParser(BaseParser):
                                                 results.append(self._mk(rel_path, path, val, context))
                                                 typetree_found += 1
                                                 n_typetree += 1
+                                                obj_hits += 1
 
                             # 3. PixelCrushers Dialogue System (conversations -> dialogueEntries -> fields)
                             if "conversations" in tree and isinstance(tree["conversations"], list):
@@ -1856,6 +2087,7 @@ class UnityParser(BaseParser):
                                                                         results.append(self._mk(rel_path, path, val, context))
                                                                         typetree_found += 1
                                                                         n_typetree += 1
+                                                                        obj_hits += 1
 
                             # 4. Generic deep typetree walk for custom ScriptableObjects / MonoBehaviours
                             generic_hits = _walk_typetree_generic(tree, [])
@@ -1876,6 +2108,10 @@ class UnityParser(BaseParser):
                                 results.append(self._mk(rel_path, path, val, context))
                                 typetree_found += 1
                                 n_typetree += 1
+                                obj_hits += 1
+
+                            if obj_hits > 0:
+                                typetree_handled_pids.add(obj.path_id)
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "Text":
@@ -1904,6 +2140,7 @@ class UnityParser(BaseParser):
                                 results.append(self._mk(rel_path, path, text, context))
                                 typetree_found += 1
                                 n_typetree += 1
+                                typetree_handled_pids.add(obj.path_id)
                         except Exception:
                             failed_count += 1
                     elif obj.type.name == "TextAsset":
@@ -1937,6 +2174,7 @@ class UnityParser(BaseParser):
                                 if not asset_name:
                                     asset_name = f"TextAsset_{obj.path_id}"
 
+                                textasset_hits = 0
                                 is_ink = False
                                 if "inkVersion" in script_content and "root" in script_content:
                                     try:
@@ -1952,6 +2190,7 @@ class UnityParser(BaseParser):
                                                     results.append(self._mk(rel_path, path, ink_text, context))
                                                     typetree_found += 1
                                                     n_typetree += 1
+                                                    textasset_hits += 1
                                     except Exception:
                                         pass
 
@@ -1967,6 +2206,7 @@ class UnityParser(BaseParser):
                                                 results.append(self._mk(rel_path, path, val, context))
                                                 typetree_found += 1
                                                 n_typetree += 1
+                                                textasset_hits += 1
                                         is_ink = True
                                     except Exception:
                                         pass
@@ -1979,13 +2219,7 @@ class UnityParser(BaseParser):
                                             rows = list(reader)
                                             if rows:
                                                 header = [h.strip().lower() for h in rows[0]]
-                                                text_col_indices = []
-                                                target_names = {"en", "english", "text", "value", "translation", "dialogue", "dialog", "content", "string", "caption", "message"}
-                                                for ci, col in enumerate(header):
-                                                    if col in target_names or any(tn in col for tn in ("text", "dialog")):
-                                                        text_col_indices.append(ci)
-                                                if not text_col_indices and len(rows[0]) >= 2:
-                                                    text_col_indices.append(1)
+                                                text_col_indices = _select_csv_text_columns(header)
 
                                                 for r_idx in range(1, len(rows)):
                                                     row = rows[r_idx]
@@ -2000,8 +2234,12 @@ class UnityParser(BaseParser):
                                                                 results.append(self._mk(rel_path, path, val, context))
                                                                 typetree_found += 1
                                                                 n_typetree += 1
+                                                                textasset_hits += 1
                                         except Exception:
                                             pass
+
+                                if textasset_hits > 0:
+                                    typetree_handled_pids.add(obj.path_id)
                         except Exception:
                             failed_count += 1
             except Exception as e:
@@ -2013,11 +2251,11 @@ class UnityParser(BaseParser):
             if env is not None:
                 before_c = len(results)
                 content_n = self._extract_raw_from_env(
-                    env, fpath, root, results, mode="content"
+                    env, fpath, root, results, mode="content", skip_pids=typetree_handled_pids
                 )
                 n_content += len(results) - before_c
                 # content_n is added count; keep using len(results) for accuracy
-                if typetree_found == 0 and failed_count > 0:
+                if failed_count > 0:
                     print(
                         f"Typetree failed for {failed_count} objects in "
                         f"{os.path.basename(fpath)}; content-blob hit {content_n}, "
@@ -2030,7 +2268,7 @@ class UnityParser(BaseParser):
                     ui_raw_ran = True
                     before_u = len(results)
                     self._extract_raw_from_env(
-                        env, fpath, root, results, mode="ui"
+                        env, fpath, root, results, mode="ui", skip_pids=typetree_handled_pids
                     )
                     n_ui_raw += len(results) - before_u
                 elif failed_count > 0:
@@ -2101,6 +2339,7 @@ class UnityParser(BaseParser):
         root: str,
         results: list[TranslationString],
         mode: str = "content",
+        skip_pids: set[int] | None = None,
     ) -> int:
         """Length-prefix extract from MonoBehaviours already loaded in ``env``.
 
@@ -2132,11 +2371,15 @@ class UnityParser(BaseParser):
             for obj in env.objects:
                 if obj.type.name != "MonoBehaviour":
                     continue
+                if skip_pids and obj.path_id in skip_pids:
+                    continue
                 try:
                     raw = obj.get_raw_data()
                 except Exception:
                     continue
                 if len(raw) < 20:
+                    continue
+                if b"m_TableCollectionName" in raw or b"m_LocaleIdentifier" in raw:
                     continue
 
                 is_content = _blob_is_content(raw)
@@ -2211,14 +2454,14 @@ class UnityParser(BaseParser):
 
         return added
 
-    def _extract_raw_fallback(self, fpath: str, root: str) -> list[TranslationString]:
+    def _extract_raw_fallback(self, fpath: str, root: str, skip_pids: set[int] | None = None) -> list[TranslationString]:
         """Legacy entry: full raw scan (content + ui). Prefer _extract_raw_from_env."""
         results: list[TranslationString] = []
         try:
             import UnityPy
             env = UnityPy.load(fpath)
-            self._extract_raw_from_env(env, fpath, root, results, mode="content")
-            self._extract_raw_from_env(env, fpath, root, results, mode="ui")
+            self._extract_raw_from_env(env, fpath, root, results, mode="content", skip_pids=skip_pids)
+            self._extract_raw_from_env(env, fpath, root, results, mode="ui", skip_pids=skip_pids)
         except Exception as e:
             print(f"Error in raw fallback for {fpath}: {e}", file=sys.stderr)
         return results
@@ -2258,6 +2501,10 @@ class UnityParser(BaseParser):
                     continue
                 if len(raw) < 20:
                     continue
+                if b"SerializationData" in raw or b"SerializedBytes" in raw:
+                    continue
+                if b"m_TableCollectionName" in raw or b"m_LocaleIdentifier" in raw:
+                    continue
 
                 # Same slot set as extract. Extra belt: never write engine ids
                 # even if a stale project.json still maps them to RU.
@@ -2295,6 +2542,18 @@ class UnityParser(BaseParser):
                     out.extend(_pack_aligned_string(replacements[offset]))
                     pos = aligned_end
                 out.extend(raw[pos:])
+
+                if len(out) % 4 != len(raw) % 4:
+                    pad_diff = (len(raw) % 4 - len(out) % 4) % 4
+                    out.extend(b"\x00" * pad_diff)
+
+                if len(out) % 4 != len(raw) % 4:
+                    print(
+                        f"Skipping raw injection path_id={obj.path_id} in "
+                        f"{os.path.basename(fpath)}: 4-byte alignment mismatch",
+                        file=sys.stderr,
+                    )
+                    continue
 
                 try:
                     obj.set_raw_data(bytes(out))
@@ -2378,14 +2637,18 @@ class UnityParser(BaseParser):
             print("UnityPy is not installed. Skipping Addressables bundles.", file=sys.stderr)
             return []
 
-        results = []
-        for bundle_path in find_aa_bundles(root):
-            rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+        aa_bundles = find_aa_bundles(root)
+        if not aa_bundles:
+            return []
+
+        # Phase 1: Collect global SharedTableData across ALL bundles, and gather available locales
+        global_shared_tables: dict[int, dict] = {}
+        all_shared_list: list[dict] = []
+        available_locales: set[str] = set()
+
+        for bundle_path in aa_bundles:
             try:
                 env = UnityPy.load(bundle_path)
-
-                # Phase 1: collect SharedTableData (id -> keyName)
-                shared_tables: dict[int, dict] = {}
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -2393,14 +2656,31 @@ class UnityParser(BaseParser):
                         data = obj.read()
                         tree = data.read_typetree()
                         if "m_Entries" in tree and "m_TableCollectionName" in tree:
-                            shared_tables[obj.path_id] = {
-                                "name": tree["m_TableCollectionName"],
-                                "id_to_key": {e["m_Id"]: e["m_Key"] for e in tree["m_Entries"]},
+                            col_name = tree.get("m_TableCollectionName") or ""
+                            entries = tree.get("m_Entries", [])
+                            tbl_info = {
+                                "name": col_name,
+                                "id_to_key": {e["m_Id"]: e["m_Key"] for e in entries if "m_Id" in e and "m_Key" in e},
                             }
+                            global_shared_tables[obj.path_id] = tbl_info
+                            all_shared_list.append(tbl_info)
+                        elif "m_TableData" in tree and "m_LocaleIdentifier" in tree:
+                            loc_code = tree.get("m_LocaleIdentifier", {}).get("m_Code", "")
+                            if loc_code:
+                                available_locales.add(loc_code.lower())
                     except Exception:
                         pass
+            except Exception:
+                pass
 
-                # Phase 2: extract StringTable
+        has_english = any(loc.startswith("en") for loc in available_locales)
+
+        # Phase 2: Extract StringTables
+        results = []
+        for bundle_path in aa_bundles:
+            rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+            try:
+                env = UnityPy.load(bundle_path)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -2410,11 +2690,16 @@ class UnityParser(BaseParser):
                         if "m_TableData" not in tree or "m_LocaleIdentifier" not in tree:
                             continue
 
-                        locale = tree["m_LocaleIdentifier"].get("m_Code", "")
-                        shared_path_id = tree.get("m_SharedData", {}).get("m_PathID")
-                        shared = shared_tables.get(shared_path_id, {})
+                        raw_locale = tree["m_LocaleIdentifier"].get("m_Code", "")
+                        locale = raw_locale.lower()
+
+                        # Locale filter: If English exists, only extract English (and blank) tables
+                        if has_english and locale and not locale.startswith("en"):
+                            continue
+
+                        shared = _resolve_shared_table(tree, obj, data, global_shared_tables, all_shared_list)
                         id_to_key = shared.get("id_to_key", {})
-                        collection_name = shared.get("name") or obj.name or "Unknown"
+                        collection_name = shared.get("name") or getattr(obj, "name", None) or getattr(data, "name", None) or "Unknown"
 
                         for entry in tree["m_TableData"]:
                             value = entry.get("m_Localized", "")
@@ -2422,8 +2707,8 @@ class UnityParser(BaseParser):
                                 continue
                             entry_id = entry["m_Id"]
                             key_name = id_to_key.get(entry_id, str(entry_id))
-                            path = ["StringTable", collection_name, locale, key_name]
-                            context = f"Collection: {collection_name}, Locale: {locale}, Key: {key_name}"
+                            path = ["StringTable", collection_name, raw_locale, key_name]
+                            context = f"Collection: {collection_name}, Locale: {raw_locale}, Key: {key_name}"
                             results.append(self._mk(rel_path, path, value, context))
                     except Exception:
                         pass
@@ -2470,6 +2755,19 @@ class UnityParser(BaseParser):
                 0,
                 enabled=False,
                 reason="no Addressables/Localization signal",
+            )
+
+        # ── streaming_files (External files under StreamingAssets) ─────────
+        if any(s.id == SOURCE_STREAMING_FILES and s.enabled for s in report.sources):
+            n = self._inject_streaming_files(root, translations, target_lang, sub_paths)
+            written += n
+            report.record(SOURCE_STREAMING_FILES, n, enabled=True)
+        else:
+            report.record(
+                SOURCE_STREAMING_FILES,
+                0,
+                enabled=False,
+                reason="no external text files in StreamingAssets",
             )
 
         report.finalize(written)
@@ -2579,21 +2877,62 @@ class UnityParser(BaseParser):
                 typetree_modified_pids: set[int] = set()
 
                 for obj in env.objects:
+                    class_name = ""
+                    data = None
                     if obj.type.name in ("MonoBehaviour", "Text"):
                         try:
                             if obj.type.name == "MonoBehaviour":
                                 ns = ""
+                                class_name = ""
                                 try:
                                     data = obj.read()
                                     script_data = data.m_Script.read()
                                     ns = getattr(script_data, "namespace", "")
+                                    class_name = getattr(script_data, "class_name", "") or getattr(script_data, "m_ClassName", "")
                                 except Exception:
                                     pass
 
                                 if should_skip_type(ns):
                                     continue
 
+                                if class_name == "TMP_FontAsset":
+                                    if font_bytes:
+                                        try:
+                                            tree = None
+                                            if hasattr(obj, "read_typetree"):
+                                                try:
+                                                    tree = obj.read_typetree()
+                                                except Exception:
+                                                    pass
+                                            if tree is None and data is not None and hasattr(data, "read_typetree"):
+                                                tree = data.read_typetree()
+                                            if tree:
+                                                pop_mode = tree.get("m_AtlasPopulationMode", 0)
+                                                src_font = tree.get("m_SourceFontFile")
+                                                font_pid = src_font.get("m_PathID") if isinstance(src_font, dict) else None
+                                                if font_pid:
+                                                    fonts_to_replace.add(font_pid)
+                                                elif pop_mode == 0:
+                                                    print(
+                                                        f"[font] Static TMP_FontAsset '{getattr(data, 'name', obj.path_id)}' "
+                                                        f"in {os.path.basename(fpath)}: left intact (relying on PPtr donor remap).",
+                                                        file=sys.stderr,
+                                                    )
+                                        except Exception:
+                                            pass
+                                    continue
+
+                                if class_name in _TECHNICAL_TMP_CLASSES:
+                                    continue
+
                                 tree = obj.read_typetree()
+
+                                # Unity Localization tables are handled by SOURCE_STRING_TABLE
+                                if ("m_TableData" in tree and "m_LocaleIdentifier" in tree) or (
+                                    "m_Entries" in tree and "m_TableCollectionName" in tree
+                                ):
+                                    typetree_modified_pids.add(obj.path_id)
+                                    continue
                             else:
                                 data = obj.read()
                                 tree = data.read_typetree()
@@ -2682,10 +3021,7 @@ class UnityParser(BaseParser):
                                         n_typetree += 1
 
                             if obj_modified:
-                                if obj.type.name == "MonoBehaviour":
-                                    obj.save_typetree(tree)
-                                else:
-                                    data.save_typetree(tree)
+                                _save_typetree_safe(obj, data, tree)
                                 changed = True
                                 typetree_modified_pids.add(obj.path_id)
                         except Exception:
@@ -2776,13 +3112,7 @@ class UnityParser(BaseParser):
                                             csv_written = 0
                                             if rows:
                                                 header = [h.strip().lower() for h in rows[0]]
-                                                text_col_indices = []
-                                                target_names = {"en", "english", "text", "value", "translation", "dialogue", "dialog", "content", "string", "caption", "message"}
-                                                for ci, col in enumerate(header):
-                                                    if col in target_names or any(tn in col for tn in ("text", "dialog")):
-                                                        text_col_indices.append(ci)
-                                                if not text_col_indices and len(rows[0]) >= 2:
-                                                    text_col_indices.append(1)
+                                                text_col_indices = _select_csv_text_columns(header)
 
                                                 for r_idx in range(1, len(rows)):
                                                     row = rows[r_idx]
@@ -2812,7 +3142,7 @@ class UnityParser(BaseParser):
                                     if tree is not None:
                                         try:
                                             tree["m_Script"] = script_content
-                                            obj.save_typetree(tree)
+                                            _save_typetree_safe(obj, data, tree)
                                             saved = True
                                         except Exception:
                                             pass
@@ -2829,9 +3159,14 @@ class UnityParser(BaseParser):
                                             pass
                                     if not saved:
                                         try:
-                                            raw_bytes = script_content.encode("utf-8")
-                                            obj.set_raw_data(struct.pack("<I", len(raw_bytes)) + raw_bytes)
-                                            saved = True
+                                            orig_raw = bytes(obj.get_raw_data())
+                                            if len(orig_raw) >= 4:
+                                                name_len = struct.unpack_from("<I", orig_raw, 0)[0]
+                                                name_end = _aligned_string_end(0, name_len)
+                                                if name_end <= len(orig_raw):
+                                                    new_raw = orig_raw[:name_end] + _pack_aligned_string(script_content)
+                                                    obj.set_raw_data(new_raw)
+                                                    saved = True
                                         except Exception:
                                             pass
                                     changed = True
@@ -2839,20 +3174,31 @@ class UnityParser(BaseParser):
                         except Exception:
                             failed_count += 1
 
-                    if obj.type.name == "TMP_FontAsset" and font_bytes:
+                    if (obj.type.name == "TMP_FontAsset" or class_name == "TMP_FontAsset") and font_bytes:
                         try:
                             data = obj.read()
                             tree = data.read_typetree()
                             pop_mode = tree.get("m_AtlasPopulationMode", 0)
                             
+                            src_font = tree.get("m_SourceFontFile")
+                            font_pid = src_font.get("m_PathID") if isinstance(src_font, dict) else None
+
                             if pop_mode == 1:
-                                src_font = tree.get("m_SourceFontFile")
-                                if src_font and isinstance(src_font, dict):
-                                    path_id = src_font.get("m_PathID")
-                                    if path_id:
-                                        fonts_to_replace.add(path_id)
-                            else:
-                                print(f"[WARNING] Static TMP_FontAsset '{data.name}' detected in {fpath}. Fallback requires atlas rebuild.", file=sys.stderr)
+                                if font_pid:
+                                    fonts_to_replace.add(font_pid)
+                            elif pop_mode == 0:
+                                # For static fonts, do NOT blind-convert m_AtlasPopulationMode to 1,
+                                # because uncleaned glyph/character tables and non-readable textures
+                                # corrupt runtime rendering. If the static font points to a TTF font,
+                                # queue the TTF font for NotoSans replacement without breaking the TMP asset.
+                                if font_pid:
+                                    fonts_to_replace.add(font_pid)
+                                else:
+                                    print(
+                                        f"[font] Static TMP_FontAsset '{getattr(data, 'name', obj.path_id)}' "
+                                        f"in {os.path.basename(fpath)}: left intact (relying on PPtr donor remap).",
+                                        file=sys.stderr,
+                                    )
                         except Exception:
                             failed_count += 1
 
@@ -2861,6 +3207,7 @@ class UnityParser(BaseParser):
                 if fonts_to_replace and font_bytes and (script is not None or target_lang is None):
                     for obj in env.objects:
                         if obj.type.name == "Font" and obj.path_id in fonts_to_replace:
+                            data = None
                             try:
                                 tree = obj.read_typetree()
                                 blob = bytes(tree.get("m_FontData") or b"")
@@ -2871,7 +3218,7 @@ class UnityParser(BaseParser):
                                     tree["m_FontData"] = list(font_bytes)
                                 else:
                                     tree["m_FontData"] = font_bytes
-                                obj.save_typetree(tree)
+                                _save_typetree_safe(obj, data, tree)
                                 changed = True
                                 typetree_modified_pids.add(obj.path_id)
                             except Exception:
@@ -2989,6 +3336,15 @@ class UnityParser(BaseParser):
             else:
                 report.record(SOURCE_YAML, 0, enabled=False, reason="no YAML assets")
 
+        if written > 0:
+            aa_dir = find_aa_dir(root)
+            if aa_dir:
+                for dirpath, _, filenames in os.walk(aa_dir):
+                    for f in filenames:
+                        if f.startswith("catalog") and f.endswith(".json"):
+                            cat_file = os.path.join(dirpath, f)
+                            self._disable_catalog_crc(cat_file)
+
         return written
 
     def _replace_font_pptrs(
@@ -3023,6 +3379,9 @@ class UnityParser(BaseParser):
         Legacy ``UnityEngine.UI.Text`` Font PPtrs are left alone — Naninovel /
         modern UI is TMP, and wrong-type Font remaps are how we ate glyphs.
         """
+        f_lower = os.path.basename(fpath).lower()
+        if f_lower.endswith((".bundle", ".assetbundle")) or f_lower == "data.unity3d":
+            return
         script = _target_script(target_lang)
         if not script:
             return
@@ -3219,15 +3578,17 @@ class UnityParser(BaseParser):
         except ImportError:
             return 0
 
-        written = 0
-        for bundle_path in find_aa_bundles(root):
-            rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+        aa_bundles = find_aa_bundles(root)
+        if not aa_bundles:
+            return 0
+
+        # Phase 1: Collect global SharedTableData across ALL bundles
+        global_shared_tables: dict[int, dict] = {}
+        all_shared_list: list[dict] = []
+
+        for bundle_path in aa_bundles:
             try:
                 env = UnityPy.load(bundle_path)
-                changed = False
-
-                # Collect SharedTableData
-                shared_tables: dict[int, dict] = {}
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -3235,14 +3596,27 @@ class UnityParser(BaseParser):
                         data = obj.read()
                         tree = data.read_typetree()
                         if "m_Entries" in tree and "m_TableCollectionName" in tree:
-                            shared_tables[obj.path_id] = {
-                                "name": tree["m_TableCollectionName"],
-                                "id_to_key": {e["m_Id"]: e["m_Key"] for e in tree["m_Entries"]},
+                            col_name = tree.get("m_TableCollectionName") or ""
+                            entries = tree.get("m_Entries", [])
+                            tbl_info = {
+                                "name": col_name,
+                                "id_to_key": {e["m_Id"]: e["m_Key"] for e in entries if "m_Id" in e and "m_Key" in e},
                             }
+                            global_shared_tables[obj.path_id] = tbl_info
+                            all_shared_list.append(tbl_info)
                     except Exception:
                         pass
+            except Exception:
+                pass
 
-                # Inject into StringTable
+        # Phase 2: Inject into StringTables
+        written = 0
+        for bundle_path in aa_bundles:
+            rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+            try:
+                env = UnityPy.load(bundle_path)
+                changed = False
+
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -3252,11 +3626,10 @@ class UnityParser(BaseParser):
                         if "m_TableData" not in tree or "m_LocaleIdentifier" not in tree:
                             continue
 
-                        locale = tree["m_LocaleIdentifier"].get("m_Code", "")
-                        shared_path_id = tree.get("m_SharedData", {}).get("m_PathID")
-                        shared = shared_tables.get(shared_path_id, {})
+                        raw_locale = tree["m_LocaleIdentifier"].get("m_Code", "")
+                        shared = _resolve_shared_table(tree, obj, data, global_shared_tables, all_shared_list)
                         id_to_key = shared.get("id_to_key", {})
-                        collection_name = shared.get("name") or obj.name or "Unknown"
+                        collection_name = shared.get("name") or getattr(obj, "name", None) or getattr(data, "name", None) or "Unknown"
 
                         entry_modified = False
                         for entry in tree["m_TableData"]:
@@ -3265,7 +3638,7 @@ class UnityParser(BaseParser):
                                 continue
                             entry_id = entry["m_Id"]
                             key_name = id_to_key.get(entry_id, str(entry_id))
-                            path = ["StringTable", collection_name, locale, key_name]
+                            path = ["StringTable", collection_name, raw_locale, key_name]
                             sid = make_id(self.engine, rel_path, path, value)
                             if sid in translations:
                                 entry["m_Localized"] = translations[sid]
@@ -3273,7 +3646,7 @@ class UnityParser(BaseParser):
                                 written += 1
 
                         if entry_modified:
-                            data.save_typetree(tree)
+                            _save_typetree_safe(obj, data, tree)
                             changed = True
                     except Exception:
                         pass
@@ -3296,9 +3669,20 @@ class UnityParser(BaseParser):
             if aa_dir:
                 for dirpath, _, filenames in os.walk(aa_dir):
                     for f in filenames:
+                        cat_file = os.path.join(dirpath, f)
                         if f.startswith("catalog") and f.endswith(".json"):
-                            cat_file = os.path.join(dirpath, f)
                             self._disable_catalog_crc(cat_file)
+                        elif f.startswith("catalog") and f.endswith(".bin"):
+                            print(
+                                f"[catalog] Addressables binary catalog detected: {f}. "
+                                "CRC check is compiled into catalog.bin; if the game fails to load modified bundles, "
+                                "CRC verification must be disabled in runtime Addressables settings.",
+                                file=sys.stderr,
+                            )
+                            if hasattr(self, "last_report") and self.last_report and hasattr(self.last_report, "caps"):
+                                self.last_report.caps.notes.append(
+                                    f"Binary Addressables catalog ({f}) detected: runtime CRC verification might be enforced."
+                                )
 
         return written
 
@@ -3403,7 +3787,7 @@ class UnityParser(BaseParser):
                 chunk = raw[data_offset + data_idx : data_offset + data_idx + length]
                 try:
                     s = chunk.decode("utf-8")
-                    if _is_game_text(s):
+                    if _is_il2cpp_safe_literal(s):
                         path = ["Il2CppMetadata", str(idx)]
                         ctx = f"IL2CPP StringLiteral #{idx}, File: {os.path.basename(gm_path)}"
                         results.append(self._mk(rel_path, path, s, ctx))
@@ -3477,8 +3861,14 @@ class UnityParser(BaseParser):
             new_data_size = len(new_data)
             delta = new_data_size - data_size
 
-            # The header ends at the start of the first data section (lit_offset)
-            header_end = min(lit_offset, 512)
+            header_end = min(lit_offset, data_offset)
+            for p in range(8, min(len(raw), 512), 8):
+                if p >= header_end:
+                    break
+                sec_off, sec_sz = struct.unpack_from("<II", raw, p)
+                if sec_sz > 0 and 128 <= sec_off <= len(raw):
+                    if sec_off < header_end:
+                        header_end = sec_off
             for p in range(8, header_end, 8):
                 sec_off = struct.unpack_from("<I", raw, p)[0]
                 if sec_off >= data_offset + data_size:
@@ -3499,3 +3889,344 @@ class UnityParser(BaseParser):
         except Exception as e:
             print(f"Error injecting IL2CPP metadata {gm_path}: {e}", file=sys.stderr)
             return 0
+
+    def _find_streaming_assets_dirs(self, root: str) -> list[str]:
+        sa_dirs: list[str] = []
+        try:
+            for name in os.listdir(root):
+                full = os.path.join(root, name)
+                if not os.path.isdir(full):
+                    continue
+                if name.lower() == "streamingassets":
+                    sa_dirs.append(full)
+                elif name.lower().endswith("_data") or name.lower() == "data":
+                    cand = os.path.join(full, "StreamingAssets")
+                    if os.path.isdir(cand):
+                        sa_dirs.append(cand)
+        except OSError:
+            pass
+        return sa_dirs
+
+    def _iter_streaming_files(self, root: str, sub_paths: list[str] | None = None) -> list[str]:
+        files: list[str] = []
+        for sa in self._find_streaming_assets_dirs(root):
+            for dp, dn, filenames in os.walk(sa):
+                if os.path.basename(dp).lower() == "aa" or "/aa/" in dp.replace("\\", "/").lower():
+                    continue
+                for f in filenames:
+                    fpath = os.path.join(dp, f)
+                    rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+                    if sub_paths and not any(rel_path.startswith(sp.replace("\\", "/")) for sp in sub_paths):
+                        continue
+                    if is_valid_streaming_file(fpath, rel_path):
+                        files.append(fpath)
+        return files
+
+    def _extract_streaming_files(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
+        self._current_root = root
+        results: list[TranslationString] = []
+        for fpath in self._iter_streaming_files(root, sub_paths):
+            rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+            base = os.path.basename(fpath)
+            fl = base.lower()
+
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(fpath, "r", encoding="latin-1") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+            if not content.strip():
+                continue
+
+            # 1. JSON (Ink or Generic)
+            if fl.endswith(".json"):
+                is_ink = False
+                if "inkVersion" in content and "root" in content:
+                    try:
+                        ink_data = json.loads(content)
+                        if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
+                            is_ink = True
+                            ink_hits = _walk_ink_root(ink_data.get("root"), [0])
+                            for idx, raw_ink_text in ink_hits:
+                                ink_text = raw_ink_text[1:]
+                                if _is_game_text(ink_text):
+                                    path = ["StreamingFile", "ink", str(idx)]
+                                    ctx = f"StreamingAsset (Ink): {base}, Index: {idx}"
+                                    results.append(self._mk(rel_path, path, ink_text, ctx))
+                    except Exception:
+                        pass
+
+                if not is_ink:
+                    try:
+                        json_obj = json.loads(content)
+                        leaves = _walk_json_leaves(json_obj, [])
+                        for jpath, val in leaves:
+                            if _is_game_text(val):
+                                dot_path = ".".join(jpath)
+                                path = ["StreamingFile", "json", dot_path]
+                                ctx = f"StreamingAsset (JSON): {base}, Path: {dot_path}"
+                                results.append(self._mk(rel_path, path, val, ctx))
+                    except Exception:
+                        pass
+
+            # 2. CSV / TSV
+            elif fl.endswith((".csv", ".tsv")):
+                delim = "\t" if fl.endswith(".tsv") else _detect_csv_delim(content)
+                if delim:
+                    try:
+                        reader = csv.reader(io.StringIO(content), delimiter=delim)
+                        rows = list(reader)
+                        if rows:
+                            header = [h.strip().lower() for h in rows[0]]
+                            text_col_indices = _select_csv_text_columns(header)
+
+                            for r_idx in range(1, len(rows)):
+                                row = rows[r_idx]
+                                key_prefix = row[0] if len(row) > 0 else str(r_idx)
+                                for ci in text_col_indices:
+                                    if ci < len(row):
+                                        val = row[ci]
+                                        if val and _is_game_text(val):
+                                            col_name = header[ci] if ci < len(header) else str(ci)
+                                            path = ["StreamingFile", "csv", str(r_idx), str(ci)]
+                                            ctx = f"StreamingAsset (CSV): {base}, Row: {r_idx} (key={key_prefix}), Col: {col_name}"
+                                            results.append(self._mk(rel_path, path, val, ctx))
+                    except Exception:
+                        pass
+
+            # 3. Yarn Spinner
+            elif fl.endswith(".yarn"):
+                lines = content.splitlines()
+                for line_idx, line in enumerate(lines):
+                    sline = line.strip()
+                    if not sline or sline.startswith("//") or sline.startswith("<<") or sline.startswith("===") or sline.startswith("---"):
+                        continue
+                    if ":" in sline and any(sline.lower().startswith(k) for k in ("title:", "tags:", "position:", "colorid:")):
+                        continue
+
+                    # Separate #tag and //comment at end of line so #line:xxx is preserved
+                    tag_match = re.search(r"(\s+#[^\s]+.*|\s+//.*)$", sline)
+                    clean_line = sline[:tag_match.start()] if tag_match else sline
+                    clean_line = clean_line.strip()
+                    if not clean_line:
+                        continue
+
+                    if clean_line.startswith("->"):
+                        choice_text = clean_line[2:].strip()
+                        if _is_game_text(choice_text):
+                            path = ["StreamingFile", "yarn", str(line_idx)]
+                            ctx = f"StreamingAsset (Yarn Choice): {base}, Line: {line_idx + 1}"
+                            results.append(self._mk(rel_path, path, choice_text, ctx))
+                    elif ":" in clean_line:
+                        speaker, text_part = clean_line.split(":", 1)
+                        text_part = text_part.strip()
+                        if _is_game_text(text_part):
+                            path = ["StreamingFile", "yarn", str(line_idx)]
+                            ctx = f"StreamingAsset (Yarn): {base}, Speaker: {speaker.strip()}, Line: {line_idx + 1}"
+                            results.append(self._mk(rel_path, path, text_part, ctx))
+                    elif _is_game_text(clean_line):
+                        path = ["StreamingFile", "yarn", str(line_idx)]
+                        ctx = f"StreamingAsset (Yarn): {base}, Line: {line_idx + 1}"
+                        results.append(self._mk(rel_path, path, clean_line, ctx))
+
+            # 4. Plain text
+            elif fl.endswith(".txt"):
+                lines = content.splitlines()
+                for line_idx, line in enumerate(lines):
+                    sline = line.strip()
+                    if sline and _is_game_text(sline):
+                        path = ["StreamingFile", "txt", str(line_idx)]
+                        ctx = f"StreamingAsset (TXT): {base}, Line: {line_idx + 1}"
+                        results.append(self._mk(rel_path, path, sline, ctx))
+
+        return results
+
+    def _inject_streaming_files(
+        self,
+        root: str,
+        translations: dict[str, str],
+        target_lang: str | None = None,
+        sub_paths: list[str] | None = None,
+    ) -> int:
+        self._current_root = root
+        written = 0
+        for fpath in self._iter_streaming_files(root, sub_paths):
+            rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+            base = os.path.basename(fpath)
+            fl = base.lower()
+
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(fpath, "r", encoding="latin-1") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+            except Exception:
+                continue
+
+            if not content.strip():
+                continue
+
+            modified = False
+            file_written = 0
+            new_content = None
+
+            # 1. JSON (Ink or Generic)
+            if fl.endswith(".json"):
+                is_ink = False
+                if "inkVersion" in content and "root" in content:
+                    try:
+                        ink_data = json.loads(content)
+                        if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
+                            is_ink = True
+                            ink_hits = _walk_ink_root(ink_data.get("root"), [0])
+                            ink_replacements: dict[int, str] = {}
+                            for idx, raw_ink_text in ink_hits:
+                                ink_text = raw_ink_text[1:]
+                                path = ["StreamingFile", "ink", str(idx)]
+                                sid = make_id(self.engine, rel_path, path, ink_text)
+                                if sid in translations:
+                                    ink_replacements[idx] = translations[sid]
+                            if ink_replacements:
+                                if _replace_ink_root(ink_data.get("root"), [0], ink_replacements):
+                                    new_content = json.dumps(ink_data, ensure_ascii=False)
+                                    modified = True
+                                    file_written += len(ink_replacements)
+                    except Exception:
+                        pass
+
+                if not is_ink:
+                    try:
+                        json_obj = json.loads(content)
+                        leaves = _walk_json_leaves(json_obj, [])
+                        j_hits = 0
+                        for jpath, orig_val in leaves:
+                            dot_path = ".".join(jpath)
+                            path = ["StreamingFile", "json", dot_path]
+                            sid = make_id(self.engine, rel_path, path, orig_val)
+                            if sid in translations:
+                                if _set_typetree_by_path(json_obj, jpath, translations[sid]):
+                                    j_hits += 1
+                        if j_hits > 0:
+                            new_content = json.dumps(json_obj, ensure_ascii=False, indent=2)
+                            modified = True
+                            file_written += j_hits
+                    except Exception:
+                        pass
+
+            # 2. CSV / TSV
+            elif fl.endswith((".csv", ".tsv")):
+                delim = "\t" if fl.endswith(".tsv") else _detect_csv_delim(content)
+                if delim:
+                    try:
+                        reader = csv.reader(io.StringIO(content), delimiter=delim)
+                        rows = list(reader)
+                        c_hits = 0
+                        if rows:
+                            header = [h.strip().lower() for h in rows[0]]
+                            text_col_indices = _select_csv_text_columns(header)
+
+                            for r_idx in range(1, len(rows)):
+                                row = rows[r_idx]
+                                for ci in text_col_indices:
+                                    if ci < len(row):
+                                        orig_val = row[ci]
+                                        path = ["StreamingFile", "csv", str(r_idx), str(ci)]
+                                        sid = make_id(self.engine, rel_path, path, orig_val)
+                                        if sid in translations:
+                                            row[ci] = translations[sid]
+                                            c_hits += 1
+
+                        if c_hits > 0:
+                            out_io = io.StringIO()
+                            writer = csv.writer(out_io, delimiter=delim, lineterminator="\n")
+                            writer.writerows(rows)
+                            new_content = out_io.getvalue()
+                            modified = True
+                            file_written += c_hits
+                    except Exception:
+                        pass
+
+            # 3. Yarn Spinner
+            elif fl.endswith(".yarn"):
+                lines = content.splitlines()
+                y_hits = 0
+                for line_idx, line in enumerate(lines):
+                    sline = line.strip()
+                    if not sline or sline.startswith("//") or sline.startswith("<<") or sline.startswith("===") or sline.startswith("---"):
+                        continue
+                    if ":" in sline and any(sline.lower().startswith(k) for k in ("title:", "tags:", "position:", "colorid:")):
+                        continue
+
+                    # Separate #tag and //comment at end of line so #line:xxx is preserved
+                    tag_match = re.search(r"(\s+#[^\s]+.*|\s+//.*)$", sline)
+                    yarn_suffix = tag_match.group(1) if tag_match else ""
+                    clean_line = sline[:tag_match.start()] if tag_match else sline
+                    clean_line = clean_line.strip()
+                    if not clean_line:
+                        continue
+
+                    if clean_line.startswith("->"):
+                        choice_text = clean_line[2:].strip()
+                        path = ["StreamingFile", "yarn", str(line_idx)]
+                        sid = make_id(self.engine, rel_path, path, choice_text)
+                        if sid in translations:
+                            prefix = line[:line.index("->") + 2]
+                            lines[line_idx] = f"{prefix} {translations[sid]}{yarn_suffix}"
+                            y_hits += 1
+                    elif ":" in clean_line:
+                        speaker, text_part = clean_line.split(":", 1)
+                        path = ["StreamingFile", "yarn", str(line_idx)]
+                        sid = make_id(self.engine, rel_path, path, text_part.strip())
+                        if sid in translations:
+                            prefix = line[:line.index(":") + 1]
+                            lines[line_idx] = f"{prefix} {translations[sid]}{yarn_suffix}"
+                            y_hits += 1
+                    else:
+                        path = ["StreamingFile", "yarn", str(line_idx)]
+                        sid = make_id(self.engine, rel_path, path, clean_line)
+                        if sid in translations:
+                            indent = line[:len(line) - len(line.lstrip())]
+                            lines[line_idx] = f"{indent}{translations[sid]}{yarn_suffix}"
+                            y_hits += 1
+                if y_hits > 0:
+                    new_content = "\n".join(lines)
+                    modified = True
+                    file_written += y_hits
+
+            # 4. Plain text
+            elif fl.endswith(".txt"):
+                lines = content.splitlines()
+                t_hits = 0
+                for line_idx, line in enumerate(lines):
+                    sline = line.strip()
+                    if sline:
+                        path = ["StreamingFile", "txt", str(line_idx)]
+                        sid = make_id(self.engine, rel_path, path, sline)
+                        if sid in translations:
+                            indent = line[:len(line) - len(line.lstrip())]
+                            trailing = line[len(line.rstrip()):]
+                            lines[line_idx] = f"{indent}{translations[sid]}{trailing}"
+                            t_hits += 1
+                if t_hits > 0:
+                    new_content = "\n".join(lines)
+                    modified = True
+                    file_written += t_hits
+
+            if modified and new_content is not None:
+                self.backup_file(root, fpath)
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                written += file_written
+
+        return written

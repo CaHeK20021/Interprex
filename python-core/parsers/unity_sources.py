@@ -34,6 +34,7 @@ SOURCE_CONTENT = "content_blob"
 SOURCE_UI_RAW = "ui_raw"
 SOURCE_YAML = "yaml_prefab"
 SOURCE_STRING_TABLE = "string_table"
+SOURCE_STREAMING_FILES = "streaming_files"
 SOURCE_FONT_GAP = "font_gap"
 
 # Ordered for reports (extract order where it matters).
@@ -45,6 +46,7 @@ SOURCE_ORDER: tuple[str, ...] = (
     SOURCE_UI_RAW,
     SOURCE_YAML,
     SOURCE_STRING_TABLE,
+    SOURCE_STREAMING_FILES,
     SOURCE_FONT_GAP,
 )
 
@@ -77,11 +79,48 @@ SOURCE_META: dict[str, dict[str, str]] = {
         "title": "Localization tables",
         "summary": "Addressables StringTable / Unity Localization entries.",
     },
+    SOURCE_STREAMING_FILES: {
+        "title": "StreamingAssets external files",
+        "summary": "External text/JSON/CSV/Yarn files under StreamingAssets/ (dialogues, configs).",
+    },
     SOURCE_FONT_GAP: {
         "title": "Font script gap",
         "summary": "Inject-only: TMP victim→donor PPtr remap outside font bodies.",
     },
 }
+
+_STREAMING_IGNORE_EXACT = frozenset({
+    "catalog", "settings", "config", "manifest", "readme", "license",
+    "credits", "changelog", "patchnotes", "version", "steam_appid",
+    "graphics", "graphic", "input", "keybinds", "keybind", "save",
+    "profile", "boot", "boot.config", "unityservicesprojectconfiguration",
+})
+
+_STREAMING_IGNORE_PREFIXES = (
+    "catalog_", "catalog.", "settings_", "config_", "manifest_",
+    "readme", "license", "changelog", "patchnotes", "steam_appid",
+)
+
+_STREAMING_TXT_ALLOW_HINTS = (
+    "loc", "lang", "text", "dialog", "story", "script", "sub",
+    "quest", "item", "ui", "en", "string", "translation",
+)
+
+
+def is_valid_streaming_file(fpath: str, rel_path: str = "") -> bool:
+    """Filter out engine configs, licenses, logs, and technical manifests from StreamingAssets."""
+    base = os.path.basename(fpath)
+    fl = base.lower()
+    f_stem = os.path.splitext(fl)[0]
+    if f_stem in _STREAMING_IGNORE_EXACT or fl in _STREAMING_IGNORE_EXACT:
+        return False
+    if any(f_stem.startswith(p) or fl.startswith(p) for p in _STREAMING_IGNORE_PREFIXES):
+        return False
+    if fl.endswith(".txt"):
+        full_rel = (rel_path or fpath).lower().replace("\\", "/")
+        if not any(hint in full_rel for hint in _STREAMING_TXT_ALLOW_HINTS):
+            return False
+    return fl.endswith((".json", ".csv", ".tsv", ".yarn", ".txt"))
 
 
 @dataclass
@@ -92,6 +131,7 @@ class UnityCapabilities:
     has_compiled_assets: bool = False
     has_yaml_assets: bool = False
     has_addressables: bool = False
+    has_streaming_files: bool = False
     has_il2cpp: bool = False
     has_mono_managed: bool = False
     # Middleware hints from Managed DLL *filenames* (not content).
@@ -100,6 +140,7 @@ class UnityCapabilities:
     marker_yarn: bool = False
     marker_localization: bool = False  # Unity.Localization* dll
     game_dll_count: int = 0
+    streaming_file_count: int = 0
     managed_dir: str | None = None
     aa_dir: str | None = None
     notes: list[str] = field(default_factory=list)
@@ -323,13 +364,36 @@ def detect_unity_capabilities(
         elif fl.startswith("level") and "." not in fl:
             caps.has_compiled_assets = True
         elif fl == "data.unity3d" or fl.endswith((".bundle", ".assetbundle")):
-            if "/aa/" not in fpath.replace("\\", "/").lower():
-                caps.has_compiled_assets = True
+            caps.has_compiled_assets = True
         if fl.endswith((".unity", ".prefab", ".asset")):
             caps.has_yaml_assets = True
 
     caps.game_dll_count = dll_n
     caps.has_game_dlls = dll_n > 0
+
+    streaming_n = 0
+    sa_dirs = []
+    try:
+        for name in os.listdir(root):
+            if name.lower() == "streamingassets" and os.path.isdir(os.path.join(root, name)):
+                sa_dirs.append(os.path.join(root, name))
+            elif name.lower().endswith("_data") and os.path.isdir(os.path.join(root, name)):
+                cand = os.path.join(root, name, "StreamingAssets")
+                if os.path.isdir(cand):
+                    sa_dirs.append(cand)
+        for sa in sa_dirs:
+            for dp, dn, filenames in os.walk(sa):
+                if os.path.basename(dp).lower() == "aa" or "/aa/" in dp.replace("\\", "/").lower():
+                    continue
+                for f in filenames:
+                    fpath = os.path.join(dp, f)
+                    rel_path = os.path.relpath(fpath, root).replace("\\", "/")
+                    if is_valid_streaming_file(fpath, rel_path):
+                        streaming_n += 1
+    except OSError:
+        pass
+    caps.streaming_file_count = streaming_n
+    caps.has_streaming_files = streaming_n > 0
 
     if caps.has_il2cpp and not caps.has_mono_managed:
         caps.notes.append(
@@ -400,6 +464,14 @@ def plan_sources(caps: UnityCapabilities, *, phase: str) -> UnityPipelineReport:
         )
     else:
         report.plan_disabled(SOURCE_STRING_TABLE, "no Addressables/Localization signal")
+
+    if caps.has_streaming_files:
+        report.plan_enabled(
+            SOURCE_STREAMING_FILES,
+            f"{caps.streaming_file_count} external file(s) in StreamingAssets",
+        )
+    else:
+        report.plan_disabled(SOURCE_STREAMING_FILES, "no external text files in StreamingAssets")
 
     if phase == "inject":
         # Font gap only when we might write assets and target script needs it —
