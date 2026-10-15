@@ -1021,7 +1021,7 @@ class TranslationScheduler:
                     b_est = max(1, math.ceil(rem / max(1.0, effective_avg)))
 
                     # Если идет кластерный шторм или мы на хвосте (<= max_batch_size) при сбоях,
-                    # разрешаем работу СТРОГО 1 воркеру во всем пуле (включая in_flight)!
+                    # разрешаем работу СТРОГО 1 воркеру во всем пуле (и в in_flight, и на кулдауне)!
                     if self.cluster_error_streak >= 3 or (
                         (rem + self.in_flight * effective_avg) <= (self.req.max_batch_size or 30)
                         and self.cluster_error_streak >= 1
@@ -1030,6 +1030,7 @@ class TranslationScheduler:
                             if self._run_done_locked():
                                 return (_DONE, None)
                             return (_REST, None)
+                        b_est = 1  # Только 1 свободный воркер (rank 0) ждет кулдаун и зондирует кластер!
 
                     # Ранг среди СВОБОДНЫХ воркеров сравнивается с числом доступных батчей в пуле (b_est)
                     if self._effective_rank_locked(worker_idx) >= b_est:
@@ -2126,19 +2127,23 @@ class TranslationScheduler:
         stagger_offset = (self.delay_seconds * thread_rank / self.threads
                           if self.delay_seconds > 0 and self.threads > 1 else 0.0)
         self._initial_stagger(worker_idx)
+        is_resting = False
         while not self._is_aborted():
             kind, payload = self.claim_batch(worker_idx, cal, worker_key)
             if kind == _DONE:
                 self._emit(worker_idx, "done", status="Done")
                 return
             if kind == _REST:
-                self._emit(worker_idx, "resting", status="Resting")
+                if not is_resting:
+                    self._emit(worker_idx, "resting", status="Resting")
+                    is_resting = True
                 # Block until state changes (a peer finished or reclaimed), so a
                 # resting worker neither busy-spins nor misses returned work.
                 with self.cond:
                     if not self._run_done_locked():
                         self.cond.wait(timeout=0.5)
                 continue
+            is_resting = False
 
             _fname, batch = payload
             batch = self._shrink_overflow_exact(batch, cal, worker_key, _fname)
@@ -2179,7 +2184,10 @@ class TranslationScheduler:
                 self._emit(worker_idx, "error", status="Error: key failed")
                 return
 
-            self._pace_delay(worker_idx, t0, stagger_offset)
+            # Если воркер добровольно сдал батч (Tail Storm Yield: tr_map пуст и не safety_skip),
+            # не держим его на RPM-паузе, чтобы карточка мгновенно перешла в Resting!
+            if tr_map or _safety:
+                self._pace_delay(worker_idx, t0, stagger_offset)
 
     # -- the public stream ------------------------------------------------------
 
