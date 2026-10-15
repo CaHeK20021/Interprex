@@ -7625,7 +7625,13 @@ def check_tyrano() -> None:
         after_content2 = sample_ks.read_text(encoding="utf-8")
         assert "#Преподаватель" in after_content2
 
-        print("OK — tyrano: detect, extract, id-stability, UI text preservation, tag repair, font injection, idempotent inject, pose suffix, @-tags")
+        # Extract after inject must still recover original English strings via backup
+        strings_after_inject = parser.extract(td)
+        assert [s.original for s in strings_after_inject] == [s.original for s in strings], (
+            "Extract after inject must recover original strings from backup"
+        )
+
+        print("OK — tyrano: detect, extract, id-stability, UI text preservation, tag repair, font injection, idempotent inject, pose suffix, @-tags, backup recovery")
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

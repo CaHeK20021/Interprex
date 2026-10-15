@@ -187,10 +187,17 @@ class TyranoParser(BaseParser):
                 if not (rel_file in sub_paths or any(rel_file.startswith(sp) for sp in sub_paths)):
                     continue
 
-            try:
-                lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
-            except Exception:
-                continue
+            orig_bytes = read_backup_original(root, rel_file)
+            if orig_bytes is not None:
+                try:
+                    lines = orig_bytes.decode("utf-8-sig", errors="replace").splitlines(keepends=True)
+                except Exception:
+                    lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
+            else:
+                try:
+                    lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
+                except Exception:
+                    continue
 
             in_script = False
             in_html = False
