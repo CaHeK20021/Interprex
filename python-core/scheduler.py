@@ -496,6 +496,9 @@ class TranslationScheduler:
         # keys are unaffected) — so with 2+ keys each waits exactly as long as ITS
         # OWN provider quota demands, no more. Guarded by self.cond.
         self.key_cooldown: dict[str, float] = {}
+        self.cluster_error_streak = 0
+        self.cluster_cooldown_until = 0.0
+        self.skipped_ids: set[str] = set()
         # Per-key TPM ledger: committed (ts, tokens) spends in the last 60s, plus
         # reserved tokens for in-flight sends so sibling threads can't over-book.
         self.key_token_events: dict[str, list[tuple[float, int]]] = {}
@@ -1000,18 +1003,23 @@ class TranslationScheduler:
                     if self.should_pause():
                         break
 
-                    # Honour this key's cooldown without blocking other keys: a short
-                    # timed wait on the shared condition lets sibling keys proceed.
-                    cd = self.key_cooldown.get(worker_key, 0.0)
+                    # Honour this key's cooldown and cluster outage cooldown without blocking other keys:
+                    # a short timed wait on the shared condition lets sibling keys proceed.
+                    cd = max(self.key_cooldown.get(worker_key, 0.0), self.cluster_cooldown_until)
                     wait_for = cd - time.time()
                     if wait_for > 0:
                         wait_left = int(math.ceil(wait_for))
                         if wait_for >= 1.5:
                             bnum = self.worker_batch_no.get(worker_idx, 0)
+                            status_msg = (
+                                f"Cluster cooldown ({wait_left}s left)..."
+                                if cd == self.cluster_cooldown_until and self.cluster_error_streak >= 3
+                                else f"Key cooldown ({wait_left}s left)..."
+                            )
                             self._emit(
                                 worker_idx,
                                 "waiting_delay",
-                                status=f"Key cooldown ({wait_left}s left)...",
+                                status=status_msg,
                                 wait_left=wait_left,
                                 batch_num=bnum or None,
                             )
@@ -1031,9 +1039,10 @@ class TranslationScheduler:
                     # Priority ramp-down: with B_est batches left, only the B_est
                     # highest-priority LIVE workers should engage. avg_batch_items is a
                     # shared running estimate (exact count is unknowable cheaply with
-                    # adaptive sizing). Rank is computed among alive workers so a dead
-                    # key's slots don't pin live workers in permanent rest.
-                    b_est = max(1, math.ceil(rem / max(1.0, self.avg_batch_items)))
+                    # adaptive sizing). Bound by at least 50% max_batch_size to protect
+                    # the tail from over-concurrency when tiny fragments appear.
+                    effective_avg = max(self.avg_batch_items, float(self.req.max_batch_size or 30) * 0.5)
+                    b_est = max(1, math.ceil(rem / max(1.0, effective_avg)))
                     if self._effective_rank_locked(worker_idx) >= b_est:
                         if self._run_done_locked():
                             return (_DONE, None)
@@ -1196,11 +1205,18 @@ class TranslationScheduler:
             self.in_flight_workers.discard(worker_idx)
             if tr_map:
                 self.result.update(tr_map)
-                a = 0.4
-                self.avg_batch_items = (
-                    (1 - a) * self.avg_batch_items + a * len(batch)
-                )
-            if not safety_skip and not self.aborted:
+                # Only update avg_batch_items if this batch wasn't a tiny tail fragment
+                # (< half of max_batch_size), so late small batches don't collapse
+                # the estimate and cause tail dogpiling.
+                min_update_sz = (self.req.max_batch_size or 30) // 2
+                if len(batch) >= min_update_sz:
+                    a = 0.4
+                    self.avg_batch_items = (
+                        (1 - a) * self.avg_batch_items + a * len(batch)
+                    )
+            if safety_skip:
+                self.skipped_ids.update(it.id for it in batch)
+            elif not self.aborted:
                 leftover = [it for it in batch if it.id not in tr_map]
                 max_reclaims = max(2, len(self.keys_to_use) + 1)
                 for it in reversed(leftover):
@@ -1320,7 +1336,8 @@ class TranslationScheduler:
         batch_tr: dict[str, str] = {}
         last_err = None
         auth_fails = 0  # consecutive auth-class failures → kill the key fast
-        server_fails = 0  # consecutive server-class failures → split batch
+        server_500_hits = 0  # cumulative server-class failures on this batch life
+        splits_done = 0  # max 1 split per batch life to avoid cascade bisection into dust
 
         for try_i in range(BATCH_TRIES):
             if self._is_aborted() or worker_key in self.dead_keys:
@@ -1384,6 +1401,8 @@ class TranslationScheduler:
                     )
                     tpm_held = False
                 with self.cond:
+                    # Reset cluster streak on any successful translation
+                    self.cluster_error_streak = 0
                     # Observe under the lock: this is the SHARED calibrator.
                     cal.observe(prompt_chars, tr.usage)
                     self.tok_in += tr.usage.prompt_tokens
@@ -1459,14 +1478,41 @@ class TranslationScheduler:
                         self.batches += 1
                     return ({}, False, True)
 
-                # Split batch on repeated server / parse glitches (e.g. Gemini 500 FSM parser crash):
+                # Cluster-wide outage detector:
+                if reached and kind in ("server", "overload", "rate"):
+                    with self.cond:
+                        self.cluster_error_streak += 1
+                        if self.cluster_error_streak >= 3:
+                            # Cluster-wide outage/overload detected across threads/keys.
+                            # Set global cooldown (10s, 20s, up to 30s) so all workers back off together
+                            # instead of amplifying load with rapid retry storms.
+                            cluster_cd = min(30.0, 6.0 + self.cluster_error_streak * 2.0)
+                            self.cluster_cooldown_until = max(
+                                self.cluster_cooldown_until,
+                                time.time() + cluster_cd,
+                            )
+
+                # Smart bisection and toxic-batch protection:
+                # 1) Do NOT reset server_500_hits on 503 or 429! Cumulative count per batch.
+                # 2) Never split batches < 10 into 1-string dust.
+                # 3) Max 1 split per batch life (splits_done == 0). If it still fails, it's server/cluster, not size.
+                # 4) If cluster is down (streak >= 4), forbid splitting to prevent request amplification storm.
+                # 5) If toxic batch causes repeated 500s while cluster is healthy, safety_skip to protect the run.
                 if kind in ("server", "other") and reached:
-                    server_fails += 1
-                    if server_fails >= 2 and len(batch) > 1:
+                    server_500_hits += 1
+                    with self.cond:
+                        curr_streak = self.cluster_error_streak
+
+                    if (
+                        server_500_hits >= 2
+                        and splits_done == 0
+                        and len(batch) >= 10
+                        and curr_streak < 4
+                    ):
                         mid = len(batch) // 2
                         leftover = batch[mid:]
                         del batch[mid:]
-                        server_fails = 0
+                        splits_done += 1
                         with self.cond:
                             for it in reversed(leftover):
                                 fn = self.item_file.get(it.id, "")
@@ -1481,18 +1527,18 @@ class TranslationScheduler:
                             "[Worker %d] Repeated %s error; split batch in half (%d kept, %d returned to pool)",
                             worker_idx, kind, len(batch), len(leftover),
                         )
-                    elif server_fails >= 5 and len(batch) == 1:
-                        # Single toxic string causing repeated 500: skip to keep key alive
+                    elif (
+                        server_500_hits >= (5 if len(batch) == 1 else 6)
+                        and curr_streak < 4
+                    ):
                         logger.warning(
-                            "[Worker %d] Single item '%s' caused 5x %s errors; skipping to keep key alive.",
-                            worker_idx, batch[0].id, kind,
+                            "[Worker %d] Batch caused %d repeated %s errors while cluster is alive; skipping via safety_skip to protect run.",
+                            worker_idx, server_500_hits, kind,
                         )
                         with self.cond:
                             self.errors.append(f"[Worker {worker_idx + 1}] {e}")
                             self.batches += 1
                         return ({}, False, True)
-                else:
-                    server_fails = 0
 
                 if kind == "auth":
                     # An invalid/expired key won't fix itself this run. Give it a
@@ -1570,6 +1616,10 @@ class TranslationScheduler:
                                     time.time() + rate_floor,
                                 )
                     floor = rate_floor
+                    with self.cond:
+                        cluster_rem = self.cluster_cooldown_until - time.time()
+                        if cluster_rem > 0:
+                            floor = max(floor, cluster_rem)
                     # Stagger sibling retries so threads that all hit an error at
                     # once don't re-fire in lockstep (which would just re-trigger
                     # the same rate limit). Spread evenly across the full delay
@@ -1586,11 +1636,15 @@ class TranslationScheduler:
                         fast_retry=(kind == "server" or not reached),
                     )
 
-        # Exhausted all retries → this key is dead (circuit breaker FAIL_STREAK=1).
+        # Exhausted all retries on server / network / overload errors.
+        # NEVER kill the API key for server-side outages (500/503/429/network).
+        # Mark safety_skip=True so untranslated strings are preserved as original,
+        # batches count is preserved, and the key remains healthy!
         if last_err is not None:
             with self.cond:
-                self.errors.append(f"[Worker {worker_idx + 1}] {last_err}")
-        return ({}, True, False)
+                self.errors.append(f"[Worker {worker_idx + 1}] Exhausted retries ({last_err})")
+                self.batches += 1
+        return ({}, False, True)
 
     # Width slack before re-asking: only kerning/shaping (advance widths sum
     # slightly looser than real layout). The old 1.1 absorbed the len()-vs-px
@@ -1755,7 +1809,7 @@ class TranslationScheduler:
                     )
             if cfg and getattr(cfg, "api_key", None):
                 with self.cond:
-                    cd = self.key_cooldown.get(cfg.api_key, 0.0)
+                    cd = max(self.key_cooldown.get(cfg.api_key, 0.0), self.cluster_cooldown_until)
                 wait = cd - time.time()
                 if wait > 0:
                     time.sleep(wait)
@@ -2125,7 +2179,7 @@ class TranslationScheduler:
             # Auto-finish sweep: any rep still missing (e.g. its key died mid-run)
             # gets one more pass on the keys that are still alive.
             if not self._is_aborted():
-                missing = [it for it in self.reps if it.id not in self.result]
+                missing = [it for it in self.reps if it.id not in self.result and it.id not in self.skipped_ids]
                 alive_keys = [k for k in self.keys_to_use if k not in self.dead_keys]
                 if missing and alive_keys:
                     logger.info("Sweep: re-attempting %d missing strings.", len(missing))

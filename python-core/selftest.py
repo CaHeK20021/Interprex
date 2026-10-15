@@ -5379,6 +5379,7 @@ def check_scheduler() -> None:
 
     Uses a fake provider so it's offline and ~instant; retry back-off is zeroed."""
     import json
+    import math
     import threading
     import time
     import scheduler
@@ -5815,6 +5816,37 @@ def check_scheduler() -> None:
         sf = final.get("size_fixes") or {}
         assert "2" in sf and 0.0 < sf["2"] < 1.0, \
             f"un-shortenable caption must record a shrink factor <1.0, got {sf}"
+        # Server 500 error exhausted retries does NOT kill key (safety_skip keeps key alive)
+        class Server500Provider(FakeProvider):
+            def translate(self, batch, lang, glossary, cfg, engine=""):
+                raise RuntimeError("Gemini API error (500): Internal error encountered.")
+
+        saved_batch_tries = scheduler.BATCH_TRIES
+        try:
+            scheduler.BATCH_TRIES = 2
+            items = [It(i, "err%d" % i) for i in range(5)]
+            final = run(Req(items, threads=1), Server500Provider())
+            assert final is not None, "500 failure run must finish"
+            assert final["errors"], "errors must be logged"
+        finally:
+            scheduler.BATCH_TRIES = saved_batch_tries
+
+        # Cluster outage streak & cooldown unit checks
+        sched_c = scheduler.TranslationScheduler(Req([It(1, "x")], threads=1), should_pause=lambda: False)
+        assert sched_c.cluster_error_streak == 0
+        assert sched_c.cluster_cooldown_until == 0.0
+
+        # Tail effective_avg prevents tail dogpiling
+        r_tail = Req([It(i, "t%d" % i) for i in range(15)])
+        r_tail.max_batch_size = 30
+        sched_tail = scheduler.TranslationScheduler(r_tail, should_pause=lambda: False)
+        sched_tail.avg_batch_items = 1.0  # simulate polluted avg from tiny fragments
+        with sched_tail.cond:
+            sched_tail.pool = scheduler.OrderedDict({"f.txt": [It(i, "t%d" % i) for i in range(15)]})
+            rem = sched_tail._remaining_locked()
+            effective_avg = max(sched_tail.avg_batch_items, float(sched_tail.req.max_batch_size or 30) * 0.5)
+            b_est = max(1, math.ceil(rem / max(1.0, effective_avg)))
+            assert b_est == 1, f"b_est must be 1 for 15 remaining items with max_batch_size=30, got {b_est}"
     finally:
         (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
          scheduler._RATE_COOLDOWN_NO_RPM_S, scheduler.get_provider) = saved
