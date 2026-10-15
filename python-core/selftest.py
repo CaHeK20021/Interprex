@@ -298,7 +298,8 @@ def check_renpy_font() -> None:
     for expected_stub in ("_set_dominant_role", "_get_dominant_role", "_set_role_name",
                           "_get_role_name", "_ix_ts_wrapper", "_ix_aph_wrapper",
                           "_get_who_typing_translated", "_interprex_orig_aph",
-                          "_interprex_orig_translate_string", "TranslatingString"):
+                          "_interprex_orig_translate_string", "TranslatingString",
+                          "_ix_run_translate_setup"):
         assert expected_stub in init_body, f"pickle safety stub {expected_stub} missing from init python:"
 
     # Execute the first translate-python block twice against a fake engine that
@@ -411,6 +412,8 @@ def check_renpy_font() -> None:
     }
 
 
+    init_body_dedented = "\n".join(l[4:] if l.startswith("    ") else l for l in init_body.split("\n"))
+    exec(init_body_dedented, env)
     exec(body, env)   # run 1
     exec(body, env)   # run 2 — must NOT raise (idempotent)
 
@@ -467,6 +470,7 @@ def check_renpy_font() -> None:
     }
     sep_globals["config"].font_name_map = {}
     sep_locals = {}
+    exec(init_body_dedented, sep_globals)
     exec(body, sep_globals, sep_locals)
     _SR = sep_globals["ServerRole"]
     _CC = sep_globals["ChatCharacter"]
