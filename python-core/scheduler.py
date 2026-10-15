@@ -499,6 +499,7 @@ class TranslationScheduler:
         self.cluster_error_streak = 0
         self.cluster_cooldown_until = 0.0
         self.skipped_ids: set[str] = set()
+        self.split_item_ids: set[str] = set()
         # Per-key TPM ledger: committed (ts, tokens) spends in the last 60s, plus
         # reserved tokens for in-flight sends so sibling threads can't over-book.
         self.key_token_events: dict[str, list[tuple[float, int]]] = {}
@@ -1493,27 +1494,38 @@ class TranslationScheduler:
                             )
 
                 # Smart bisection and toxic-batch protection:
-                # 1) Do NOT reset server_500_hits on 503 or 429! Cumulative count per batch.
+                # 1) Do NOT accumulate server_500_hits when cluster is down (curr_streak >= 3)!
+                #    If the cluster is down, errors are cluster-wide, not batch toxicity.
                 # 2) Never split batches < 10 into 1-string dust.
-                # 3) Max 1 split per batch life (splits_done == 0). If it still fails, it's server/cluster, not size.
-                # 4) If cluster is down (streak >= 4), forbid splitting to prevent request amplification storm.
+                # 3) Max 1 split per string life across ALL workers (self.split_item_ids).
+                # 4) If cluster is down (streak >= 3), forbid splitting to prevent request amplification storm.
                 # 5) If toxic batch causes repeated 500s while cluster is healthy, safety_skip to protect the run.
                 if kind in ("server", "other") and reached:
-                    server_500_hits += 1
                     with self.cond:
                         curr_streak = self.cluster_error_streak
+                        already_split = any(it.id in self.split_item_ids for it in batch)
+
+                    if curr_streak < 3:
+                        server_500_hits += 1
+                    else:
+                        # Cluster is in an outage storm — clear batch-level strike counter
+                        # so that once the cluster recovers, this batch is not falsely dropped!
+                        server_500_hits = 0
 
                     if (
                         server_500_hits >= 2
                         and splits_done == 0
+                        and not already_split
                         and len(batch) >= 10
-                        and curr_streak < 4
+                        and curr_streak < 3
                     ):
                         mid = len(batch) // 2
                         leftover = batch[mid:]
                         del batch[mid:]
                         splits_done += 1
                         with self.cond:
+                            self.split_item_ids.update(it.id for it in batch)
+                            self.split_item_ids.update(it.id for it in leftover)
                             for it in reversed(leftover):
                                 fn = self.item_file.get(it.id, "")
                                 self.pool.setdefault(fn, []).insert(0, it)
@@ -1529,7 +1541,7 @@ class TranslationScheduler:
                         )
                     elif (
                         server_500_hits >= (5 if len(batch) == 1 else 6)
-                        and curr_streak < 4
+                        and curr_streak < 3
                     ):
                         logger.warning(
                             "[Worker %d] Batch caused %d repeated %s errors while cluster is alive; skipping via safety_skip to protect run.",
