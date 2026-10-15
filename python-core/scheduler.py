@@ -124,15 +124,15 @@ def clear_process_caches() -> None:
 def _classify_error(msg: str) -> str:
     """Bucket a provider error so the retry loop can react correctly.
 
-      "rate"  — 429 / 503 / overloaded / quota / temporarily-unavailable. The
-                request still consumed the provider's per-minute quota, so the
-                retry must wait at least the pacing delay. These often recover,
-                so keep retrying up to BATCH_TRIES.
-      "auth"  — invalid / expired / unauthorized key, billing, daily limit exhausted,
-                or regional geoblock. Will NOT recover this run: fail the key fast so
-                its work fails over to a surviving key instead of burning ~26 minutes
-                of pointless retries.
-      "other" — anything else (parse hiccup, odd 500): retry normally.
+      "rate"     — 429 / quota / resource_exhausted. Pacing delay on key,
+                   release local TPM reserve to 0.
+      "overload" — 502 / 503 / 504 / capacity / server is busy. Short key
+                   cooldown (6-12s) to avoid slamming dying node.
+      "server"   — 500 / internal error / returned 0 translated strings.
+                   Do NOT cooldown key (siblings proceed). Split batch on repeated failures.
+      "auth"     — invalid / expired / unauthorized key, billing, daily limit exhausted,
+                   or regional geoblock. Fail key fast.
+      "other"    — anything else: retry normally.
     """
     m = (msg or "").lower()
     # Permanent failures that won't recover during this translation run:
@@ -151,14 +151,6 @@ def _classify_error(msg: str) -> str:
     if any(k in m for k in geo_markers):
         return "auth"
 
-    rate_markers = (
-        "429", "too many", "rate limit", "rate-limit", "resource exhausted",
-        "resource_exhausted", "quota", "503", "overloaded", "unavailable",
-        "try again", "temporarily", "capacity", "server is busy", "busy",
-        "provider returned error", "no available provider",
-    )
-    if any(k in m for k in rate_markers):
-        return "rate"
     auth_markers = (
         "401", "403", "api key not valid", "invalid api key", "invalid_api_key",
         "api_key_invalid", "permission", "unauthor", "expired", "billing",
@@ -171,6 +163,33 @@ def _classify_error(msg: str) -> str:
     )
     if any(k in m for k in auth_markers):
         return "auth"
+
+    # Pure Rate Limit (429 / RPM/TPM quota exhausted)
+    rate_markers = (
+        "429", "too many", "rate limit", "rate-limit",
+        "resource exhausted", "resource_exhausted", "quota",
+    )
+    if any(k in m for k in rate_markers):
+        return "rate"
+
+    # Temporary server / gateway overload (502, 503, 504)
+    overload_markers = (
+        "502", "503", "504", "overloaded", "unavailable",
+        "try again", "temporarily", "capacity", "server is busy", "busy",
+        "no available provider",
+    )
+    if any(k in m for k in overload_markers):
+        return "overload"
+
+    # Internal model / server glitch (500, empty translation, malformed JSON response)
+    server_markers = (
+        "500", "internal error", "internal_error",
+        "provider returned error", "returned 0 translated strings",
+        "unexpected gemini response",
+    )
+    if any(k in m for k in server_markers):
+        return "server"
+
     return "other"
 
 
@@ -1301,6 +1320,7 @@ class TranslationScheduler:
         batch_tr: dict[str, str] = {}
         last_err = None
         auth_fails = 0  # consecutive auth-class failures → kill the key fast
+        server_fails = 0  # consecutive server-class failures → split batch
 
         for try_i in range(BATCH_TRIES):
             if self._is_aborted() or worker_key in self.dead_keys:
@@ -1416,16 +1436,17 @@ class TranslationScheduler:
                     batch_size=len(batch),
                     try_i=try_i,
                 )
-                # A failed request that still reached the server spent the quota.
-                # TPM: commit the estimate (no usage on error); pure connection
-                # failures release the reserve without counting spend.
+                # Release TPM reserve: errors NEVER spend TPM quota on cloud LLMs (500/503/429/400).
+                # Committing phantom est_tokens on error chokes the 60s sliding window.
+                # Only a client-side ReadTimeout (where the server generated for 200s+) spent tokens.
                 if tpm_held:
-                    if _reached_server(err_str):
+                    is_read_timeout = "readtimeout" in err_str.lower() or "timed out" in err_str.lower()
+                    if is_read_timeout and reached:
                         self._tpm_commit(worker_idx, worker_key, est_tokens, event_time=start_time)
                     else:
                         self._tpm_commit(worker_idx, worker_key, 0)
                     tpm_held = False
-                if _reached_server(err_str):
+                if reached:
                     with self.cond:
                         self.requests_sent += 1
                 if is_safety:
@@ -1437,6 +1458,41 @@ class TranslationScheduler:
                         self.errors.append(f"[Worker {worker_idx + 1}] {e}")
                         self.batches += 1
                     return ({}, False, True)
+
+                # Split batch on repeated server / parse glitches (e.g. Gemini 500 FSM parser crash):
+                if kind in ("server", "other") and reached:
+                    server_fails += 1
+                    if server_fails >= 2 and len(batch) > 1:
+                        mid = len(batch) // 2
+                        leftover = batch[mid:]
+                        del batch[mid:]
+                        server_fails = 0
+                        with self.cond:
+                            for it in reversed(leftover):
+                                fn = self.item_file.get(it.id, "")
+                                self.pool.setdefault(fn, []).insert(0, it)
+                                self.pool.move_to_end(fn, last=False)
+                            self.cond.notify_all()
+                        prompt_chars = len(build_prompt(
+                            batch, req.target_lang, req.glossary,
+                            req.engine, req.extra_instruction,
+                        ))
+                        logger.info(
+                            "[Worker %d] Repeated %s error; split batch in half (%d kept, %d returned to pool)",
+                            worker_idx, kind, len(batch), len(leftover),
+                        )
+                    elif server_fails >= 5 and len(batch) == 1:
+                        # Single toxic string causing repeated 500: skip to keep key alive
+                        logger.warning(
+                            "[Worker %d] Single item '%s' caused 5x %s errors; skipping to keep key alive.",
+                            worker_idx, batch[0].id, kind,
+                        )
+                        with self.cond:
+                            self.errors.append(f"[Worker {worker_idx + 1}] {e}")
+                            self.batches += 1
+                        return ({}, False, True)
+                else:
+                    server_fails = 0
 
                 if kind == "auth":
                     # An invalid/expired key won't fix itself this run. Give it a
@@ -1466,16 +1522,6 @@ class TranslationScheduler:
                         ):
                             return ({}, False, False)
                         # Unpaused: fall through to normal back-off then retry.
-                    # rate/overload replies STILL spend the per-minute quota on
-                    # every cloud API, so wait at least the pacing delay before
-                    # re-sending — and record a per-key cooldown so siblings on
-                    # this key wait too while other keys keep working.
-                    #
-                    # CRITICAL: delay_seconds==0 (user set only TPM, left RPM
-                    # empty) must NOT skip the multi-thread cooldown. Without
-                    # it, only this worker backs off 8s while siblings keep
-                    # firing → 429 storm, "TPM ignored" symptom. Floor to a
-                    # fixed no-RPM cooldown (or the RPM-derived delay).
                     rate_floor = 0.0
                     if kind == "rate":
                         m_retry = re.search(r"\[retry_after=([0-9.]+)s?\]", err_str)
@@ -1488,25 +1534,42 @@ class TranslationScheduler:
                                 if self.delay_seconds > 0
                                 else _RATE_COOLDOWN_NO_RPM_S
                             )
-                    elif not reached:
-                        # 10054 / SSL handshake drop recovers, but N threads
-                        # retrying in lockstep 8s later re-slam a dying path
-                        # (and often the next error is 429). Same stagger as
-                        # rate; shorter floor than the TPM-only 20s.
-                        rate_floor = (
-                            self.delay_seconds
-                            if self.delay_seconds > 0
-                            else float(_RETRY_BACKOFF_FIRST)
-                        )
-                    floor = rate_floor
-                    if rate_floor > 0:
-                        # Rate: the failed request spent a quota slot.
-                        # Network: the path is sick — siblings wait too.
                         with self.cond:
                             self.key_cooldown[worker_key] = max(
                                 self.key_cooldown.get(worker_key, 0.0),
                                 time.time() + rate_floor,
                             )
+                    elif kind == "overload":
+                        # 502/503/504: temporary server capacity hiccup; short key cooldown
+                        rate_floor = (
+                            max(6.0, min(self.delay_seconds, 12.0))
+                            if _RETRY_BACKOFF_FIRST > 0
+                            else 0.0
+                        )
+                        if rate_floor > 0:
+                            with self.cond:
+                                self.key_cooldown[worker_key] = max(
+                                    self.key_cooldown.get(worker_key, 0.0),
+                                    time.time() + rate_floor,
+                                )
+                    elif kind == "server":
+                        # 500: Do NOT lock the key! Siblings work fine. Fast local backoff.
+                        rate_floor = 3.0 if _RETRY_BACKOFF_FIRST > 0 else 0.0
+                    elif not reached:
+                        # 10054 / SSL handshake drop recovers, but N threads
+                        # retrying in lockstep 8s later re-slam a dying path
+                        rate_floor = (
+                            self.delay_seconds
+                            if self.delay_seconds > 0
+                            else float(_RETRY_BACKOFF_FIRST)
+                        )
+                        if rate_floor > 0:
+                            with self.cond:
+                                self.key_cooldown[worker_key] = max(
+                                    self.key_cooldown.get(worker_key, 0.0),
+                                    time.time() + rate_floor,
+                                )
+                    floor = rate_floor
                     # Stagger sibling retries so threads that all hit an error at
                     # once don't re-fire in lockstep (which would just re-trigger
                     # the same rate limit). Spread evenly across the full delay
@@ -1514,11 +1577,14 @@ class TranslationScheduler:
                     # second, keeping the peak RPM at N/delay ≤ 1 request per
                     # thread-period.
                     stagger = 0.0
-                    if rate_floor > 0 and self.threads > 1:
+                    if kind in ("rate", "overload") and rate_floor > 0 and self.threads > 1:
                         rank = worker_idx % self.threads
                         stagger = rate_floor * rank / self.threads
-                    self._retry_sleep(worker_idx, batch, try_i, start_time,
-                                      min_wait=floor, stagger=stagger)
+                    self._retry_sleep(
+                        worker_idx, batch, try_i, start_time,
+                        min_wait=floor, stagger=stagger,
+                        fast_retry=(kind == "server" or not reached),
+                    )
 
         # Exhausted all retries → this key is dead (circuit breaker FAIL_STREAK=1).
         if last_err is not None:
@@ -1811,7 +1877,7 @@ class TranslationScheduler:
         )
 
     def _retry_sleep(self, worker_idx, batch, try_i, start_time, min_wait=0.0,
-                     stagger=0.0) -> None:
+                     stagger=0.0, fast_retry: bool = False) -> None:
         """Back-off between retries on an OWNED batch.
 
         Uses an absolute wall-clock deadline (`ready_at`). Pause freezes ACTION
@@ -1820,9 +1886,13 @@ class TranslationScheduler:
         while they were parked, Continue fires immediately. Abort interrupts.
         min_wait raises the floor for rate/overload; stagger spreads siblings.
         """
-        sleep_time = max(min_wait,
-                         _RETRY_BACKOFF_FIRST if try_i == 0 else _RETRY_BACKOFF_REST)
-        sleep_time += stagger
+        if _RETRY_BACKOFF_FIRST == 0 and _RETRY_BACKOFF_REST == 0:
+            base_wait = 0.0
+        elif fast_retry:
+            base_wait = 3.0 if try_i == 0 else min(10.0, 3.0 + try_i * 2.0)
+        else:
+            base_wait = _RETRY_BACKOFF_FIRST if try_i == 0 else _RETRY_BACKOFF_REST
+        sleep_time = max(min_wait, base_wait) + stagger
         ready_at = time.time() + sleep_time
         while not self._is_aborted():
             # Pause mid-backoff: park until Continue, then re-check the SAME

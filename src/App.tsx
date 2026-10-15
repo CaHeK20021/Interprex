@@ -4534,16 +4534,16 @@ export default function App() {
         <table>
           <thead>
             <tr>
-              <th style={{ width: "30px", textAlign: "center" }}>
+              <th className="col-check" style={{ width: "38px", textAlign: "center" }}>
                 <input
                   type="checkbox"
                   checked={pageRows.length > 0 && pageRows.every((s) => selectedIds.has(s.id))}
                   onChange={() => selectAllVisible(pageRows)}
                 />
               </th>
-              <th>{t("colOriginal")}</th>
-              <th>{t("colTranslation")}</th>
-              <th>{translationMode === "mods" ? "Мод" : "Тип строки"}</th>
+              <th className="col-equal">{t("colOriginal")}</th>
+              <th className="col-equal">{t("colTranslation")}</th>
+              <th className="col-equal">{translationMode === "mods" ? "Мод" : "Тип строки"}</th>
             </tr>
           </thead>
           <tbody>

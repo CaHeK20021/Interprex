@@ -480,6 +480,7 @@ table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  table-layout: fixed;
 }
 thead th {
   position: sticky;
@@ -495,10 +496,18 @@ thead th {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+thead th.col-check {
+  width: 38px;
+}
+thead th.col-equal {
+  width: calc((100% - 38px) / 3);
+}
 tbody td {
   padding: 10px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.045);
   vertical-align: top;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 tbody tr:hover td {
   background: color-mix(in srgb, var(--engine) 6%, transparent);

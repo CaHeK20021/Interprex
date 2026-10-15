@@ -13,10 +13,15 @@ are expensive to get wrong:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import multiprocessing
 import os
-import tempfile
+import shutil
 import sys
+import tempfile
+import time
+import traceback
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -5385,6 +5390,8 @@ def check_scheduler() -> None:
     assert scheduler._classify_error("User not found") == "auth"
     assert scheduler._classify_error("Error code: 401 - Unauthorized") == "auth"
     assert scheduler._classify_error("429 Too Many Requests") == "rate"
+    assert scheduler._classify_error("Gemini API error (500): Internal error encountered.") == "server"
+    assert scheduler._classify_error("503 Service Unavailable") == "overload"
     assert scheduler._classify_error("parse hiccup in batch") == "other"
 
     # Quota vs free: an HTTP error response spent the request; a TCP/TLS drop
@@ -6116,9 +6123,10 @@ def check_scheduler_high_threads() -> None:
 
     MAX_T = 40
     saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-             scheduler.get_provider)
+             scheduler.get_provider, scheduler._RATE_COOLDOWN_NO_RPM_S)
     scheduler._RETRY_BACKOFF_FIRST = 0
     scheduler._RETRY_BACKOFF_REST = 0
+    scheduler._RATE_COOLDOWN_NO_RPM_S = 0.0
 
     class StrictProvider:
         """Tracks concurrent ownership so we can prove workers don't trample."""
@@ -6477,7 +6485,7 @@ def check_scheduler_high_threads() -> None:
         )
     finally:
         (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-         scheduler.get_provider) = saved
+         scheduler.get_provider, scheduler._RATE_COOLDOWN_NO_RPM_S) = saved
 
 
 def check_scheduler_tail() -> None:
@@ -6498,9 +6506,10 @@ def check_scheduler_tail() -> None:
     from providers.base import TranslateResult, Usage
 
     saved = (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-             scheduler.get_provider)
+             scheduler.get_provider, scheduler._RATE_COOLDOWN_NO_RPM_S)
     scheduler._RETRY_BACKOFF_FIRST = 0
     scheduler._RETRY_BACKOFF_REST = 0
+    scheduler._RATE_COOLDOWN_NO_RPM_S = 0.0
 
     class TrackProv:
         name = "fake"
@@ -6941,7 +6950,7 @@ def check_scheduler_tail() -> None:
         )
     finally:
         (scheduler._RETRY_BACKOFF_FIRST, scheduler._RETRY_BACKOFF_REST,
-         scheduler.get_provider) = saved
+         scheduler.get_provider, scheduler._RATE_COOLDOWN_NO_RPM_S) = saved
 
 
 def check_epic_games() -> None:
@@ -7095,7 +7104,7 @@ def check_renpy_python_pool() -> None:
     def run(keys, threads, process_fn, batches=None):
         batches = batches if batches is not None else list(range(8))
         return rp._run_batches_over_keypool(
-            batches, keys, threads, 0.0, "Tested", process_fn
+            batches, keys, threads, 0.05, "Tested", process_fn
         )
 
     # 1. All-success: every batch merged, exactly once.
@@ -7636,91 +7645,159 @@ def check_tyrano() -> None:
         shutil.rmtree(td, ignore_errors=True)
 
 
-def main() -> int:
-    check_ue_pak_detection()
-    check_tyrano()
-    check_epic_games()
-    check_steam_games()
-    check_prompt_width()
-    check_providers()
-    check_scheduler()
-    check_scheduler_tpm()
-    check_scheduler_high_threads()
-    check_scheduler_tail()
-    check_renpy_python_pool()
-    check_renpy_python_sources()
-    check_renpy_keystring_safety()
-    check_renpy_keystring_promotion()
-    check_renpy_python_cache()
-    check_renpy_inline_extraction()
-    check_csharp()
-    check_backup_restage()
-    check_unity_sources_registry()
-    check_unity_font_script()
-    check_unity_engine_identifiers()
-    check_unity()
-    check_unity_localization()
-    check_unity_frameworks_typetree()
-    check_unity_v2_advanced_sources()
-    check_i18n()
-    check_i18n_rimworld_defs()
-    check_rimworld_research_lines()
-    check_rimworld_defs_coverage()
-    check_fusion()
-    check_mmf2()
-    check_qsp()
-    check_twine()
+def check_rpgmaker() -> None:
     root = build_project()
-    data_map = os.path.join(root, "data", "Map001.json")
+    try:
+        data_map = os.path.join(root, "data", "Map001.json")
 
-    assert detect_engine(root) == "rpgmaker", "detect failed"
-    p = get_parser("rpgmaker")
+        assert detect_engine(root) == "rpgmaker", "detect failed"
+        p = get_parser("rpgmaker")
 
-    strings = p.extract(root)
-    originals = [s.original for s in strings]
-    assert originals == ["Hello there", "How are you?", "Yes", "No"], originals
+        strings = p.extract(root)
+        originals = [s.original for s in strings]
+        assert originals == ["Hello there", "How are you?", "Yes", "No"], originals
 
-    # ids stable across runs
-    ids1 = {s.id for s in strings}
-    ids2 = {s.id for s in p.extract(root)}
-    assert ids1 == ids2, "ids not stable across runs"
+        # ids stable across runs
+        ids1 = {s.id for s in strings}
+        ids2 = {s.id for s in p.extract(root)}
+        assert ids1 == ids2, "ids not stable across runs"
 
-    # inject lands in the right slots
-    tr = {s.id: s.original.upper() for s in strings}
-    written = p.inject(root, tr)
-    assert written == 4, f"written={written}"
-    after = json.load(open(data_map, encoding="utf-8"))
-    lst = after["events"][1]["pages"][0]["list"]
-    assert lst[0]["parameters"][0] == "HELLO THERE", lst[0]
-    assert lst[2]["parameters"][0] == ["YES", "NO"], lst[2]
+        # inject lands in the right slots
+        tr = {s.id: s.original.upper() for s in strings}
+        written = p.inject(root, tr)
+        assert written == 4, f"written={written}"
+        after = json.load(open(data_map, encoding="utf-8"))
+        lst = after["events"][1]["pages"][0]["list"]
+        assert lst[0]["parameters"][0] == "HELLO THERE", lst[0]
+        assert lst[2]["parameters"][0] == ["YES", "NO"], lst[2]
 
-    # id parity with the TS makeId (same algorithm) — expected c670705d
-    parity = make_id(
-        "rpgmaker", "data/Map001.json",
-        ["events", "1", "pages", "0", "list", "0", "parameters", "0"],
-        "Hello there",
-    )
-    assert parity == "c670705d", f"id parity drifted: {parity}"
+        # id parity with the TS makeId (same algorithm) — expected c670705d
+        parity = make_id(
+            "rpgmaker", "data/Map001.json",
+            ["events", "1", "pages", "0", "list", "0", "parameters", "0"],
+            "Hello there",
+        )
+        assert parity == "c670705d", f"id parity drifted: {parity}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
-    check_renpy()
-    check_renpy_font()
-    check_char_limit()
-    check_renpy_risk()
-    check_renpy_identifier_parity()
-    check_renpy_mixed_translate()
-    check_renpy_context_history()
-    check_renpy_rpa()
-    check_renpy_decompilation()
-    check_skyrim()
-    check_unreal()
-    check_unreal4()
-    check_unreal4_pak()
-    check_unreal4_5_utoc()
-    check_unreal4_5_cdo()
-    check_unreal4_5_routing()
-    check_unreal4_5_inherited()
-    check_unreal4_5_bytepatch()
 
+ALL_CHECKS = [
+    # Heaviest / longest running first (Longest Job First for optimal packing across CPU cores):
+    "check_scheduler_high_threads",
+    "check_scheduler_tail",
+    "check_scheduler",
+    "check_scheduler_tpm",
+    "check_unity",
+    "check_unreal4_5_bytepatch",
+    "check_unreal4_5_utoc",
+    "check_renpy_python_pool",
+    "check_renpy_decompilation",
+    "check_renpy_python_sources",
+    "check_csharp",
+    "check_ue_pak_detection",
+    "check_tyrano",
+    "check_epic_games",
+    "check_steam_games",
+    "check_prompt_width",
+    "check_providers",
+    "check_renpy_keystring_safety",
+    "check_renpy_keystring_promotion",
+    "check_renpy_python_cache",
+    "check_renpy_inline_extraction",
+    "check_backup_restage",
+    "check_unity_sources_registry",
+    "check_unity_font_script",
+    "check_unity_engine_identifiers",
+    "check_unity_localization",
+    "check_unity_frameworks_typetree",
+    "check_unity_v2_advanced_sources",
+    "check_i18n",
+    "check_i18n_rimworld_defs",
+    "check_rimworld_research_lines",
+    "check_rimworld_defs_coverage",
+    "check_fusion",
+    "check_mmf2",
+    "check_qsp",
+    "check_twine",
+    "check_rpgmaker",
+    "check_renpy",
+    "check_renpy_font",
+    "check_char_limit",
+    "check_renpy_risk",
+    "check_renpy_identifier_parity",
+    "check_renpy_mixed_translate",
+    "check_renpy_context_history",
+    "check_renpy_rpa",
+    "check_skyrim",
+    "check_unreal",
+    "check_unreal4",
+    "check_unreal4_pak",
+    "check_unreal4_5_cdo",
+    "check_unreal4_5_routing",
+    "check_unreal4_5_inherited",
+]
+
+
+def _run_single_check(name: str) -> tuple[str, float, str | None]:
+    """Execute a single check function by name, returning (name, elapsed_seconds, error_traceback_or_None)."""
+    t0 = time.perf_counter()
+    try:
+        fn = globals()[name]
+        fn()
+        return (name, time.perf_counter() - t0, None)
+    except Exception:
+        return (name, time.perf_counter() - t0, traceback.format_exc())
+
+
+def main() -> int:
+    multiprocessing.freeze_support()
+    t_start = time.perf_counter()
+
+    args = sys.argv[1:]
+    is_serial = "--serial" in args or "-s" in args
+    filter_args = [a for a in args if not a.startswith("-")]
+
+    checks_to_run = ALL_CHECKS
+    if filter_args:
+        checks_to_run = [
+            c for c in ALL_CHECKS
+            if any(f.lower() in c.lower() for f in filter_args)
+        ]
+        if not checks_to_run:
+            print(f"No checks matched filter: {filter_args}", file=sys.stderr)
+            return 1
+
+    if is_serial:
+        print(f"Running {len(checks_to_run)} check(s) sequentially (--serial)...")
+        for name in checks_to_run:
+            name, elapsed, err = _run_single_check(name)
+            if err:
+                print(f"\n[FAIL] {name} failed after {elapsed:.2f}s:\n{err}", file=sys.stderr)
+                return 1
+            print(f"[{elapsed:5.2f}s] OK — {name}")
+    else:
+        max_workers = min(12, os.cpu_count() or 4)
+        print(f"Running {len(checks_to_run)} check(s) in parallel across {max_workers} worker processes...")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_name = {
+                executor.submit(_run_single_check, name): name
+                for name in checks_to_run
+            }
+            failed = []
+            for f in concurrent.futures.as_completed(future_to_name):
+                name, elapsed, err = f.result()
+                if err:
+                    print(f"\n[FAIL] {name} failed after {elapsed:.2f}s:\n{err}", file=sys.stderr)
+                    failed.append((name, err))
+                else:
+                    print(f"[{elapsed:5.2f}s] OK — {name}")
+            if failed:
+                print(f"\n{len(failed)} check(s) FAILED!", file=sys.stderr)
+                return 1
+
+    total_elapsed = time.perf_counter() - t_start
+    print(f"\nTotal time: {total_elapsed:.2f}s")
     print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch + ue-pak-detection + tyrano) + scheduler all pass")
     return 0
 
