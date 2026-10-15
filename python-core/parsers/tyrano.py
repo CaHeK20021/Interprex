@@ -18,13 +18,18 @@ import sys
 import hashlib
 from pathlib import Path
 
-from .base import BaseParser, TranslationString, make_id, update_metadata
+from .base import BaseParser, TranslationString, make_id, update_metadata, read_backup_original
 
 
 _TRAILING_TAGS_RE = re.compile(r'((?:\s*\[(?:p|l|r|cm|er)\s*\])+\s*)$')
 _UI_TAG_RE = re.compile(r'(\[(?:glink|tb_ptext_show|ptext|button|link)\b[^\]]*?\])', re.IGNORECASE)
+_AT_UI_RE = re.compile(r'^@(glink|tb_ptext_show|ptext|button|link)\b(.*)$', re.IGNORECASE)
 _ATTR_TEXT_RE = re.compile(r'(\btext\s*=\s*")([^"]*)(")|(\btext\s*=\s*\')([^\']*)(\')')
 _EMB_RE = re.compile(r'\[emb\b[^\]]*\]', re.IGNORECASE)
+
+_VALID_KAG_TAGS = frozenset({
+    "l", "r", "p", "cm", "er", "emb", "font", "resetfont", "ruby", "ch", "graph", "wait"
+})
 
 
 def _find_tyrano_app_dir(root: str | Path) -> Path | None:
@@ -52,7 +57,11 @@ def _find_tyrano_app_dir(root: str | Path) -> Path | None:
 
 
 def _find_font_source() -> Path | None:
-    """Locate the bundled NotoSans-Regular.ttf font."""
+    """Locate the bundled NotoSans-Regular.ttf font (supports PyInstaller frozen bundle)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidate = Path(sys._MEIPASS) / "assets" / "fonts" / "NotoSans-Regular.ttf"
+        if candidate.is_file():
+            return candidate
     candidate = Path(__file__).resolve().parent.parent / "assets" / "fonts" / "NotoSans-Regular.ttf"
     if candidate.is_file():
         return candidate
@@ -83,7 +92,9 @@ def _replace_ui_tag_text(tag_str: str, new_text: str) -> str:
 
 
 def _repair_tyrano_inline_tags(orig: str, trans: str) -> str:
-    """Ensure inline variables and formatting tags from orig are preserved verbatim in trans."""
+    """Ensure inline variables and formatting tags from orig are preserved verbatim in trans,
+    and prevent invalid brackets or syntax chars that break KAG engine execution."""
+    # 1. Restore exact byte-for-byte [emb ...] tags from orig
     orig_embs = _EMB_RE.findall(orig)
     trans_embs = re.findall(r'\[(?:emb|вставка|exp)\b[^\]]*\]', trans, flags=re.IGNORECASE)
     if orig_embs:
@@ -95,12 +106,38 @@ def _repair_tyrano_inline_tags(orig: str, trans: str) -> str:
             if orig.strip().startswith(orig_embs[0]):
                 trans = orig_embs[0] + " " + trans.lstrip()
 
+    # 2. Restore [font ...] and [resetfont] from orig
     orig_fonts = re.findall(r'\[font\b[^\]]*\]', orig, flags=re.IGNORECASE)
     trans_fonts = re.findall(r'\[font\b[^\]]*\]', trans, flags=re.IGNORECASE)
     if orig_fonts and len(orig_fonts) == len(trans_fonts):
         for of, tf in zip(orig_fonts, trans_fonts):
             if of != tf:
                 trans = trans.replace(tf, of, 1)
+
+    # 3. Protect against spurious [...] in translation that aren't valid KAG tags
+    # or weren't present in orig. Convert spurious [text] to (text).
+    orig_tag_names = {
+        m.group(1).lower()
+        for m in re.finditer(r'\[([a-zA-Z0-9_]+)\b', orig)
+    }
+
+    def sanitize_bracket(m: re.Match) -> str:
+        full_tag = m.group(0)
+        raw_tag_name = m.group(1)
+        tag_name = raw_tag_name.lower()
+        if tag_name in _VALID_KAG_TAGS or tag_name in orig_tag_names:
+            return full_tag
+        inner = m.group(2).strip()
+        return f"({raw_tag_name}{(' ' + inner) if inner else ''})"
+
+    trans = re.sub(r'\[([a-zA-Z0-9_\u0400-\u04FF]+)\b([^\]]*)\]', sanitize_bracket, trans)
+
+    # 4. Protect against leading KAG control characters (*, ;, #, @)
+    s_trans = trans.lstrip()
+    if s_trans.startswith(("*", ";", "#", "@")):
+        first_char = s_trans[0]
+        replacements = {"*": "★", ";": ",", "#": "№", "@": "(at)"}
+        trans = trans.replace(first_char, replacements.get(first_char, " "), 1)
 
     return trans
 
@@ -189,24 +226,53 @@ class TyranoParser(BaseParser):
                 if s.startswith("*"):
                     continue
 
-                # Speaker lines (#Name or reset #)
+                # Single-line @-command tags in KAG
+                if s.startswith("@"):
+                    m_at = _AT_UI_RE.match(s)
+                    if m_at:
+                        tag_name = m_at.group(1).lower()
+                        tag_rest = m_at.group(2)
+                        m_text = _ATTR_TEXT_RE.search(tag_rest)
+                        if m_text:
+                            text_val = m_text.group(2) if m_text.group(2) is not None else m_text.group(5)
+                            if text_val and text_val.strip():
+                                ctx = "Choice button (keep short)" if tag_name in ("glink", "button", "link") else f"UI {tag_name} text"
+                                results.append(
+                                    self._mk(
+                                        file=rel_file,
+                                        path=["line", str(line_idx), "attr_text"],
+                                        original=text_val,
+                                        context=ctx,
+                                    )
+                                )
+                    # Any @ line is a command, never dialogue -> continue
+                    continue
+
+                # Speaker lines (#Name, #Name:pose, or reset #)
                 if s.startswith("#"):
-                    speaker_name = s[1:].strip()
-                    if speaker_name:
-                        current_speaker = speaker_name
-                        results.append(
-                            self._mk(
-                                file=rel_file,
-                                path=["line", str(line_idx), "speaker"],
-                                original=speaker_name,
-                                context="Speaker name",
+                    raw_speaker = s[1:].strip()
+                    if raw_speaker:
+                        if ":" in raw_speaker:
+                            speaker_name = raw_speaker.split(":", 1)[0].strip()
+                        else:
+                            speaker_name = raw_speaker
+                        if speaker_name:
+                            current_speaker = speaker_name
+                            results.append(
+                                self._mk(
+                                    file=rel_file,
+                                    path=["line", str(line_idx), "speaker"],
+                                    original=speaker_name,
+                                    context="Speaker name",
+                                )
                             )
-                        )
+                        else:
+                            current_speaker = ""
                     else:
                         current_speaker = ""
                     continue
 
-                # UI tags with text="..." (glink, tb_ptext_show, ptext, button, link)
+                # UI tags with text="..." in brackets ([glink], [tb_ptext_show], [ptext], [button], [link])
                 ui_matches = list(_UI_TAG_RE.finditer(line))
                 if ui_matches:
                     found_ui = False
@@ -274,10 +340,18 @@ class TyranoParser(BaseParser):
                 if not (rel_file in sub_paths or any(rel_file.startswith(sp) for sp in sub_paths)):
                     continue
 
-            try:
-                lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
-            except Exception:
-                continue
+            # Idempotent inject: always base extraction IDs on original pre-Interprex bytes
+            orig_bytes = read_backup_original(root, rel_file)
+            if orig_bytes is not None:
+                try:
+                    lines = orig_bytes.decode("utf-8-sig", errors="replace").splitlines(keepends=True)
+                except Exception:
+                    lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
+            else:
+                try:
+                    lines = ks_path.read_text(encoding="utf-8-sig", errors="replace").splitlines(keepends=True)
+                except Exception:
+                    continue
 
             modified = False
             new_lines = []
@@ -321,21 +395,51 @@ class TyranoParser(BaseParser):
                     new_lines.append(line)
                     continue
 
-                # Speaker lines (#Name)
-                if s.startswith("#"):
-                    speaker_name = s[1:].strip()
-                    if speaker_name:
-                        str_id = make_id(self.engine, rel_file, ["line", str(line_idx), "speaker"], speaker_name)
-                        if str_id in translations:
-                            trans = translations[str_id].strip()
-                            new_lines.append(f"{leading_ws}#{trans}{newline}")
-                            modified = True
-                            count += 1
-                            continue
+                # Single-line @-command tags in KAG
+                if s.startswith("@"):
+                    m_at = _AT_UI_RE.match(s)
+                    if m_at:
+                        tag_rest = m_at.group(2)
+                        m_text = _ATTR_TEXT_RE.search(tag_rest)
+                        if m_text:
+                            text_val = m_text.group(2) if m_text.group(2) is not None else m_text.group(5)
+                            if text_val and text_val.strip():
+                                str_id = make_id(self.engine, rel_file, ["line", str(line_idx), "attr_text"], text_val)
+                                if str_id in translations:
+                                    trans_text = translations[str_id].strip()
+                                    new_line = _replace_ui_tag_text(line, trans_text)
+                                    new_lines.append(new_line)
+                                    modified = True
+                                    count += 1
+                                    continue
                     new_lines.append(line)
                     continue
 
-                # UI tags with text="..."
+                # Speaker lines (#Name or #Name:pose)
+                if s.startswith("#"):
+                    raw_speaker = s[1:].strip()
+                    if raw_speaker:
+                        if ":" in raw_speaker:
+                            speaker_name, pose_suffix = raw_speaker.split(":", 1)
+                            speaker_name = speaker_name.strip()
+                            pose_suffix = pose_suffix.strip()
+                        else:
+                            speaker_name = raw_speaker
+                            pose_suffix = ""
+
+                        if speaker_name:
+                            str_id = make_id(self.engine, rel_file, ["line", str(line_idx), "speaker"], speaker_name)
+                            if str_id in translations:
+                                trans = translations[str_id].strip()
+                                pose_part = f":{pose_suffix}" if pose_suffix else ""
+                                new_lines.append(f"{leading_ws}#{trans}{pose_part}{newline}")
+                                modified = True
+                                count += 1
+                                continue
+                    new_lines.append(line)
+                    continue
+
+                # UI tags with text="..." in brackets
                 ui_matches = list(_UI_TAG_RE.finditer(line))
                 if ui_matches:
                     line_mod = False
@@ -400,7 +504,8 @@ class TyranoParser(BaseParser):
         return count
 
     def _install_font_and_css(self, root: str, app_dir: Path) -> None:
-        """Copy NotoSans-Regular.ttf to data/others/InterprexNoto.ttf and patch tyrano/css/font.css."""
+        """Copy NotoSans-Regular.ttf to data/others/InterprexNoto.ttf and patch tyrano/css/font.css
+        with global and per-custom-family overrides so inline face="..." styles use Noto Sans."""
         font_src = _find_font_source()
         if not font_src:
             return
@@ -421,12 +526,34 @@ class TyranoParser(BaseParser):
             css_content = font_css.read_text(encoding="utf-8", errors="replace")
             if "InterprexNoto" not in css_content:
                 self.backup_file(root, str(font_css))
+
+                # Scan existing custom font families from font.css and files in data/others
+                existing_families: set[str] = set(
+                    re.findall(r"font-family\s*:\s*['\"]([^'\"]+)['\"]", css_content)
+                )
+                if dest_font_dir.is_dir():
+                    for f in dest_font_dir.iterdir():
+                        if f.suffix.lower() in (".ttf", ".otf", ".woff", ".eot") and f.name != "InterprexNoto.ttf":
+                            existing_families.add(f.stem)
+
+                family_overrides = []
+                for fam in sorted(existing_families):
+                    family_overrides.append(
+                        f"@font-face {{\n"
+                        f"    font-family: '{fam}';\n"
+                        f"    src: url('../../data/others/InterprexNoto.ttf') format('truetype');\n"
+                        f"    font-weight: normal; font-style: normal;\n"
+                        f"}}"
+                    )
+
+                overrides_css = "\n".join(family_overrides)
                 font_rule = (
                     "\n/* Interprex Font Override */\n"
                     "@font-face {\n"
                     "    font-family: 'InterprexNoto';\n"
                     "    src: url('../../data/others/InterprexNoto.ttf') format('truetype');\n"
                     "}\n"
+                    f"{overrides_css}\n"
                     "body, #tyrano_base, .tyrano_base, .message_inner, .message_inner p, "
                     ".message_inner span, .glink_button, .layer_event_click, .ptext {\n"
                     "    font-family: 'InterprexNoto', 'Noto Sans', sans-serif !important;\n"

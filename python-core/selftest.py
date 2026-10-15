@@ -7526,7 +7526,10 @@ def check_tyrano() -> None:
         css_dir.mkdir(parents=True)
 
         (tyrano_dir / "tyrano.js").write_text("// tyrano engine", encoding="utf-8")
-        (css_dir / "font.css").write_text("/* original font css */", encoding="utf-8")
+        (css_dir / "font.css").write_text(
+            "@font-face { font-family: 'c16xcnr'; src: url('../../data/others/c16xcnr.ttf'); }\n",
+            encoding="utf-8"
+        )
 
         # System scenario (should be skipped)
         (sys_dir / "_scene1.ks").write_text('[preload storage="img.png"]\n', encoding="utf-8")
@@ -7538,17 +7541,21 @@ def check_tyrano() -> None:
         sample_ks.write_text(
             '; Comment line to skip\n'
             '*start\n'
+            '@bg storage="room.jpg" time="1000"\n'
             '[iscript]\n'
             'var code = 123;\n'
             '[endscript]\n'
             '[tb_start_text mode=1 ]\n'
             '#Teacher\n'
             '[emb exp= "f.name" ], Tell the transfer student to come to the office.[p]\n'
+            '#Aoisaki:smile\n'
+            'Let us do something fun![p]\n'
             '#\n'
             'I looked down at the envelope.[p]\n'
             '[_tb_end_text]\n'
             '[tb_ptext_show x="100" y="200" text="Enter your name!→"]\n'
-            '[glink color="btn_26_red" text="Speak" target="*Speak" storage="scene1.ks"]\n',
+            '[glink color="btn_26_red" text="Speak" target="*Speak" storage="scene1.ks"]\n'
+            '@glink color="btn_blue" text="Confirm" target="*confirm"\n',
             encoding="utf-8",
         )
 
@@ -7557,8 +7564,17 @@ def check_tyrano() -> None:
         assert isinstance(parser, TyranoParser)
 
         strings = parser.extract(td)
-        assert len(strings) == 5, f"Expected 5 strings, got {len(strings)}: {[s.original for s in strings]}"
-        assert len(parser.extract(td, [])) == 5, "extract with empty sub_paths list must not filter out all files"
+        # Expected:
+        # 1. Teacher (speaker)
+        # 2. [emb exp= "f.name" ], Tell the transfer student to come to the office. (dialogue)
+        # 3. Aoisaki (speaker, from #Aoisaki:smile)
+        # 4. Let us do something fun! (dialogue)
+        # 5. I looked down at the envelope. (dialogue)
+        # 6. Enter your name!→ (attr_text)
+        # 7. Speak (attr_text)
+        # 8. Confirm (attr_text from @glink)
+        assert len(strings) == 8, f"Expected 8 strings, got {len(strings)}: {[s.original for s in strings]}"
+        assert len(parser.extract(td, [])) == 8, "extract with empty sub_paths list must not filter out all files"
 
         # Check stability across runs
         ids1 = [s.id for s in strings]
@@ -7570,20 +7586,29 @@ def check_tyrano() -> None:
         tr = {
             s_map["Teacher"]: "Учитель",
             s_map['[emb exp= "f.name" ], Tell the transfer student to come to the office.']: '[emb exp="f.name"], Скажи новенькому зайти в учительскую.',
-            s_map["I looked down at the envelope."]: "Я посмотрел на конверт.",
+            s_map["Aoisaki"]: "Аоисаки",
+            s_map["Let us do something fun!"]: "[Вздыхает] Давай сделаем что-нибудь веселое!",
+            s_map["I looked down at the envelope."]: "*Я посмотрел на конверт.",
             s_map["Enter your name!→"]: "Введите ваше имя!→",
             s_map["Speak"]: "Заговорить",
+            s_map["Confirm"]: "Подтвердить",
         }
 
         written = parser.inject(td, tr, target_lang="ru")
-        assert written == 5, f"Expected 5 written, got {written}"
+        assert written == 8, f"Expected 8 written, got {written}"
 
         after_content = sample_ks.read_text(encoding="utf-8")
         assert "#Учитель" in after_content
+        assert "#Аоисаки:smile" in after_content, f"Pose suffix :smile missing: {after_content}"
         assert '[emb exp= "f.name" ], Скажи новенькому зайти в учительскую.[p]' in after_content
-        assert "Я посмотрел на конверт.[p]" in after_content
+        # Spurious [Вздыхает] converted to (Вздыхает)
+        assert "(Вздыхает) Давай сделаем что-нибудь веселое![p]" in after_content
+        # Leading * escaped to ★
+        assert "★Я посмотрел на конверт.[p]" in after_content
         assert 'text="Введите ваше имя!→"' in after_content
         assert 'text="Заговорить" target="*Speak" storage="scene1.ks"' in after_content
+        assert '@glink color="btn_blue" text="Подтвердить" target="*confirm"' in after_content
+        assert '@bg storage="room.jpg" time="1000"' in after_content
         assert "var code = 123;" in after_content
 
         # Font & CSS check
@@ -7591,8 +7616,16 @@ def check_tyrano() -> None:
         assert dest_font.exists(), "InterprexNoto.ttf must be installed"
         after_css = (css_dir / "font.css").read_text(encoding="utf-8")
         assert "InterprexNoto" in after_css, "font.css must contain InterprexNoto"
+        assert "font-family: 'c16xcnr'" in after_css, "font.css must override custom face c16xcnr"
 
-        print("OK — tyrano: detect (over Electron paks), extract, id-stability, UI text preservation, tag repair, font injection")
+        # Idempotency check: 2nd inject with an updated translation
+        tr[s_map["Teacher"]] = "Преподаватель"
+        written2 = parser.inject(td, tr, target_lang="ru")
+        assert written2 == 8, f"Second inject must be idempotent and succeed, got {written2}"
+        after_content2 = sample_ks.read_text(encoding="utf-8")
+        assert "#Преподаватель" in after_content2
+
+        print("OK — tyrano: detect, extract, id-stability, UI text preservation, tag repair, font injection, idempotent inject, pose suffix, @-tags")
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
