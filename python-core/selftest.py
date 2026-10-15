@@ -299,8 +299,9 @@ def check_renpy_font() -> None:
                           "_get_role_name", "_ix_ts_wrapper", "_ix_aph_wrapper",
                           "_get_who_typing_translated", "_interprex_orig_aph",
                           "_interprex_orig_translate_string", "TranslatingString",
-                          "_ix_run_translate_setup"):
+                          "_ix_multibox_render", "_ix_run_translate_setup"):
         assert expected_stub in init_body, f"pickle safety stub {expected_stub} missing from init python:"
+    assert "style.default.line_spacing = -2" in src, "line_spacing compensation missing from _interprex_font.rpy"
 
     # Execute the first translate-python block twice against a fake engine that
     # mirrors the real FontGroup-alias rule — proves idempotency + correctness.
@@ -615,6 +616,35 @@ def check_renpy_font() -> None:
         restored = _pkl.loads(dumped)
         assert restored == "Sweet Serial Killer"
         assert type(restored) is str, f"TranslatingString must unpickle as str, got {type(restored)}"
+
+    # 3. MultiBox vertical overflow calculation test:
+    # Verifies that when children overflow height, the bottom child (button) is pulled
+    # within height - last_h - 15, and offsets match new_rv_children.
+    class _MockSurf:
+        def __init__(self, h):
+            self.height = h
+    _surfs = [_MockSurf(260), _MockSurf(50), _MockSurf(330), _MockSurf(30), _MockSurf(440), _MockSurf(50), _MockSurf(100)]
+    _orig_y = [0, 270, 330, 670, 710, 1160, 1220]  # total bottom = 1220 + 100 = 1320 > 1080
+    _rv_c = [(_surfs[i], 0, _orig_y[i], True, True) for i in range(len(_surfs))]
+    _offs = [(0, _orig_y[i]) for i in range(len(_surfs))]
+    _avail_h = 1080
+    _last_s = _rv_c[-1][0]
+    _last_h = _last_s.height
+    _target_y = max(0, _avail_h - _last_h - 15)
+    _first_y = _rv_c[0][2]
+    _span = _rv_c[-1][2] - _first_y
+    assert _span > 0 and _rv_c[-1][2] > _target_y
+    _scale = float(_target_y - _first_y) / float(_span)
+    _new_c = []
+    _new_o = []
+    for _i in range(len(_surfs)):
+        _ot = _rv_c[_i]
+        _ny = int(round(_first_y + (_ot[2] - _first_y) * _scale))
+        _new_c.append((_ot[0], _ot[1], _ny) + _ot[3:])
+        _new_o.append((_offs[_i][0], _ny))
+    assert _new_c[-1][2] == _target_y == 965
+    assert _new_c[-1][2] + _last_h <= _avail_h - 15
+    assert _new_o[-1][1] == _new_c[-1][2]
 
     # Restore deletes the generated font file (registered type=created).
     from main import backup_restore, BackupRestoreReq

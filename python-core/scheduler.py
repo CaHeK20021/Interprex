@@ -285,6 +285,17 @@ class TranslationScheduler:
                 and c.path[2] in ("textbutton", "label")
                 and len(c.text) < 50
             )
+            is_screen_header = False
+            if (
+                len(c.path) >= 3
+                and c.path[0] == "screen"
+                and c.path[2] == "text"
+                and len(c.text.strip()) <= 30
+            ):
+                stripped = c.text.strip()
+                words = stripped.split()
+                if (len(words) <= 3 and not stripped.endswith((".", "!", "?", ":", ";"))) or (stripped.isupper() and len(words) <= 4):
+                    is_screen_header = True
             # Per-item fixed-width budget. The char limit is passed to the model
             # as TranslateItem.max_chars (a first-class field build_prompt surfaces
             # prominently), NOT stuffed into `context` — the system prompt tells the
@@ -294,7 +305,7 @@ class TranslationScheduler:
             max_chars = 0
             max_pixels = 0
             max_lines = 0
-            if (is_menu or is_screen_button) and self.is_renpy and req.root and self.source_font_path:
+            if (is_menu or is_screen_button or is_screen_header) and self.is_renpy and req.root and self.source_font_path:
                 try:
                     from parsers.renpy import (
                         get_char_limit, measure_original_px, _avg_char_width,
@@ -317,7 +328,8 @@ class TranslationScheduler:
                         req.target_lang, self.font_size, self._font_style
                     )
                     floor_px = self._MIN_CAPTION_CHARS * avg_w
-                    budget_px = max(orig_px * self._UI_WIDTH_SLACK, floor_px)
+                    slack = 1.25 if is_screen_header else self._UI_WIDTH_SLACK
+                    budget_px = max(orig_px * slack, floor_px)
                     max_chars = max(
                         get_char_limit(
                             c.text, self.source_font_path, req.target_lang,
@@ -326,10 +338,24 @@ class TranslationScheduler:
                         int(budget_px / avg_w) if avg_w > 0 else self._MIN_CAPTION_CHARS,
                         self._MIN_CAPTION_CHARS,
                     )
+                    if is_screen_header:
+                        words_cnt = len(c.text.strip().split())
+                        if words_cnt == 1:
+                            max_chars = min(max_chars, max(14, int(len(c.text.strip()) * 1.35)))
+                            max_lines = 1
+                            self.item_max_lines[c.id] = 1
+                            header_note = "Single-word screen header/title. Keep as a single compact word (e.g. ДИСКЛЕЙМЕР, ПРЕДУПРЕЖДЕНИЕ), do NOT expand into multiple words or lines."
+                            context = f"{header_note} | {context}" if context else header_note
+                        else:
+                            max_lines = 1
+                            self.item_max_lines[c.id] = 1
+                            header_note = "Short screen header. Keep compact on a single line."
+                            context = f"{header_note} | {context}" if context else header_note
+
                     self.item_orig_px[c.id] = budget_px
                     max_pixels = int(budget_px)
 
-                    if not is_menu:
+                    if not is_menu and not is_screen_header:
                         line_count = c.text.count("\\n") + 1
                         if line_count > 1:
                             note = (
