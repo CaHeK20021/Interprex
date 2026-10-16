@@ -998,6 +998,7 @@ class TranslationScheduler:
                 continue
 
             with self.cond:
+                last_cd_wait_left: int | None = None
                 while True:
                     if self.aborted:
                         return (_DONE, None)
@@ -1058,19 +1059,21 @@ class TranslationScheduler:
                     if wait_for > 0:
                         wait_left = int(math.ceil(wait_for))
                         if wait_for >= 1.5:
-                            bnum = self.worker_batch_no.get(worker_idx, 0)
-                            status_msg = (
-                                f"Cluster cooldown ({wait_left}s left)..."
-                                if is_cluster_cd
-                                else f"Key cooldown ({wait_left}s left)..."
-                            )
-                            self._emit(
-                                worker_idx,
-                                "waiting_delay",
-                                status=status_msg,
-                                wait_left=wait_left,
-                                batch_num=bnum or None,
-                            )
+                            if wait_left != last_cd_wait_left:
+                                last_cd_wait_left = wait_left
+                                bnum = self.worker_batch_no.get(worker_idx, 0)
+                                status_msg = (
+                                    f"Cluster cooldown ({wait_left}s left)..."
+                                    if is_cluster_cd
+                                    else f"Key cooldown ({wait_left}s left)..."
+                                )
+                                self._emit(
+                                    worker_idx,
+                                    "waiting_delay",
+                                    status=status_msg,
+                                    wait_left=wait_left,
+                                    batch_num=bnum or None,
+                                )
                         self.cond.wait(timeout=min(wait_for, 1.0))
                         continue
 
@@ -1388,10 +1391,55 @@ class TranslationScheduler:
             # After a failed attempt the user may have hit Pause — do not fire
             # the next try until they Continue. (In-flight HTTP still always
             # runs to completion; only the gap BETWEEN tries honours pause.)
-            if try_i > 0 and not self._wait_if_paused_before_retry(
-                worker_idx, batch, try_i
-            ):
-                return ({}, False, False)
+            if try_i > 0:
+                if not self._wait_if_paused_before_retry(
+                    worker_idx, batch, try_i
+                ):
+                    return ({}, False, False)
+                # Tail Coalescing: if we are the sole active worker retrying a batch (e.g. after
+                # Tail Storm Yield caused other workers to surrender their batches back to pool),
+                # greedily absorb yielded items into this batch up to max_batch_size and token budget.
+                with self.cond:
+                    if (
+                        self.in_flight == 1
+                        and self._remaining_locked() > 0
+                        and len(batch) < req.max_batch_size
+                    ):
+                        budget = cal.input_budget(self.window, req.glossary)
+                        used_tokens = sum(
+                            cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
+                            for it in batch
+                        )
+                        added = 0
+                        for pool_fn, pool_items in list(self.pool.items()):
+                            if not pool_items:
+                                continue
+                            take_count = 0
+                            for it in pool_items:
+                                if len(batch) >= req.max_batch_size:
+                                    break
+                                cost = cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
+                                if used_tokens + cost > budget:
+                                    break
+                                used_tokens += cost
+                                batch.append(it)
+                                take_count += 1
+                                added += 1
+                            if take_count > 0:
+                                del pool_items[:take_count]
+                                if not pool_items and pool_fn in self.pool:
+                                    del self.pool[pool_fn]
+                            if len(batch) >= req.max_batch_size:
+                                break
+                        if added > 0:
+                            prompt_chars = len(build_prompt(
+                                batch, req.target_lang, req.glossary,
+                                req.engine, req.extra_instruction,
+                            ))
+                            logger.info(
+                                "[Worker %d] Coalesced %d tail strings into retry batch (now %d strings).",
+                                worker_idx, added, len(batch),
+                            )
 
             start_time = time.time()
             try_suffix = f" (retry {try_i + 1}/{BATCH_TRIES})" if try_i > 0 else ""
@@ -1632,7 +1680,7 @@ class TranslationScheduler:
                         # Сбрасываем счетчик reclaim для этих строк, чтобы добровольная сдача
                         # не потратила лимит max_reclaims!
                         for it in batch:
-                            self.reclaim_count[it.id] = max(0, self.reclaim_count.get(it.id, 0) - 1)
+                            self.reclaim_count[it.id] = self.reclaim_count.get(it.id, 0) - 1
                         logger.info(
                             "[Worker %d] Yielding tail batch (%d items) back to pool so only 1 worker retries during server error.",
                             worker_idx, len(batch),
