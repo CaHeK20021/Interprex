@@ -335,6 +335,9 @@ const ru: Strings = {
   updateLatest: "У вас последняя версия",
   updateError: "Не удалось проверить обновления",
   updateProgress: "{downloaded} / {total} МБ",
+  updateAvailable: "Доступно обновление: {version}",
+  updateDisabledWhileBusy: "Недоступно во время работы",
+  updateClickToInstall: "Нажмите для установки",
 };
 
 export default ru;

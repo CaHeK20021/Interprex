@@ -3,48 +3,59 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useT } from "./i18n";
 
-type UpdateState =
+export type UpdateState =
   | { kind: "downloading"; version: string; downloaded: number; total: number }
   | { kind: "ready" }
   | null;
 
+export type AvailableUpdateInfo = {
+  version: string;
+  run: () => void;
+};
+
 export default function UpdateOverlay({
   onStateChange,
+  isAppBusy,
+  onUpdateAvailableChange,
 }: {
   onStateChange: (busy: boolean) => void;
+  isAppBusy?: boolean;
+  onUpdateAvailableChange?: (update: AvailableUpdateInfo | null) => void;
 }) {
   const { t } = useT();
   const [state, setState] = useState<UpdateState>(null);
-  // Guards against duplicate downloads: the effect below re-fires whenever
-  // `run`'s identity changes (which happens whenever the parent re-renders and
-  // hands us a fresh `onStateChange` closure). Without this, a re-render that
-  // lands *after* a download has already started would schedule a SECOND
-  // parallel check()+downloadAndInstall() — two independent downloads both
-  // writing to the same `state`, which is what made the progress bar jump
-  // back and forth. This ref makes the actual work run at most once per
-  // mount, no matter how many times the effect/timer re-fires.
-  const startedRef = useRef(false);
 
-  const run = useCallback(async () => {
-    if (startedRef.current) return;
-    startedRef.current = true;
+  const isAppBusyRef = useRef(isAppBusy ?? false);
+  isAppBusyRef.current = isAppBusy ?? false;
+
+  const updateHandleRef = useRef<any>(null);
+  const isCheckingRef = useRef(false);
+  const isDownloadingRef = useRef(false);
+
+  const onUpdateAvailableChangeRef = useRef(onUpdateAvailableChange);
+  onUpdateAvailableChangeRef.current = onUpdateAvailableChange;
+
+  const startDownload = useCallback(async () => {
+    if (isDownloadingRef.current) return;
+    if (isAppBusyRef.current) return;
+    const update = updateHandleRef.current;
+    if (!update) return;
+
+    isDownloadingRef.current = true;
+    onStateChange(true);
     try {
-      const update = await check();
-      if (!update) return;
-
       const version = update.version ?? "?";
       setState({ kind: "downloading", version, downloaded: 0, total: 0 });
-      onStateChange(true);
 
       let downloaded = 0;
       let total = 0;
 
-      await update.downloadAndInstall((event) => {
+      await update.downloadAndInstall((event: any) => {
         if (event.event === "Started") {
-          total = event.data.contentLength ?? 0;
+          total = event.data?.contentLength ?? 0;
           setState({ kind: "downloading", version, downloaded: 0, total });
         } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
+          downloaded += event.data?.chunkLength ?? 0;
           setState({ kind: "downloading", version, downloaded, total });
         }
       });
@@ -55,17 +66,51 @@ export default function UpdateOverlay({
       console.error("[updater] check/download/install failed:", err);
       setState(null);
       onStateChange(false);
+      isDownloadingRef.current = false;
     }
   }, [onStateChange]);
 
+  const checkUpdate = useCallback(async () => {
+    if (isCheckingRef.current || isDownloadingRef.current) return;
+    isCheckingRef.current = true;
+    try {
+      const update = await check();
+      if (update) {
+        updateHandleRef.current = update;
+        if (onUpdateAvailableChangeRef.current) {
+          onUpdateAvailableChangeRef.current({
+            version: update.version ?? "?",
+            run: startDownload,
+          });
+        }
+      } else {
+        updateHandleRef.current = null;
+        if (onUpdateAvailableChangeRef.current) {
+          onUpdateAvailableChangeRef.current(null);
+        }
+      }
+    } catch (err) {
+      console.warn("[updater] check failed:", err);
+    } finally {
+      isCheckingRef.current = false;
+    }
+  }, [startDownload]);
+
+  // Initial check on mount + periodic check every 15 minutes.
   useEffect(() => {
-    // Kick off the update check immediately on mount — no artificial delay.
-    // The 500ms setTimeout we used to have just postponed the GitHub check(),
-    // which made the download overlay pop in 2-3s after launch (after the user
-    // had already started clicking around). run() guards itself against
-    // double-firing via startedRef, so calling it directly is safe.
-    run();
-  }, [run]);
+    checkUpdate();
+    const interval = setInterval(checkUpdate, 15 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [checkUpdate]);
+
+  // When work in progress stops (busy transitions from true to false), re-check immediately.
+  const prevBusyRef = useRef(isAppBusy ?? false);
+  useEffect(() => {
+    if (prevBusyRef.current && !isAppBusy) {
+      checkUpdate();
+    }
+    prevBusyRef.current = isAppBusy ?? false;
+  }, [isAppBusy, checkUpdate]);
 
   if (!state) return null;
 

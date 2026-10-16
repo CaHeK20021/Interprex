@@ -338,6 +338,9 @@ const en = {
   updateLatest: "You're up to date",
   updateError: "Update check failed",
   updateProgress: "{downloaded} / {total} MB",
+  updateAvailable: "Update available: {version}",
+  updateDisabledWhileBusy: "Unavailable while working",
+  updateClickToInstall: "Click to install",
 };
 
 export default en;

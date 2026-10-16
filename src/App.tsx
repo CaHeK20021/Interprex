@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback, useMemo, memo, startTransition } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   ping,
   detectEngine,
@@ -48,7 +49,7 @@ import {
 import type { Engine, FontStyle, ProjectFile, TranslationString } from "./lib/types";
 import { engineLabel } from "./lib/types";
 import FolderPicker from "./FolderPicker";
-import UpdateOverlay from "./UpdateOverlay";
+import UpdateOverlay, { type AvailableUpdateInfo } from "./UpdateOverlay";
 import {
   useT,
   setUiLang,
@@ -1132,6 +1133,15 @@ export default function App() {
   const [proxyChecking, setProxyChecking] = useState(false);
   const [proxyCheckResults, setProxyCheckResults] =
     useState<Record<string, ProxyAutocheckResult> | null>(null);
+  const [appVersion, setAppVersion] = useState("0.0.131");
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdateInfo | null>(null);
+
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => {});
+  }, []);
+
   const changeTranslationMode = (mode: "game" | "mods") => {
     if (busy) return;
     setTranslationMode(mode);
@@ -3243,7 +3253,11 @@ export default function App() {
         <div className="app-orb app-orb-c" />
         <div className="app-grain" />
       </div>
-      <UpdateOverlay onStateChange={setUpdateBusyTracked} />
+      <UpdateOverlay
+        onStateChange={setUpdateBusyTracked}
+        isAppBusy={busy}
+        onUpdateAvailableChange={setAvailableUpdate}
+      />
 
       {selectedIds.size > 0 && (
         <div className="floating-action-bar">
@@ -3345,6 +3359,37 @@ export default function App() {
                 ? t("sidecarOnline")
                 : t("sidecarOffline")}
           </span>
+          {availableUpdate && (
+            <button
+              id="app-update-btn"
+              className="update-top-btn"
+              disabled={busy}
+              title={
+                busy
+                  ? `${(t("updateAvailable") as string).replace("{version}", availableUpdate.version)} (${t("updateDisabledWhileBusy") as string})`
+                  : `${(t("updateAvailable") as string).replace("{version}", availableUpdate.version)} — ${(t("updateClickToInstall") as string)}`
+              }
+              onClick={() => {
+                if (!busy) availableUpdate.run();
+              }}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="15"
+                height="15"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              <span className="update-top-badge" />
+            </button>
+          )}
           <button
             id="proxy-settings-btn"
             className="gear-btn"
@@ -3365,7 +3410,10 @@ export default function App() {
         <div className="proxy-panel" id="proxy-panel">
           <div className="proxy-panel-header">
             <span className="proxy-panel-title">{t("proxySettingsTitle") as string}</span>
-            <button className="proxy-close-btn" onClick={() => setShowProxyPanel(false)}>✕</button>
+            <div className="proxy-panel-header-right">
+              <button className="proxy-close-btn" onClick={() => setShowProxyPanel(false)}>✕</button>
+              <span className="proxy-panel-version">v{appVersion}</span>
+            </div>
           </div>
 
           <label className="proxy-url-row">
