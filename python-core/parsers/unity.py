@@ -147,6 +147,9 @@ def is_custom_dll(filename: str) -> bool:
         "elringus.", "naninovel.", "naninovel",
         "spine.", "DOTween", "dotween", "rewired", "photon", "mirror.",
         "facepunch", "com.unity.", "unityengine",
+        "cinemachine", "unitask", "unirx", "zenject", "sirenix", "textmeshpro",
+        "playfab", "fmodstudio", "icsharpcode", "ionic", "demilib", "ak.wwise",
+        "com.rlabrecque", "google.", "firebase", "facebook",
         # Native runtime / C libraries (never .NET managed assemblies)
         "d3dcompiler", "libpython", "librenpy", "libwinpthread", "libffi",
         "libcrypto", "libssl", "libegl", "libgles", "nvdrs", "steam_api",
@@ -959,18 +962,28 @@ def _pack_aligned_string(text: str) -> bytes:
 # ── Generic TypeTree and TextAsset Helpers ────────────────────────────────────
 
 _TEXT_FIELD_KEYWORDS = frozenset({
-    "text", "title", "description", "desc", "caption", "label",
-    "dialogue", "dialog", "message", "msg", "prompt", "tooltip",
-    "hint", "bio", "lore", "story", "sentence", "phrase", "line",
-    "header", "subtitle", "summary", "question", "answer", "choice",
-    "option", "content", "bark", "greeting", "note", "quote",
+    "text", "texts", "title", "titles", "description", "descriptions",
+    "desc", "descs", "caption", "captions", "label", "labels",
+    "dialogue", "dialogues", "dialog", "dialogs", "message", "messages",
+    "msg", "msgs", "prompt", "prompts", "tooltip", "tooltips",
+    "hint", "hints", "bio", "lore", "story", "stories",
+    "sentence", "sentences", "phrase", "phrases", "line", "lines",
+    "header", "headers", "subtitle", "subtitles", "summary", "summaries",
+    "question", "questions", "answer", "answers", "choice", "choices",
+    "option", "options", "content", "contents", "bark", "barks",
+    "greeting", "greetings", "note", "notes", "quote", "quotes",
     "storytext", "localizedtext", "flavor", "flavortext", "itemname",
     "questname", "skillname", "spellname", "displayname",
+    "body", "speech", "narration", "monologue", "objective", "objectives",
+    "paragraph", "paragraphs", "tip", "tips", "entry", "entries",
 })
 
 _TEXT_FIELD_SUFFIXES = (
-    "text", "title", "desc", "description", "label", "message",
-    "tooltip", "dialogue", "dialog", "caption", "name",
+    "text", "texts", "title", "titles", "desc", "description", "descriptions",
+    "label", "labels", "message", "messages", "tooltip", "tooltips",
+    "dialogue", "dialogues", "dialog", "dialogs", "caption", "captions",
+    "name", "line", "lines", "choice", "choices", "option", "options",
+    "hint", "hints", "note", "notes", "prompt", "prompts",
 )
 
 _TECHNICAL_NAME_EXCLUSIONS = frozenset({
@@ -1013,10 +1026,20 @@ def _walk_typetree_generic(node: Any, path_parts: list[str]) -> list[tuple[list[
             elif isinstance(v, (dict, list)):
                 out.extend(_walk_typetree_generic(v, path_parts + [k]))
     elif isinstance(node, list):
+        parent_field = (
+            path_parts[-2]
+            if len(path_parts) >= 2 and (path_parts[-1] == "Array" or path_parts[-1].isdigit())
+            else (path_parts[-1] if path_parts else "")
+        )
         for idx, item in enumerate(node):
             if isinstance(item, (dict, list)):
                 out.extend(_walk_typetree_generic(item, path_parts + [str(idx)]))
-            elif isinstance(item, str) and path_parts and _is_typetree_text_field(path_parts[-1]) and _is_game_text(item):
+            elif (
+                isinstance(item, str)
+                and parent_field
+                and _is_typetree_text_field(parent_field)
+                and _is_game_text(item)
+            ):
                 out.append((path_parts + [str(idx)], item))
     return out
 
@@ -1113,8 +1136,6 @@ def _walk_json_leaves(node: Any, path: list[str]) -> list[tuple[list[str], str]]
                         continue
                 out.append((path + [k], v))
             elif isinstance(v, (dict, list)):
-                if is_strict_skip_key or is_id_or_key:
-                    continue
                 out.extend(_walk_json_leaves(v, path + [k]))
     elif isinstance(node, list):
         for i, item in enumerate(node):
@@ -1624,12 +1645,20 @@ def find_aa_bundles(root: str) -> list[str]:
                 bundles.append(os.path.join(dirpath, f))
     return bundles
 
+_MANAGED_MARKERS = frozenset({
+    "assembly-csharp.dll",
+    "unityengine.coremodule.dll",
+    "unityengine.dll",
+    "mscorlib.dll",
+    "netstandard.dll",
+})
+
 def find_managed_dir(root: str) -> str | None:
-    """Find the Managed directory containing Assembly-CSharp.dll."""
+    """Find the Managed directory containing Assembly-CSharp.dll or core runtime assemblies."""
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d.lower() not in IGNORE_DIRS and not d.startswith(".")]
         if os.path.basename(dirpath) == "Managed":
-            if any(f.lower() == "assembly-csharp.dll" for f in filenames):
+            if any(f.lower() in _MANAGED_MARKERS for f in filenames):
                 return dirpath
     return None
 
@@ -1949,6 +1978,7 @@ class UnityParser(BaseParser):
         # Last extract/inject multi-source report (API / logs / UI honesty).
         self.last_report: UnityPipelineReport | None = None
         self._modified_files_in_run: set[str] = set()
+        self._discovered_loc_files: set[str] = set()
 
     def _mark_modified_in_run(self, fpath: str) -> None:
         if not hasattr(self, "_modified_files_in_run"):
@@ -2286,8 +2316,9 @@ class UnityParser(BaseParser):
         asset_counts = self._extract_assets(root, sub_paths, report=report)
         results.extend(asset_counts["strings"])
 
-        # ── string_table (Addressables) ────────────────────────────────────
-        if any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources):
+        # ── string_table (Addressables / discovered in assets) ─────────────
+        loc_enabled = any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources) or bool(getattr(self, "_discovered_loc_files", None))
+        if loc_enabled:
             before = len(results)
             results.extend(self._extract_localization(root, sub_paths))
             report.record(SOURCE_STRING_TABLE, len(results) - before, enabled=True)
@@ -2469,6 +2500,7 @@ class UnityParser(BaseParser):
                             if ("m_TableData" in tree and "m_LocaleIdentifier" in tree) or (
                                 "m_Entries" in tree and "m_TableCollectionName" in tree
                             ):
+                                self._discovered_loc_files.add(os.path.normpath(fpath))
                                 typetree_handled_pids.add(obj.path_id)
                                 continue
 
@@ -3176,7 +3208,9 @@ class UnityParser(BaseParser):
             return []
 
         aa_bundles = find_aa_bundles(root)
-        if not aa_bundles:
+        extra_loc = [p for p in sorted(getattr(self, "_discovered_loc_files", set())) if p not in aa_bundles and os.path.isfile(p)]
+        loc_files = aa_bundles + extra_loc
+        if not loc_files:
             return []
 
         # Phase 1: Collect global SharedTableData across ALL bundles, and gather available locales
@@ -3184,7 +3218,7 @@ class UnityParser(BaseParser):
         all_shared_list: list[dict] = []
         available_locales: set[str] = set()
 
-        for bundle_path in aa_bundles:
+        for bundle_path in loc_files:
             try:
                 rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
                 orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
@@ -3225,7 +3259,7 @@ class UnityParser(BaseParser):
 
         # Phase 2: Extract StringTables
         results = []
-        for bundle_path in aa_bundles:
+        for bundle_path in loc_files:
             rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
             try:
                 orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
@@ -3303,7 +3337,8 @@ class UnityParser(BaseParser):
         )
         written += n_assets
 
-        if any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources):
+        loc_enabled = any(s.id == SOURCE_STRING_TABLE and s.enabled for s in report.sources) or bool(getattr(self, "_discovered_loc_files", None))
+        if loc_enabled:
             n = self._inject_localization(root, translations, target_lang, sub_paths)
             written += n
             report.record(SOURCE_STRING_TABLE, n, enabled=True)
@@ -3542,6 +3577,7 @@ class UnityParser(BaseParser):
                                 if ("m_TableData" in tree and "m_LocaleIdentifier" in tree) or (
                                     "m_Entries" in tree and "m_TableCollectionName" in tree
                                 ):
+                                    self._discovered_loc_files.add(os.path.normpath(fpath))
                                     typetree_modified_pids.add(obj.path_id)
                                     continue
 
@@ -3854,15 +3890,32 @@ class UnityParser(BaseParser):
                         except Exception:
                             failed_count += 1
 
-                # Dynamic TTF font replacement for TMP_FontAsset
+                # ── Advanced TMP fallback / donor / drought handling ──────────
+                converted_count = 0
                 script = _target_script(target_lang)
-                if fonts_to_replace and font_bytes and (script is not None or target_lang is None):
+                tmp_donor = None
+                tmp_victims = set()
+                tmp_cov = {}
+                if script:
+                    try:
+                        tmp_donor, tmp_victims, tmp_cov, _ = self._find_tmp_donors_and_victims(env, script)
+                    except Exception:
+                        pass
+
+                # Dynamic TTF font replacement for Font (ClassID 128) - both TMP and UnityEngine.UI.Text
+                if font_bytes and (script is not None or target_lang is None):
                     for obj in env.objects:
-                        if obj.type.name == "Font" and obj.path_id in fonts_to_replace:
+                        if obj.type.name == "Font":
+                            should_replace = obj.path_id in fonts_to_replace
                             data = None
                             try:
                                 tree = obj.read_typetree()
                                 blob = bytes(tree.get("m_FontData") or b"")
+                                if not should_replace and script and len(blob) > 100:
+                                    if _ttf_covers_script(blob, script) is False:
+                                        should_replace = True
+                                if not should_replace:
+                                    continue
                                 if script and _ttf_covers_script(blob, script) is True:
                                     continue
                                 existing_fdata = tree.get("m_FontData")
@@ -3877,6 +3930,11 @@ class UnityParser(BaseParser):
                                 try:
                                     data = obj.read()
                                     blob = bytes(getattr(data, "m_FontData", b"") or b"")
+                                    if not should_replace and script and len(blob) > 100:
+                                        if _ttf_covers_script(blob, script) is False:
+                                            should_replace = True
+                                    if not should_replace:
+                                        continue
                                     if script and _ttf_covers_script(blob, script) is True:
                                         continue
                                     if hasattr(data, "m_FontData"):
@@ -3891,12 +3949,8 @@ class UnityParser(BaseParser):
                                 except Exception as e_font:
                                     print(f"Failed to replace font in Font path_id={obj.path_id}: {e_font}", file=sys.stderr)
 
-                # ── Advanced TMP fallback / donor / drought handling ──────────
-                converted_count = 0
                 if script:
                     try:
-                        tmp_donor, tmp_victims, tmp_cov, _ = self._find_tmp_donors_and_victims(env, script)
-
                         # Fallback for tmp_font_objs / tmp_settings_objs if empty
                         if not tmp_font_objs and tmp_cov:
                             tmp_font_objs = [o for o in env.objects if o.path_id in tmp_cov]
@@ -4479,14 +4533,16 @@ class UnityParser(BaseParser):
             return 0
 
         aa_bundles = find_aa_bundles(root)
-        if not aa_bundles:
+        extra_loc = [p for p in sorted(getattr(self, "_discovered_loc_files", set())) if p not in aa_bundles and os.path.isfile(p)]
+        loc_files = aa_bundles + extra_loc
+        if not loc_files:
             return 0
 
         # Phase 1: Collect global SharedTableData across ALL bundles
         global_shared_tables: dict[int, dict] = {}
         all_shared_list: list[dict] = []
 
-        for bundle_path in aa_bundles:
+        for bundle_path in loc_files:
             try:
                 rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
                 if self._is_modified_in_run(bundle_path):
@@ -4524,7 +4580,10 @@ class UnityParser(BaseParser):
 
         # Phase 2: Inject into StringTables
         written = 0
-        for bundle_path in aa_bundles:
+        tl = (target_lang or "").lower()
+        tl_code = tl.split("-")[0].split("_")[0] if tl else ""
+
+        for bundle_path in loc_files:
             rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
             try:
                 if self._is_modified_in_run(bundle_path):
@@ -4542,6 +4601,9 @@ class UnityParser(BaseParser):
                         env = UnityPy.load(bundle_path)
                 changed = False
 
+                col_entry_translations: dict[tuple[str, int], str] = {}
+                target_locale_tables: list[tuple[Any, Any, dict, str, str]] = []
+
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -4556,6 +4618,16 @@ class UnityParser(BaseParser):
                         id_to_key = shared.get("id_to_key", {})
                         collection_name = shared.get("name") or getattr(obj, "name", None) or getattr(data, "name", None) or "Unknown"
 
+                        is_target_locale = bool(
+                            tl_code and (
+                                raw_locale.lower() == tl
+                                or raw_locale.lower().startswith(tl_code)
+                                or (tl_code in ("ru", "russian") and raw_locale.lower() in ("ru", "ru-ru", "russian"))
+                            )
+                        )
+                        if is_target_locale:
+                            target_locale_tables.append((obj, data, tree, collection_name, raw_locale))
+
                         entry_modified = False
                         for entry in tree["m_TableData"]:
                             value = entry.get("m_Localized", "")
@@ -4569,12 +4641,31 @@ class UnityParser(BaseParser):
                                 entry["m_Localized"] = translations[sid]
                                 entry_modified = True
                                 written += 1
+                                col_entry_translations[(collection_name, entry_id)] = translations[sid]
 
                         if entry_modified:
                             _save_typetree_safe(obj, data, tree)
                             changed = True
                     except Exception:
                         pass
+
+                # Second pass to sync translations into target locale table (e.g. ru table)
+                if col_entry_translations and target_locale_tables:
+                    for obj, data, tree, collection_name, raw_locale in target_locale_tables:
+                        try:
+                            sync_modified = False
+                            for entry in tree.get("m_TableData", []):
+                                entry_id = entry.get("m_Id")
+                                if (collection_name, entry_id) in col_entry_translations:
+                                    target_val = col_entry_translations[(collection_name, entry_id)]
+                                    if entry.get("m_Localized") != target_val:
+                                        entry["m_Localized"] = target_val
+                                        sync_modified = True
+                            if sync_modified:
+                                _save_typetree_safe(obj, data, tree)
+                                changed = True
+                        except Exception:
+                            pass
 
                 if changed:
                     saved_bytes = None
