@@ -23,10 +23,11 @@ import csv
 import io
 import struct
 import tempfile
+import shutil
 import subprocess
 from typing import Any
 from collections.abc import Generator
-from .base import BaseParser, TranslationString, make_id
+from .base import BaseParser, TranslationString, make_id, read_backup_original
 from .unity_sources import (
     SOURCE_CONTENT,
     SOURCE_DLL,
@@ -523,6 +524,9 @@ def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
         t = s.strip()
         if not t:
             continue
+        if not nano:
+            if offset % 4 != 0 and not (len(s) >= 6 and " " in s):
+                continue
         prev = seq[i - 1][1].strip() if i > 0 else ""
         nxt = seq[i + 1][1].strip() if i + 1 < len(seq) else ""
         # Opcode sits immediately before the Commands assembly marker.
@@ -982,6 +986,7 @@ _SKIP_TYPETREE_BRANCHES = frozenset({
     "m_GameObject", "m_Script", "m_Enabled", "m_Name", "m_Father",
     "m_Children", "m_Component", "m_Transform", "m_ObjectHideFlags",
     "m_CorrespondingSourceObject", "m_PrefabInstance", "m_PrefabAsset",
+    "m_VisualElementAssets",
 })
 
 
@@ -1058,6 +1063,23 @@ _JSON_ALLOWED_TEXT_SUFFIXES = frozenset({
 })
 
 
+def _is_technical_id_token(s: str) -> bool:
+    """Return True if s looks like a code identifier or technical ID."""
+    if not s or " " in s:
+        return False
+    if s.lower() in _KNOWN_UI:
+        return False
+    if "_" in s or "/" in s or "\\" in s:
+        return True
+    if any(c.isdigit() for c in s):
+        return True
+    if re.search(r"[a-z][A-Z]", s):
+        return True
+    if s.isupper() and len(s) <= 4:
+        return True
+    return False
+
+
 def _walk_json_leaves(node: Any, path: list[str]) -> list[tuple[list[str], str]]:
     """Recursively find string leaves in generic JSON."""
     out: list[tuple[list[str], str]] = []
@@ -1067,23 +1089,31 @@ def _walk_json_leaves(node: Any, path: list[str]) -> list[tuple[list[str], str]]
             if k_low in _JSON_STRICT_TECHNICAL_KEYS:
                 continue
 
-            is_suspicious_key = (
+            is_strict_skip_key = (
                 k_low in _JSON_SKIP_KEYS
-                or (
-                    k_low.endswith(("id", "_id", "key", "_key", "path", "file", "prefab", "scene", "sprite", "sound", "sfx", "anim"))
-                    and not any(k_low.endswith(suf) for suf in _JSON_ALLOWED_TEXT_SUFFIXES)
-                )
+                or k_low.endswith(("path", "file", "prefab", "scene", "sprite", "sound", "sfx", "anim"))
+            )
+            is_id_or_key = (
+                k_low.endswith(("id", "_id", "key", "_key", "term", "_term"))
+                and not any(k_low.endswith(suf) for suf in _JSON_ALLOWED_TEXT_SUFFIXES)
             )
 
             if isinstance(v, str):
-                if is_suspicious_key:
-                    v_str = v.strip()
+                v_str = v.strip()
+                if is_strict_skip_key:
+                    if "/" in v_str or "\\" in v_str:
+                        continue
                     is_sentence = (" " in v_str and len(v_str.split()) >= 3) or any(p in v_str for p in ".?!")
-                    if not is_sentence or "/" in v_str or "\\" in v_str:
+                    if not is_sentence:
+                        continue
+                elif is_id_or_key:
+                    if "/" in v_str or "\\" in v_str:
+                        continue
+                    if _is_technical_id_token(v_str):
                         continue
                 out.append((path + [k], v))
             elif isinstance(v, (dict, list)):
-                if is_suspicious_key:
+                if is_strict_skip_key or is_id_or_key:
                     continue
                 out.extend(_walk_json_leaves(v, path + [k]))
     elif isinstance(node, list):
@@ -1147,6 +1177,110 @@ def _replace_ink_root(root_node: Any, current_idx: list[int], replacements: dict
     return modified
 
 
+_XML_TRANSLATABLE_ATTRS = frozenset({
+    "text", "value", "label", "title", "desc", "description", "caption", "dialogue",
+})
+
+
+def _extract_xml_strings(xml_text: str) -> list[tuple[str, str]]:
+    """Extract translatable strings from XML text using ElementTree."""
+    import xml.etree.ElementTree as ET
+    out: list[tuple[str, str]] = []
+    clean_text = xml_text.lstrip()
+    if clean_text.startswith("\ufeff"):
+        clean_text = clean_text[1:].lstrip()
+    try:
+        root_elem = ET.fromstring(clean_text)
+    except Exception:
+        return []
+
+    def _walk(elem: ET.Element, path: str) -> None:
+        if elem.text:
+            t = elem.text.strip()
+            if t and _is_game_text(t):
+                out.append((f"{path}:text", t))
+        for attr_name, attr_val in elem.attrib.items():
+            if attr_name.lower() in _XML_TRANSLATABLE_ATTRS and isinstance(attr_val, str):
+                v = attr_val.strip()
+                if v and _is_game_text(v):
+                    out.append((f"{path}:attr:{attr_name}", v))
+        for idx, child in enumerate(elem):
+            _walk(child, f"{path}.{idx}")
+
+    _walk(root_elem, "0")
+    return out
+
+
+def _inject_xml_strings(xml_text: str, replacements: dict[str, str]) -> str:
+    """Inject translations into XML text using ElementTree."""
+    import xml.etree.ElementTree as ET
+    has_bom = xml_text.startswith("\ufeff")
+    clean_text = xml_text[1:] if has_bom else xml_text
+    has_decl = clean_text.lstrip().startswith("<?xml")
+    root_elem = ET.fromstring(clean_text)
+
+    def _inject(elem: ET.Element, path: str) -> None:
+        k = f"{path}:text"
+        if k in replacements and elem.text is not None:
+            lws = elem.text[: len(elem.text) - len(elem.text.lstrip())]
+            tws = elem.text[len(elem.text.rstrip()) :]
+            elem.text = lws + replacements[k] + tws
+        for a in list(elem.attrib.keys()):
+            ak = f"{path}:attr:{a}"
+            if ak in replacements:
+                elem.attrib[a] = replacements[ak]
+        for idx, child in enumerate(elem):
+            _inject(child, f"{path}.{idx}")
+
+    _inject(root_elem, "0")
+    res = ET.tostring(root_elem, encoding="utf-8", xml_declaration=has_decl).decode("utf-8")
+    if has_bom:
+        res = "\ufeff" + res
+    return res
+
+
+def _resolve_i2_lang_indices(tree: dict, target_lang: str | None = None) -> tuple[int, list[int]]:
+    """Find source (English/primary) language index and target language indices in I2 LanguageSource."""
+    m_langs = None
+    if "mLanguages" in tree and isinstance(tree["mLanguages"], list):
+        m_langs = tree["mLanguages"]
+    elif "mSource" in tree and isinstance(tree["mSource"], dict):
+        ms = tree["mSource"]
+        if "mLanguages" in ms and isinstance(ms.get("mLanguages"), list):
+            m_langs = ms["mLanguages"]
+
+    if not m_langs:
+        return 0, []
+
+    src_idx = 0
+    for idx, lang_info in enumerate(m_langs):
+        if not isinstance(lang_info, dict):
+            continue
+        code = str(lang_info.get("Code", "")).strip().lower()
+        name = str(lang_info.get("Name", "")).strip().lower()
+        if code in ("en", "en-us", "en-gb") or "english" in name:
+            src_idx = idx
+            break
+
+    target_indices: list[int] = []
+    if target_lang:
+        t_low = target_lang.strip().lower()
+        for idx, lang_info in enumerate(m_langs):
+            if not isinstance(lang_info, dict):
+                continue
+            code = str(lang_info.get("Code", "")).strip().lower()
+            name = str(lang_info.get("Name", "")).strip().lower()
+            if (
+                t_low == code
+                or t_low in name
+                or (t_low in ("ru", "russian") and (code == "ru" or "russian" in name))
+            ):
+                if idx not in target_indices:
+                    target_indices.append(idx)
+
+    return src_idx, target_indices
+
+
 def _save_typetree_safe(obj: Any, data: Any, tree: dict) -> None:
     """Save TypeTree safely across different UnityPy ObjectReader / Object versions."""
     if hasattr(obj, "save_typetree"):
@@ -1157,6 +1291,169 @@ def _save_typetree_safe(obj: Any, data: Any, tree: dict) -> None:
         obj.save()
     elif data is not None and hasattr(data, "save"):
         data.save()
+
+
+_VTA_TEXT_KEYS = frozenset({"text", "label", "title", "tooltip", "placeholder-text", "placeholder"})
+
+
+def _extract_from_visual_tree_asset(
+    tree: dict,
+    path_id: int,
+    rel_path: str,
+    base_name: str,
+    mk_fn: Any,
+) -> list[TranslationString]:
+    out: list[TranslationString] = []
+    ve_assets = tree.get("m_VisualElementAssets")
+    if not isinstance(ve_assets, list):
+        return out
+
+    for ve_idx, ve in enumerate(ve_assets):
+        if not isinstance(ve, dict):
+            continue
+
+        ve_text = ve.get("m_Text")
+        if isinstance(ve_text, str) and ve_text.strip() and _is_game_text(ve_text):
+            path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), "m_Text"]
+            ctx = f"VisualTreeAsset: {base_name}, Element: {ve_idx}, Field: m_Text"
+            out.append(mk_fn(rel_path, path, ve_text, ctx))
+
+        props = ve.get("m_Properties")
+        if not isinstance(props, list):
+            props = ve.get("m_SerializedProperties")
+        if not isinstance(props, list):
+            continue
+
+        is_flat_strings = len(props) > 0 and all(isinstance(x, str) for x in props)
+        if is_flat_strings:
+            p_idx = 0
+            while p_idx < len(props):
+                item = props[p_idx]
+                k = item.lower().strip()
+                if k in _VTA_TEXT_KEYS and p_idx + 1 < len(props):
+                    val = props[p_idx + 1]
+                    if isinstance(val, str) and val.strip() and _is_game_text(val):
+                        prop_idx = p_idx + 1
+                        path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                        ctx = f"VisualTreeAsset: {base_name}, Element: {ve_idx}, Prop: {k}"
+                        out.append(mk_fn(rel_path, path, val, ctx))
+                    p_idx += 2
+                elif "=" in item or ":" in item:
+                    sep = "=" if "=" in item else ":"
+                    k_part, val_part = item.split(sep, 1)
+                    if k_part.lower().strip() in _VTA_TEXT_KEYS:
+                        val = val_part.strip()
+                        if val and _is_game_text(val):
+                            path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(p_idx)]
+                            ctx = f"VisualTreeAsset: {base_name}, Element: {ve_idx}, Prop: {k_part.strip()}"
+                            out.append(mk_fn(rel_path, path, val, ctx))
+                    p_idx += 1
+                else:
+                    p_idx += 1
+        else:
+            for prop_idx, prop in enumerate(props):
+                if isinstance(prop, dict):
+                    name = str(prop.get("name") or prop.get("m_Name") or prop.get("key") or prop.get("m_Property") or "").lower().strip()
+                    if name in _VTA_TEXT_KEYS:
+                        val = prop.get("value") if "value" in prop else (prop.get("m_Value") if "m_Value" in prop else prop.get("val"))
+                        if isinstance(val, str) and val.strip() and _is_game_text(val):
+                            path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                            ctx = f"VisualTreeAsset: {base_name}, Element: {ve_idx}, Prop: {name}"
+                            out.append(mk_fn(rel_path, path, val, ctx))
+                    else:
+                        for k, v in prop.items():
+                            if k.lower().strip() in _VTA_TEXT_KEYS and isinstance(v, str) and v.strip() and _is_game_text(v):
+                                path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                                ctx = f"VisualTreeAsset: {base_name}, Element: {ve_idx}, Prop: {k}"
+                                out.append(mk_fn(rel_path, path, v, ctx))
+                                break
+    return out
+
+
+def _inject_into_visual_tree_asset(
+    tree: dict,
+    path_id: int,
+    rel_path: str,
+    translations: dict[str, str],
+    engine: str,
+) -> int:
+    ve_assets = tree.get("m_VisualElementAssets")
+    if not isinstance(ve_assets, list):
+        return 0
+
+    hits = 0
+    for ve_idx, ve in enumerate(ve_assets):
+        if not isinstance(ve, dict):
+            continue
+
+        ve_text = ve.get("m_Text")
+        if isinstance(ve_text, str) and ve_text.strip():
+            path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), "m_Text"]
+            sid = make_id(engine, rel_path, path, ve_text)
+            if sid in translations:
+                ve["m_Text"] = translations[sid]
+                hits += 1
+
+        props = ve.get("m_Properties")
+        if not isinstance(props, list):
+            props = ve.get("m_SerializedProperties")
+        if not isinstance(props, list):
+            continue
+
+        is_flat_strings = len(props) > 0 and all(isinstance(x, str) for x in props)
+        if is_flat_strings:
+            p_idx = 0
+            while p_idx < len(props):
+                item = props[p_idx]
+                k = item.lower().strip()
+                if k in _VTA_TEXT_KEYS and p_idx + 1 < len(props):
+                    val = props[p_idx + 1]
+                    if isinstance(val, str) and val.strip():
+                        prop_idx = p_idx + 1
+                        path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                        sid = make_id(engine, rel_path, path, val)
+                        if sid in translations:
+                            props[prop_idx] = translations[sid]
+                            hits += 1
+                    p_idx += 2
+                elif "=" in item or ":" in item:
+                    sep = "=" if "=" in item else ":"
+                    k_part, val_part = item.split(sep, 1)
+                    if k_part.lower().strip() in _VTA_TEXT_KEYS:
+                        val = val_part.strip()
+                        if val:
+                            path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(p_idx)]
+                            sid = make_id(engine, rel_path, path, val)
+                            if sid in translations:
+                                props[p_idx] = f"{k_part}{sep}{translations[sid]}"
+                                hits += 1
+                    p_idx += 1
+                else:
+                    p_idx += 1
+        else:
+            for prop_idx, prop in enumerate(props):
+                if isinstance(prop, dict):
+                    name = str(prop.get("name") or prop.get("m_Name") or prop.get("key") or prop.get("m_Property") or "").lower().strip()
+                    if name in _VTA_TEXT_KEYS:
+                        val_key = "value" if "value" in prop else ("m_Value" if "m_Value" in prop else ("val" if "val" in prop else None))
+                        if val_key:
+                            orig_val = prop[val_key]
+                            if isinstance(orig_val, str) and orig_val.strip():
+                                path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                                sid = make_id(engine, rel_path, path, orig_val)
+                                if sid in translations:
+                                    prop[val_key] = translations[sid]
+                                    hits += 1
+                    else:
+                        for k, v in list(prop.items()):
+                            if k.lower().strip() in _VTA_TEXT_KEYS and isinstance(v, str) and v.strip():
+                                path = ["Asset", "VisualTreeAsset", str(path_id), str(ve_idx), str(prop_idx)]
+                                sid = make_id(engine, rel_path, path, v)
+                                if sid in translations:
+                                    prop[k] = translations[sid]
+                                    hits += 1
+                                    break
+    return hits
 
 
 def _resolve_shared_table(
@@ -1336,6 +1633,20 @@ def find_managed_dir(root: str) -> str | None:
                 return dirpath
     return None
 
+def _safe_yaml_unescape(s: str) -> str:
+    def _repl(m: re.Match[str]) -> str:
+        seq = m.group(0)
+        if seq == r"\n": return "\n"
+        if seq == r"\r": return "\r"
+        if seq == r"\t": return "\t"
+        if seq == r'\"': return '"'
+        if seq == r"\\": return "\\"
+        try:
+            return chr(int(seq[2:], 16))
+        except ValueError:
+            return seq
+    return re.sub(r'\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[nrt"\\])', _repl, s)
+
 def _parse_multiline_yaml_val(lines: list[str], start_line_idx: int, initial_raw_val: str) -> tuple[str | None, int]:
     line_idx = start_line_idx
     raw_val = initial_raw_val
@@ -1370,16 +1681,30 @@ def _parse_multiline_yaml_val(lines: list[str], start_line_idx: int, initial_raw
         try:
             val = json.loads(raw_val)
         except Exception:
-            val = raw_val[1:-1]
+            val = _safe_yaml_unescape(raw_val[1:-1])
     elif raw_val.startswith("'") and raw_val.endswith("'"):
         val = raw_val[1:-1].replace("''", "'")
     else:
-        val = raw_val
+        if "\\" in raw_val:
+            val = _safe_yaml_unescape(raw_val)
+        else:
+            val = raw_val
+
+    if val is not None:
+        try:
+            val = val.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        except Exception:
+            pass
+
     return val, line_idx
+
 
 def iter_files(root: str, sub_paths: list[str] | None = None) -> Generator[str, None, None]:
     paths_to_walk = [root] if not sub_paths else [os.path.join(root, p) for p in sub_paths]
     for start_path in paths_to_walk:
+        if os.path.isfile(start_path):
+            yield start_path
+            continue
         for dirpath, dirnames, filenames in os.walk(start_path):
             dirnames[:] = [d for d in dirnames if d.lower() not in IGNORE_DIRS and not d.startswith(".")]
             for f in filenames:
@@ -1595,6 +1920,23 @@ def _font_base_name(name: str) -> str:
     return n.strip().lower().replace(" ", "")
 
 
+def _is_yaml_asset(fpath: str) -> bool:
+    """Check if a .unity / .prefab / .asset file is text YAML or binary SerializedFile."""
+    try:
+        with open(fpath, "rb") as f:
+            head = f.read(64)
+        if head.startswith(b"\xef\xbb\xbf"):
+            head = head[3:]
+        head = head.lstrip()
+        if head.startswith(b"%YAML") or head.startswith(b"--- !u!"):
+            return True
+        if not fpath.lower().endswith(".asset") and any(head.startswith(kw) for kw in (b"MonoBehaviour:", b"GameObject:", b"%YAML")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 class UnityParser(BaseParser):
     engine = "unity"
 
@@ -1606,6 +1948,113 @@ class UnityParser(BaseParser):
         self._font_bytes_cache: dict[str, bytes | None] = {}
         # Last extract/inject multi-source report (API / logs / UI honesty).
         self.last_report: UnityPipelineReport | None = None
+        self._modified_files_in_run: set[str] = set()
+
+    def _mark_modified_in_run(self, fpath: str) -> None:
+        if not hasattr(self, "_modified_files_in_run"):
+            self._modified_files_in_run = set()
+        self._modified_files_in_run.add(os.path.normpath(fpath))
+
+    def _is_modified_in_run(self, fpath: str) -> bool:
+        if not hasattr(self, "_modified_files_in_run"):
+            return False
+        return os.path.normpath(fpath) in self._modified_files_in_run
+
+    def _read_asset_backup_original(self, root: str, fpath: str, rel_path: str) -> bytes | None:
+        """Read the original un-injected bytes of an asset.
+
+        For split assets (.split0), reconstitutes the full original asset by concatenating
+        all backup parts (.split0, .split1, ...) or reading un-injected disk parts.
+        Returns None if no backup exists for this file or its parts.
+        """
+        if fpath.lower().endswith(".split0"):
+            base_fpath = fpath[:-7]
+            base_rel = rel_path[:-7]
+            chunks: list[bytes] = []
+            any_backed_up = False
+            idx = 0
+            while True:
+                part_rel = f"{base_rel}.split{idx}"
+                part_fpath = f"{base_fpath}.split{idx}"
+                part_orig = read_backup_original(root, part_rel)
+                if part_orig is not None:
+                    any_backed_up = True
+                    chunks.append(part_orig)
+                elif os.path.isfile(part_fpath):
+                    try:
+                        with open(part_fpath, "rb") as pf:
+                            chunks.append(pf.read())
+                    except Exception:
+                        break
+                else:
+                    break
+                idx += 1
+
+            if any_backed_up and chunks:
+                return b"".join(chunks)
+            return None
+        return read_backup_original(root, rel_path)
+
+    def _save_or_split_asset(self, root: str, fpath: str, data: bytes) -> None:
+        """Save asset data to disk.
+
+        If fpath is a split asset (.split0), slices data into chunks matching the
+        original split size, backs up all existing parts, overwrites/creates
+        .split0, .split1, ..., and deletes any leftover stale split files.
+        Otherwise backs up and writes the single asset file.
+        """
+        if fpath.lower().endswith(".split0"):
+            base_prefix = fpath[:-7]
+            existing_parts: list[str] = []
+            idx = 0
+            while True:
+                part_path = f"{base_prefix}.split{idx}"
+                if os.path.isfile(part_path):
+                    existing_parts.append(part_path)
+                    idx += 1
+                else:
+                    break
+
+            for part in existing_parts:
+                self.backup_file(root, part)
+
+            chunk_size = 0
+            part_split1 = f"{base_prefix}.split1"
+            if os.path.isfile(part_split1):
+                try:
+                    chunk_size = os.path.getsize(part_split1)
+                except Exception:
+                    chunk_size = 0
+            if chunk_size <= 0 and os.path.isfile(fpath):
+                try:
+                    chunk_size = os.path.getsize(fpath)
+                except Exception:
+                    chunk_size = 0
+            if chunk_size <= 0:
+                chunk_size = max(len(data), 1024 * 1024)
+
+            num_chunks = max(1, (len(data) + chunk_size - 1) // chunk_size) if data else 1
+            for k in range(num_chunks):
+                part_path = f"{base_prefix}.split{k}"
+                chunk = data[k * chunk_size : (k + 1) * chunk_size]
+                with open(part_path, "wb") as pf:
+                    pf.write(chunk)
+                self._mark_modified_in_run(part_path)
+
+            for k in range(num_chunks, len(existing_parts)):
+                leftover_part = f"{base_prefix}.split{k}"
+                if os.path.isfile(leftover_part):
+                    try:
+                        os.remove(leftover_part)
+                    except Exception:
+                        pass
+            self._mark_modified_in_run(fpath)
+        else:
+            self.backup_file(root, fpath)
+            with open(fpath, "wb") as f:
+                f.write(data)
+            self._mark_modified_in_run(fpath)
+
 
     def engine_prompt_addon(self) -> str:
         return (
@@ -1713,11 +2162,14 @@ class UnityParser(BaseParser):
             f_lower = f.lower()
             if f_lower == "data.unity3d" or f_lower.endswith((".bundle", ".assetbundle")):
                 compiled_files.append(fpath)
-            elif f_lower.endswith(".assets") or (f_lower.startswith("level") and "." not in f):
+            elif f_lower.endswith((".assets", ".split0")) or (f_lower.startswith("level") and "." not in f):
                 if not f_lower.endswith(".manifest") and not f_lower.endswith(".resS") and not f_lower.endswith(".resource") and f_lower != "level":
                     compiled_files.append(fpath)
-            elif f_lower.endswith(".unity") or f_lower.endswith(".prefab") or f_lower.endswith(".asset"):
-                source_files.append(fpath)
+            elif f_lower.endswith((".unity", ".prefab", ".asset")):
+                if _is_yaml_asset(fpath):
+                    source_files.append(fpath)
+                else:
+                    compiled_files.append(fpath)
         return compiled_files, source_files
 
     def _get_editor_path(self) -> str:
@@ -1802,7 +2254,7 @@ class UnityParser(BaseParser):
                 return True
             if f_lower.endswith(".assetbundle") or f_lower.endswith(".bundle"):
                 return True
-            if f_lower.endswith(".assets") or f_lower.startswith("level"):
+            if f_lower.endswith((".assets", ".split0")) or f_lower.startswith("level"):
                 if not f_lower.endswith(".manifest") and not f_lower.endswith(".resS") and not f_lower.endswith(".resource"):
                     return True
             if f_lower.endswith(".unity") or f_lower.endswith(".prefab"):
@@ -1883,9 +2335,23 @@ class UnityParser(BaseParser):
                     if fpath in self._dll_extract_cache:
                         extracted = self._dll_extract_cache[fpath]
                     else:
-                        stdout = self._run_editor(["extract", fpath])
-                        extracted = json.loads(stdout)
-                        self._dll_extract_cache[fpath] = extracted
+                        orig_bytes = read_backup_original(root, rel_path)
+                        if orig_bytes is not None:
+                            import tempfile
+                            temp_dll_dir = tempfile.mkdtemp(prefix="interprex_dll_orig_")
+                            temp_dll_path = os.path.join(temp_dll_dir, f)
+                            try:
+                                with open(temp_dll_path, "wb") as tdf:
+                                    tdf.write(orig_bytes)
+                                stdout = self._run_editor(["extract", temp_dll_path])
+                                extracted = json.loads(stdout)
+                                self._dll_extract_cache[fpath] = extracted
+                            finally:
+                                shutil.rmtree(temp_dll_dir, ignore_errors=True)
+                        else:
+                            stdout = self._run_editor(["extract", fpath])
+                            extracted = json.loads(stdout)
+                            self._dll_extract_cache[fpath] = extracted
 
                     for item in extracted:
                         original = item.get("original", "")
@@ -1942,7 +2408,16 @@ class UnityParser(BaseParser):
             typetree_handled_pids: set[int] = set()
             env = None
             try:
-                env = UnityPy.load(fpath)
+                orig_bytes = self._read_asset_backup_original(root, fpath, rel_path)
+                if orig_bytes is not None:
+                    try:
+                        bio = io.BytesIO(orig_bytes)
+                        bio.name = fpath
+                        env = UnityPy.load(bio, path=os.path.dirname(fpath))
+                    except Exception:
+                        env = UnityPy.load(fpath)
+                else:
+                    env = UnityPy.load(fpath)
                 # Resolve and set generator using cached helper
                 unity_version = None
                 for obj in env.objects:
@@ -1953,6 +2428,21 @@ class UnityParser(BaseParser):
                     env.typetree_generator = generator
 
                 for obj in env.objects:
+                    if obj.type.name == "VisualTreeAsset":
+                        try:
+                            tree = obj.read_typetree()
+                            vta_res = _extract_from_visual_tree_asset(
+                                tree, obj.path_id, rel_path, os.path.basename(fpath), self._mk
+                            )
+                            if vta_res:
+                                results.extend(vta_res)
+                                typetree_found += len(vta_res)
+                                n_typetree += len(vta_res)
+                                typetree_handled_pids.add(obj.path_id)
+                        except Exception:
+                            failed_count += 1
+                        continue
+
                     if obj.type.name == "MonoBehaviour":
                         try:
                             # Skip library classes, handle external script load failures gracefully
@@ -1981,6 +2471,17 @@ class UnityParser(BaseParser):
                             ):
                                 typetree_handled_pids.add(obj.path_id)
                                 continue
+
+                            if class_name == "VisualTreeAsset" or "m_VisualElementAssets" in tree:
+                                vta_res = _extract_from_visual_tree_asset(
+                                    tree, obj.path_id, rel_path, os.path.basename(fpath), self._mk
+                                )
+                                if vta_res:
+                                    results.extend(vta_res)
+                                    typetree_found += len(vta_res)
+                                    n_typetree += len(vta_res)
+                                    typetree_handled_pids.add(obj.path_id)
+                                    continue
 
                             obj_hits = 0
 
@@ -2038,12 +2539,14 @@ class UnityParser(BaseParser):
                                     terms_list = ms["mTerms"]
 
                             if terms_list:
+                                src_idx, _ = _resolve_i2_lang_indices(tree)
                                 for term in terms_list:
                                     if isinstance(term, dict):
                                         term_key = term.get("Term")
                                         langs = term.get("Languages")
                                         if term_key and isinstance(langs, list) and langs:
-                                            val = langs[0]
+                                            idx = src_idx if src_idx < len(langs) else 0
+                                            val = langs[idx]
                                             if isinstance(val, str) and val and not val.isspace() and _is_game_text(val):
                                                 path = ["Asset", "I2Term", str(obj.path_id), str(term_key)]
                                                 context = f"I2 Localization: {term_key}, File: {os.path.basename(fpath)}, PathID: {obj.path_id}"
@@ -2092,7 +2595,7 @@ class UnityParser(BaseParser):
                             # 4. Generic deep typetree walk for custom ScriptableObjects / MonoBehaviours
                             generic_hits = _walk_typetree_generic(tree, [])
                             for p_parts, val in generic_hits:
-                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations"):
+                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations", "m_VisualElementAssets"):
                                     continue
                                 dot_path = ".".join(p_parts)
                                 path = ["AssetTree", str(obj.path_id), dot_path]
@@ -2175,12 +2678,12 @@ class UnityParser(BaseParser):
                                     asset_name = f"TextAsset_{obj.path_id}"
 
                                 textasset_hits = 0
-                                is_ink = False
+                                handled = False
                                 if "inkVersion" in script_content and "root" in script_content:
                                     try:
                                         ink_data = json.loads(script_content)
                                         if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
-                                            is_ink = True
+                                            handled = True
                                             ink_hits = _walk_ink_root(ink_data.get("root"), [0])
                                             for idx, raw_ink_text in ink_hits:
                                                 ink_text = raw_ink_text[1:]
@@ -2194,9 +2697,10 @@ class UnityParser(BaseParser):
                                     except Exception:
                                         pass
 
-                                if not is_ink and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
+                                if not handled and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
                                     try:
                                         json_obj = json.loads(script_content)
+                                        handled = True
                                         leaves = _walk_json_leaves(json_obj, [])
                                         for jpath, val in leaves:
                                             if _is_game_text(val):
@@ -2207,11 +2711,10 @@ class UnityParser(BaseParser):
                                                 typetree_found += 1
                                                 n_typetree += 1
                                                 textasset_hits += 1
-                                        is_ink = True
                                     except Exception:
                                         pass
 
-                                if not is_ink and ("\n" in script_content or "\r" in script_content):
+                                if not handled and ("\n" in script_content or "\r" in script_content):
                                     delim = _detect_csv_delim(script_content)
                                     if delim:
                                         try:
@@ -2237,6 +2740,18 @@ class UnityParser(BaseParser):
                                                                 textasset_hits += 1
                                         except Exception:
                                             pass
+
+                                if not handled:
+                                    stripped = script_content.lstrip()
+                                    if stripped.startswith("<?xml") or (stripped.startswith("<") and ">" in stripped):
+                                        xml_hits = _extract_xml_strings(script_content)
+                                        for xml_path, val in xml_hits:
+                                            path = ["TextAsset", str(obj.path_id), "xml", xml_path]
+                                            context = f"TextAsset (XML): {asset_name}, Path: {xml_path}, File: {os.path.basename(fpath)}"
+                                            results.append(self._mk(rel_path, path, val, context))
+                                            typetree_found += 1
+                                            n_typetree += 1
+                                            textasset_hits += 1
 
                                 if textasset_hits > 0:
                                     typetree_handled_pids.add(obj.path_id)
@@ -2281,21 +2796,38 @@ class UnityParser(BaseParser):
         for fpath in source_files:
             rel_path = os.path.relpath(fpath, root).replace("\\", "/")
             try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
+                orig_bytes = read_backup_original(root, rel_path)
+                if orig_bytes is not None:
+                    try:
+                        content = orig_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content = orig_bytes.decode("latin-1", errors="ignore")
+                else:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
                 
                 lines = content.splitlines()
                 line_idx = 0
+                is_asset_file = fpath.lower().endswith(".asset")
                 while line_idx < len(lines):
                     line = lines[line_idx]
-                    match = re.search(r'm_[Tt]ext(?:UGUI)?:\s*(.*)', line)
+                    m_field = None
+                    raw_val = None
+                    start_line_idx = line_idx
+                    match = re.match(r'^(\s*)([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)$', line)
                     if match:
-                        raw_val = match.group(1).strip()
-                        start_line_idx = line_idx
-                        
+                        fname = match.group(2)
+                        if fname in ("m_Text", "m_text", "m_TextUGUI"):
+                            m_field = "m_Text"
+                            raw_val = match.group(3).strip()
+                        elif is_asset_file and _is_typetree_text_field(fname):
+                            m_field = fname
+                            raw_val = match.group(3).strip()
+
+                    if m_field is not None and raw_val is not None:
                         val, line_idx = _parse_multiline_yaml_val(lines, line_idx, raw_val)
                         if val and not val.isspace() and _is_game_text(val):
-                            path = ["AssetYAML", "m_Text", str(start_line_idx)]
+                            path = ["AssetYAML", m_field, str(start_line_idx)]
                             context = f"File: {os.path.basename(fpath)}, Line: {start_line_idx + 1}"
                             results.append(self._mk(rel_path, path, val, context))
                             n_yaml += 1
@@ -2470,7 +3002,8 @@ class UnityParser(BaseParser):
                              env: Any = None, font_bytes: bytes | None = None,
                              target_lang: str | None = None,
                              already_changed: bool = False,
-                             skip_pids: set[int] | None = None) -> int:
+                             skip_pids: set[int] | None = None,
+                             skip_font_pptr: bool = False) -> int:
         """Inject into MonoBehaviour raw via length-changing string rebuild.
 
         Prefers path-addressed slots ``AssetRaw / type / path_id / offset``.
@@ -2569,11 +3102,10 @@ class UnityParser(BaseParser):
             if objects_changed == 0 and not already_changed:
                 # No string edits — still try a conservative font-gap patch if
                 # the target script needs glyphs the game's fonts don't have.
-                if _target_script(target_lang):
+                if not skip_font_pptr and _target_script(target_lang):
                     self._replace_font_pptrs(env, fpath, target_lang)
                 return written
 
-            self.backup_file(root, fpath)
             # UnityPy Environment.save writes into out_path dir; use file.save bytes.
             try:
                 data = None
@@ -2586,8 +3118,7 @@ class UnityParser(BaseParser):
                 if not data:
                     data = env.file.save()
                 if isinstance(data, (bytes, bytearray)) and len(data) > 0:
-                    with open(fpath, "wb") as f:
-                        f.write(data)
+                    self._save_or_split_asset(root, fpath, bytes(data))
                 else:
                     # Multi-cab / container: fall back to env.save into temp dir
                     import shutil
@@ -2597,13 +3128,20 @@ class UnityParser(BaseParser):
                         # Find the rewritten asset by basename
                         base = os.path.basename(fpath)
                         candidate = os.path.join(tmp, base)
+                        if not os.path.isfile(candidate) and base.lower().endswith(".split0"):
+                            candidate = os.path.join(tmp, base[:-7])
                         if not os.path.isfile(candidate):
                             for dirpath, _, filenames in os.walk(tmp):
                                 if base in filenames:
                                     candidate = os.path.join(dirpath, base)
                                     break
+                                if base.lower().endswith(".split0") and base[:-7] in filenames:
+                                    candidate = os.path.join(dirpath, base[:-7])
+                                    break
                         if os.path.isfile(candidate):
-                            shutil.copy2(candidate, fpath)
+                            with open(candidate, "rb") as cf:
+                                cdata = cf.read()
+                            self._save_or_split_asset(root, fpath, cdata)
                         else:
                             print(
                                 f"UnityPy save produced no {base}; inject may be incomplete",
@@ -2616,7 +3154,7 @@ class UnityParser(BaseParser):
 
             # Font-gap patch AFTER save so we rewrite the final on-disk bytes
             # (UnityPy save would otherwise clobber a pre-save PPtr edit).
-            if _target_script(target_lang):
+            if not skip_font_pptr and _target_script(target_lang):
                 try:
                     import UnityPy
                     env2 = UnityPy.load(fpath)
@@ -2648,7 +3186,17 @@ class UnityParser(BaseParser):
 
         for bundle_path in aa_bundles:
             try:
-                env = UnityPy.load(bundle_path)
+                rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+                orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
+                if orig_bytes is not None:
+                    try:
+                        bio = io.BytesIO(orig_bytes)
+                        bio.name = bundle_path
+                        env = UnityPy.load(bio, path=os.path.dirname(bundle_path))
+                    except Exception:
+                        env = UnityPy.load(bundle_path)
+                else:
+                    env = UnityPy.load(bundle_path)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -2680,7 +3228,16 @@ class UnityParser(BaseParser):
         for bundle_path in aa_bundles:
             rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
             try:
-                env = UnityPy.load(bundle_path)
+                orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
+                if orig_bytes is not None:
+                    try:
+                        bio = io.BytesIO(orig_bytes)
+                        bio.name = bundle_path
+                        env = UnityPy.load(bio, path=os.path.dirname(bundle_path))
+                    except Exception:
+                        env = UnityPy.load(bundle_path)
+                else:
+                    env = UnityPy.load(bundle_path)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -2720,6 +3277,7 @@ class UnityParser(BaseParser):
 
     def inject(self, root: str, translations: dict[str, str], target_lang: str | None = None, sub_paths: list[str] | None = None) -> int:
         """Run enabled Unity inject sources; stash ``last_report`` with per-source counts."""
+        self._modified_files_in_run = set()
         caps = detect_unity_capabilities(root)
         report = plan_sources(caps, phase="inject")
         self.last_report = report
@@ -2770,6 +3328,7 @@ class UnityParser(BaseParser):
                 reason="no external text files in StreamingAssets",
             )
 
+        self.finalize_backups(root)
         report.finalize(written)
         print(f"[unity] {report.summary_line()}", file=sys.stderr)
         return written
@@ -2788,8 +3347,20 @@ class UnityParser(BaseParser):
                 rel_path = os.path.relpath(fpath, root).replace("\\", "/")
 
                 try:
+                    orig_bytes = read_backup_original(root, rel_path)
                     if fpath in self._dll_extract_cache:
                         extracted = self._dll_extract_cache[fpath]
+                    elif orig_bytes is not None:
+                        temp_dll_dir = tempfile.mkdtemp(prefix="interprex_dll_orig_")
+                        temp_dll_path = os.path.join(temp_dll_dir, f)
+                        try:
+                            with open(temp_dll_path, "wb") as tdf:
+                                tdf.write(orig_bytes)
+                            stdout = self._run_editor(["extract", temp_dll_path])
+                            extracted = json.loads(stdout)
+                            self._dll_extract_cache[fpath] = extracted
+                        finally:
+                            shutil.rmtree(temp_dll_dir, ignore_errors=True)
                     else:
                         stdout = self._run_editor(["extract", fpath])
                         extracted = json.loads(stdout)
@@ -2814,13 +3385,15 @@ class UnityParser(BaseParser):
 
                         try:
                             self.backup_file(root, fpath)
+                            if orig_bytes is not None and not self._is_modified_in_run(fpath):
+                                with open(fpath, "wb") as f_out:
+                                    f_out.write(orig_bytes)
                             stdout = self._run_editor(["inject", fpath, temp_json_path])
                             output = stdout.strip()
                             if output.startswith("SUCCESS:"):
                                 replaced = int(output.split(":")[1])
                                 written += replaced
-                                if fpath in self._dll_extract_cache:
-                                    del self._dll_extract_cache[fpath]
+                                self._mark_modified_in_run(fpath)
                         finally:
                             if os.path.exists(temp_json_path):
                                 os.remove(temp_json_path)
@@ -2829,6 +3402,7 @@ class UnityParser(BaseParser):
                     print(f"Error injecting into DLL {f}: {ex}", file=sys.stderr)
                     continue
 
+        self.finalize_backups(root)
         return written
 
     def _inject_assets(
@@ -2863,7 +3437,19 @@ class UnityParser(BaseParser):
             failed_count = 0
             typetree_found = 0
             try:
-                env = UnityPy.load(fpath)
+                if self._is_modified_in_run(fpath):
+                    env = UnityPy.load(fpath)
+                else:
+                    orig_bytes = self._read_asset_backup_original(root, fpath, rel_path)
+                    if orig_bytes is not None:
+                        try:
+                            bio = io.BytesIO(orig_bytes)
+                            bio.name = fpath
+                            env = UnityPy.load(bio, path=os.path.dirname(fpath))
+                        except Exception:
+                            env = UnityPy.load(fpath)
+                    else:
+                        env = UnityPy.load(fpath)
                 unity_version = None
                 for obj in env.objects:
                     unity_version = obj.assets_file.unity_version
@@ -2875,12 +3461,32 @@ class UnityParser(BaseParser):
                 changed = False
                 fonts_to_replace = set()
                 typetree_modified_pids: set[int] = set()
+                tmp_settings_objs: list[Any] = []
+                tmp_font_objs: list[Any] = []
 
                 for obj in env.objects:
                     class_name = ""
                     data = None
-                    if obj.type.name in ("MonoBehaviour", "Text"):
+                    if obj.type.name in ("MonoBehaviour", "Text", "VisualTreeAsset", "TMP_FontAsset"):
                         try:
+                            if obj.type.name == "VisualTreeAsset":
+                                data = obj.read()
+                                tree = obj.read_typetree()
+                                vta_hits = _inject_into_visual_tree_asset(
+                                    tree, obj.path_id, rel_path, translations, self.engine
+                                )
+                                if vta_hits > 0:
+                                    _save_typetree_safe(obj, data, tree)
+                                    changed = True
+                                    written += vta_hits
+                                    typetree_found += vta_hits
+                                    n_typetree += vta_hits
+                                    typetree_modified_pids.add(obj.path_id)
+                                continue
+
+                            if obj.type.name == "TMP_FontAsset":
+                                tmp_font_objs.append(obj)
+
                             if obj.type.name == "MonoBehaviour":
                                 ns = ""
                                 class_name = ""
@@ -2896,6 +3502,7 @@ class UnityParser(BaseParser):
                                     continue
 
                                 if class_name == "TMP_FontAsset":
+                                    tmp_font_objs.append(obj)
                                     if font_bytes:
                                         try:
                                             tree = None
@@ -2922,6 +3529,10 @@ class UnityParser(BaseParser):
                                             pass
                                     continue
 
+                                if class_name == "TMP_Settings" or getattr(data, "name", "") in ("TMP Settings", "TMP_Settings") or getattr(getattr(obj, "serialized_type", None), "class_name", None) == "TMP_Settings":
+                                    tmp_settings_objs.append(obj)
+                                    continue
+
                                 if class_name in _TECHNICAL_TMP_CLASSES:
                                     continue
 
@@ -2932,6 +3543,19 @@ class UnityParser(BaseParser):
                                     "m_Entries" in tree and "m_TableCollectionName" in tree
                                 ):
                                     typetree_modified_pids.add(obj.path_id)
+                                    continue
+
+                                if class_name == "VisualTreeAsset" or "m_VisualElementAssets" in tree:
+                                    vta_hits = _inject_into_visual_tree_asset(
+                                        tree, obj.path_id, rel_path, translations, self.engine
+                                    )
+                                    if vta_hits > 0:
+                                        _save_typetree_safe(obj, data, tree)
+                                        changed = True
+                                        written += vta_hits
+                                        typetree_found += vta_hits
+                                        n_typetree += vta_hits
+                                        typetree_modified_pids.add(obj.path_id)
                                     continue
                             else:
                                 data = obj.read()
@@ -2963,17 +3587,23 @@ class UnityParser(BaseParser):
                                     terms_list = ms["mTerms"]
 
                             if terms_list:
+                                src_idx, tgt_indices = _resolve_i2_lang_indices(tree, target_lang)
                                 for term in terms_list:
                                     if isinstance(term, dict):
                                         term_key = term.get("Term")
                                         langs = term.get("Languages")
                                         if term_key and isinstance(langs, list) and langs:
-                                            orig_val = langs[0]
+                                            idx = src_idx if src_idx < len(langs) else 0
+                                            orig_val = langs[idx]
                                             if isinstance(orig_val, str) and orig_val:
                                                 path = ["Asset", "I2Term", str(obj.path_id), str(term_key)]
                                                 sid = make_id(self.engine, rel_path, path, orig_val)
                                                 if sid in translations:
-                                                    langs[0] = translations[sid]
+                                                    translated = translations[sid]
+                                                    langs[idx] = translated
+                                                    for tgt_idx in tgt_indices:
+                                                        if tgt_idx < len(langs) and tgt_idx != idx:
+                                                            langs[tgt_idx] = translated
                                                     obj_modified = True
                                                     written += 1
                                                     typetree_found += 1
@@ -3008,7 +3638,7 @@ class UnityParser(BaseParser):
                             # 4. Generic deep typetree injection
                             generic_hits = _walk_typetree_generic(tree, [])
                             for p_parts, orig_val in generic_hits:
-                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations"):
+                                if p_parts and p_parts[0] in ("m_Text", "m_text", "storyText", "description", "localizedText", "mTerms", "mSource", "conversations", "m_VisualElementAssets"):
                                     continue
                                 dot_path = ".".join(p_parts)
                                 path = ["AssetTree", str(obj.path_id), dot_path]
@@ -3053,14 +3683,14 @@ class UnityParser(BaseParser):
 
                             if script_content and isinstance(script_content, str):
                                 asset_modified = False
-                                is_ink = False
+                                handled = False
 
                                 # 1. Ink JSON
                                 if "inkVersion" in script_content and "root" in script_content:
                                     try:
                                         ink_data = json.loads(script_content)
                                         if isinstance(ink_data, dict) and "inkVersion" in ink_data and "root" in ink_data:
-                                            is_ink = True
+                                            handled = True
                                             ink_hits = _walk_ink_root(ink_data.get("root"), [0])
                                             ink_replacements: dict[int, str] = {}
                                             for idx, raw_ink_text in ink_hits:
@@ -3080,7 +3710,7 @@ class UnityParser(BaseParser):
                                         pass
 
                                 # 2. Generic JSON
-                                if not is_ink and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
+                                if not handled and (script_content.strip().startswith("{") or script_content.strip().startswith("[")):
                                     try:
                                         json_obj = json.loads(script_content)
                                         leaves = _walk_json_leaves(json_obj, [])
@@ -3098,12 +3728,12 @@ class UnityParser(BaseParser):
                                             written += j_written
                                             typetree_found += j_written
                                             n_typetree += j_written
-                                        is_ink = True
+                                        handled = True
                                     except Exception:
                                         pass
 
                                 # 3. CSV / TSV table
-                                if not is_ink and ("\n" in script_content or "\r" in script_content):
+                                if not handled and ("\n" in script_content or "\r" in script_content):
                                     delim = _detect_csv_delim(script_content)
                                     if delim:
                                         try:
@@ -3134,8 +3764,30 @@ class UnityParser(BaseParser):
                                                 written += csv_written
                                                 typetree_found += csv_written
                                                 n_typetree += csv_written
+                                            handled = True
                                         except Exception:
                                             pass
+
+                                # 4. XML
+                                if not handled and not asset_modified:
+                                    stripped = script_content.lstrip()
+                                    if stripped.startswith("<?xml") or (stripped.startswith("<") and ">" in stripped):
+                                        xml_hits = _extract_xml_strings(script_content)
+                                        xml_replacements: dict[str, str] = {}
+                                        for xml_path, orig_val in xml_hits:
+                                            path = ["TextAsset", str(obj.path_id), "xml", xml_path]
+                                            sid = make_id(self.engine, rel_path, path, orig_val)
+                                            if sid in translations:
+                                                xml_replacements[xml_path] = translations[sid]
+                                        if xml_replacements:
+                                            try:
+                                                script_content = _inject_xml_strings(script_content, xml_replacements)
+                                                asset_modified = True
+                                                written += len(xml_replacements)
+                                                typetree_found += len(xml_replacements)
+                                                n_typetree += len(xml_replacements)
+                                            except Exception:
+                                                pass
 
                                 if asset_modified:
                                     saved = False
@@ -3239,6 +3891,218 @@ class UnityParser(BaseParser):
                                 except Exception as e_font:
                                     print(f"Failed to replace font in Font path_id={obj.path_id}: {e_font}", file=sys.stderr)
 
+                # ── Advanced TMP fallback / donor / drought handling ──────────
+                converted_count = 0
+                if script:
+                    try:
+                        tmp_donor, tmp_victims, tmp_cov, _ = self._find_tmp_donors_and_victims(env, script)
+
+                        # Fallback for tmp_font_objs / tmp_settings_objs if empty
+                        if not tmp_font_objs and tmp_cov:
+                            tmp_font_objs = [o for o in env.objects if o.path_id in tmp_cov]
+                        if not tmp_settings_objs:
+                            for o in env.objects:
+                                if o.type.name == "MonoBehaviour":
+                                    cn = getattr(getattr(o, "serialized_type", None), "class_name", None)
+                                    if cn == "TMP_Settings" or getattr(o, "name", "") in ("TMP Settings", "TMP_Settings"):
+                                        tmp_settings_objs.append(o)
+
+                        # Case A: An in-file TMP donor covers the script
+                        if tmp_donor is not None:
+                            # 1. Inject tmp_donor into global TMP_Settings.m_fallbackFontAssets
+                            for obj in tmp_settings_objs:
+                                data = None
+                                tree = None
+                                try:
+                                    data = obj.read()
+                                    if hasattr(data, "read_typetree"):
+                                        tree = data.read_typetree()
+                                except Exception:
+                                    pass
+                                if tree is None and hasattr(obj, "read_typetree"):
+                                    try:
+                                        tree = obj.read_typetree()
+                                    except Exception:
+                                        pass
+                                if isinstance(tree, dict) and "m_fallbackFontAssets" in tree:
+                                    fallbacks = tree.get("m_fallbackFontAssets")
+                                    if isinstance(fallbacks, list):
+                                        has_donor = any(
+                                            isinstance(x, dict) and x.get("m_PathID") == tmp_donor
+                                            for x in fallbacks
+                                        )
+                                        if not has_donor:
+                                            fallbacks.insert(0, {"m_FileID": 0, "m_PathID": tmp_donor})
+                                            _save_typetree_safe(obj, data, tree)
+                                            changed = True
+                                            typetree_modified_pids.add(obj.path_id)
+                                            print(
+                                                f"[font] Injected tmp_donor ({tmp_donor}) into "
+                                                f"TMP_Settings.m_fallbackFontAssets in {os.path.basename(fpath)}",
+                                                file=sys.stderr,
+                                            )
+
+                            # 2. Inject tmp_donor into m_FallbackFontAssetTable of other TMP_FontAssets
+                            for obj in tmp_font_objs:
+                                if obj.path_id != tmp_donor:
+                                    if tmp_cov.get(obj.path_id, (None, None))[1] is not True:
+                                        data = None
+                                        tree = None
+                                        try:
+                                            data = obj.read()
+                                            if hasattr(data, "read_typetree"):
+                                                tree = data.read_typetree()
+                                        except Exception:
+                                            pass
+                                        if tree is None and hasattr(obj, "read_typetree"):
+                                            try:
+                                                tree = obj.read_typetree()
+                                            except Exception:
+                                                pass
+                                        if isinstance(tree, dict) and "m_FallbackFontAssetTable" in tree:
+                                            fallbacks = tree.get("m_FallbackFontAssetTable")
+                                            if isinstance(fallbacks, list):
+                                                has_donor = any(
+                                                    isinstance(x, dict) and x.get("m_PathID") == tmp_donor
+                                                    for x in fallbacks
+                                                )
+                                                if not has_donor:
+                                                    fallbacks.insert(0, {"m_FileID": 0, "m_PathID": tmp_donor})
+                                                    _save_typetree_safe(obj, data, tree)
+                                                    changed = True
+                                                    typetree_modified_pids.add(obj.path_id)
+
+                        # Case B: Total Font Drought (TMP victims exist, no donor, font_bytes available)
+                        elif tmp_donor is None and tmp_victims and font_bytes:
+                            target_font_obj = None
+                            # 1. Prefer a Font already referenced by one of the victims
+                            for vid in tmp_victims:
+                                v_obj = next((o for o in tmp_font_objs if o.path_id == vid), None)
+                                if not v_obj:
+                                    v_obj = next((o for o in env.objects if o.path_id == vid), None)
+                                if v_obj:
+                                    try:
+                                        v_tree = None
+                                        if hasattr(v_obj, "read_typetree"):
+                                            v_tree = v_obj.read_typetree()
+                                        elif hasattr(v_obj, "read"):
+                                            v_data = v_obj.read()
+                                            if hasattr(v_data, "read_typetree"):
+                                                v_tree = v_data.read_typetree()
+                                        src = v_tree.get("m_SourceFontFile") if isinstance(v_tree, dict) else None
+                                        if isinstance(src, dict) and src.get("m_FileID") == 0 and src.get("m_PathID"):
+                                            f_obj = next(
+                                                (o for o in env.objects if o.path_id == src["m_PathID"] and o.type.name == "Font"),
+                                                None,
+                                            )
+                                            if f_obj:
+                                                target_font_obj = f_obj
+                                                break
+                                    except Exception:
+                                        pass
+
+                            # 2. Or any Font in the file
+                            if target_font_obj is None:
+                                for obj in env.objects:
+                                    if obj.type.name == "Font":
+                                        target_font_obj = obj
+                                        break
+
+                            if target_font_obj is not None:
+                                ttf_pid = target_font_obj.path_id
+                                font_saved = False
+                                try:
+                                    ftree = None
+                                    if hasattr(target_font_obj, "read_typetree"):
+                                        ftree = target_font_obj.read_typetree()
+                                    elif hasattr(target_font_obj, "read"):
+                                        fdata = target_font_obj.read()
+                                        if hasattr(fdata, "read_typetree"):
+                                            ftree = fdata.read_typetree()
+                                    if isinstance(ftree, dict):
+                                        existing_fdata = ftree.get("m_FontData")
+                                        if isinstance(existing_fdata, list):
+                                            ftree["m_FontData"] = list(font_bytes)
+                                        else:
+                                            ftree["m_FontData"] = font_bytes
+                                        _save_typetree_safe(target_font_obj, None, ftree)
+                                        font_saved = True
+                                        changed = True
+                                        typetree_modified_pids.add(ttf_pid)
+                                except Exception:
+                                    pass
+
+                                if not font_saved:
+                                    try:
+                                        fdata = target_font_obj.read()
+                                        if hasattr(fdata, "m_FontData"):
+                                            existing_fdata = getattr(fdata, "m_FontData")
+                                            if isinstance(existing_fdata, list):
+                                                fdata.m_FontData = list(font_bytes)
+                                            else:
+                                                fdata.m_FontData = font_bytes
+                                            fdata.save()
+                                            font_saved = True
+                                            changed = True
+                                            typetree_modified_pids.add(ttf_pid)
+                                    except Exception as e_f:
+                                        print(f"Failed to inject font_bytes into Font path_id={ttf_pid}: {e_f}", file=sys.stderr)
+
+                                if font_saved:
+                                    converted_vids: list[int] = []
+                                    for vid in tmp_victims:
+                                        v_obj = next((o for o in tmp_font_objs if o.path_id == vid), None)
+                                        if not v_obj:
+                                            v_obj = next((o for o in env.objects if o.path_id == vid), None)
+                                        if not v_obj:
+                                            continue
+                                        try:
+                                            data = v_obj.read() if hasattr(v_obj, "read") else None
+                                            tree = None
+                                            if data and hasattr(data, "read_typetree"):
+                                                tree = data.read_typetree()
+                                            elif hasattr(v_obj, "read_typetree"):
+                                                tree = v_obj.read_typetree()
+                                            if isinstance(tree, dict):
+                                                tree["m_SourceFontFile"] = {"m_FileID": 0, "m_PathID": ttf_pid}
+                                                tree["m_AtlasPopulationMode"] = 1
+                                                if "m_IsMultiAtlasTexturesEnabled" in tree:
+                                                    tree["m_IsMultiAtlasTexturesEnabled"] = 1
+                                                _save_typetree_safe(v_obj, data, tree)
+                                                changed = True
+                                                typetree_modified_pids.add(v_obj.path_id)
+                                                converted_count += 1
+                                                converted_vids.append(vid)
+                                        except Exception as e_v:
+                                            print(
+                                                f"Failed to convert victim TMP_FontAsset path_id={vid} to dynamic: {e_v}",
+                                                file=sys.stderr,
+                                            )
+                                    if converted_count > 0:
+                                        first_vid = converted_vids[0]
+                                        # Also inject first converted dynamic font into TMP_Settings.m_fallbackFontAssets
+                                        for obj in tmp_settings_objs:
+                                            try:
+                                                data = obj.read()
+                                                tree = obj.read_typetree() if hasattr(obj, "read_typetree") else data.read_typetree()
+                                                if isinstance(tree, dict) and "m_fallbackFontAssets" in tree:
+                                                    fallbacks = tree.get("m_fallbackFontAssets")
+                                                    if isinstance(fallbacks, list):
+                                                        if not any(isinstance(x, dict) and x.get("m_PathID") == first_vid for x in fallbacks):
+                                                            fallbacks.insert(0, {"m_FileID": 0, "m_PathID": first_vid})
+                                                            _save_typetree_safe(obj, data, tree)
+                                                            changed = True
+                                                            typetree_modified_pids.add(obj.path_id)
+                                            except Exception:
+                                                pass
+                                        print(
+                                            f"[font] Converted {converted_count} static TMP_FontAsset(s) in "
+                                            f"{os.path.basename(fpath)} to Dynamic Multi-Atlas pointing to Font path_id={ttf_pid}.",
+                                            file=sys.stderr,
+                                        )
+                    except Exception as e_adv_font:
+                        print(f"Error in advanced font fallback handling for {fpath}: {e_adv_font}", file=sys.stderr)
+
                 # Always attempt raw inject: content blobs (Naninovel/I2/…) never use m_Text.
                 # Font-gap PPtr rewrite runs INSIDE raw inject, AFTER any UnityPy
                 # save — a pre-save disk patch would be clobbered by env.file.save().
@@ -3248,6 +4112,7 @@ class UnityParser(BaseParser):
                     target_lang=target_lang,
                     already_changed=changed,
                     skip_pids=typetree_modified_pids,
+                    skip_font_pptr=(converted_count > 0),
                 )
                 if raw_written > 0:
                     written += raw_written
@@ -3265,29 +4130,51 @@ class UnityParser(BaseParser):
         for fpath in source_files:
             rel_path = os.path.relpath(fpath, root).replace("\\", "/")
             try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
+                if self._is_modified_in_run(fpath):
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                else:
+                    orig_bytes = read_backup_original(root, rel_path)
+                    if orig_bytes is not None:
+                        try:
+                            content = orig_bytes.decode("utf-8")
+                        except UnicodeDecodeError:
+                            content = orig_bytes.decode("latin-1", errors="ignore")
+                    else:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
 
                 lines = content.splitlines()
                 changed = False
                 line_idx = 0
+                is_asset_file = fpath.lower().endswith(".asset")
                 while line_idx < len(lines):
                     line = lines[line_idx]
-                    match = re.search(r'm_[Tt]ext(?:UGUI)?:\s*(.*)', line)
+                    m_field = None
+                    raw_val = None
+                    start_line_idx = line_idx
+                    key_prefix = ""
+                    match = re.match(r'^(\s*)([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)$', line)
                     if match:
-                        raw_val = match.group(1).strip()
-                        start_line_idx = line_idx
-                        
+                        fname = match.group(2)
+                        if fname in ("m_Text", "m_text", "m_TextUGUI"):
+                            m_field = "m_Text"
+                            raw_val = match.group(3).strip()
+                            key_prefix = line[:match.start(3)]
+                        elif is_asset_file and _is_typetree_text_field(fname):
+                            m_field = fname
+                            raw_val = match.group(3).strip()
+                            key_prefix = line[:match.start(3)]
+
+                    if m_field is not None and raw_val is not None:
                         val, line_idx = _parse_multiline_yaml_val(lines, line_idx, raw_val)
                         if val and not val.isspace() and _is_game_text(val):
-                            path = ["AssetYAML", "m_Text", str(start_line_idx)]
+                            path = ["AssetYAML", m_field, str(start_line_idx)]
                             sid = make_id(self.engine, rel_path, path, val)
 
                             if sid in translations:
                                 translated = translations[sid]
                                 escaped_trans = json.dumps(translated, ensure_ascii=False)
-                                
-                                key_prefix = line[:match.start(1)]
                                 lines[start_line_idx] = f"{key_prefix}{escaped_trans}"
                                 for i in range(start_line_idx + 1, line_idx + 1):
                                     lines[i] = None
@@ -3301,6 +4188,7 @@ class UnityParser(BaseParser):
                     self.backup_file(root, fpath)
                     with open(fpath, "w", encoding="utf-8") as f:
                         f.write("\n".join(lines))
+                    self._mark_modified_in_run(fpath)
             except Exception as e:
                 print(f"Error injecting into source file {fpath}: {e}", file=sys.stderr)
 
@@ -3341,11 +4229,102 @@ class UnityParser(BaseParser):
             if aa_dir:
                 for dirpath, _, filenames in os.walk(aa_dir):
                     for f in filenames:
+                        cat_file = os.path.join(dirpath, f)
                         if f.startswith("catalog") and f.endswith(".json"):
-                            cat_file = os.path.join(dirpath, f)
                             self._disable_catalog_crc(cat_file)
+                        elif f.startswith("catalog") and f.endswith(".bin"):
+                            self._disable_catalog_bin_crc(cat_file)
 
+        self.finalize_backups(root)
         return written
+
+    def _find_tmp_donors_and_victims(
+        self, env: Any, script: str
+    ) -> tuple[int | None, set[int], dict[int, tuple[str, bool | None]], list[tuple[int, int]]]:
+        """Catalog Font assets and TMP FontAssets to identify a donor and missing victims for a script.
+
+        Returns:
+            (tmp_donor, tmp_victims, tmp_cov, forbidden_ranges)
+        """
+        font_cov: dict[int, tuple[str, bool | None]] = {}
+        font_by_base: dict[str, tuple[int, bool | None]] = {}
+        forbidden_ranges: list[tuple[int, int]] = []
+        for obj in env.objects:
+            if obj.type.name != "Font":
+                continue
+            try:
+                bs = int(getattr(obj, "byte_start", -1))
+                bsz = int(getattr(obj, "byte_size", 0))
+                if bs >= 0 and bsz > 0:
+                    forbidden_ranges.append((bs, bs + bsz))
+                data = obj.read()
+                name = getattr(data, "m_Name", None) or ""
+                blob = bytes(getattr(data, "m_FontData", b"") or b"")
+                cov = _ttf_covers_script(blob, script) if blob else None
+                font_cov[obj.path_id] = (name, cov)
+                if name:
+                    font_by_base[_font_base_name(name)] = (obj.path_id, cov)
+            except Exception:
+                continue
+
+        tmp_cov: dict[int, tuple[str, bool | None]] = {}
+        for obj in env.objects:
+            class_name = getattr(getattr(obj, "serialized_type", None), "class_name", None)
+            if obj.type.name != "MonoBehaviour" and obj.type.name != "TMP_FontAsset" and class_name != "TMP_FontAsset":
+                continue
+            try:
+                raw = bytes(obj.get_raw_data())
+            except Exception:
+                continue
+            if len(raw) < 40:
+                continue
+            strings = _mb_length_prefixed_strings(raw)
+            if not _looks_like_tmp_font_asset(strings):
+                continue
+            try:
+                bs = int(getattr(obj, "byte_start", -1))
+                bsz = int(getattr(obj, "byte_size", 0))
+                if bs >= 0 and bsz > 0:
+                    forbidden_ranges.append((bs, bs + bsz))
+            except Exception:
+                pass
+            name = _tmp_font_display_name(strings)
+            charset = _tmp_charset_from_strings(strings)
+            cov: bool | None = None
+            if charset:
+                cov = _charset_covers_script(charset, script)
+            if cov is None:
+                base = _font_base_name(name)
+                ttf = font_by_base.get(base)
+                if ttf is not None and ttf[1] is False:
+                    cov = False
+            tmp_cov[obj.path_id] = (name, cov)
+
+        if not tmp_cov:
+            return None, set(), {}, forbidden_ranges
+
+        tmp_donors = [pid for pid, (_, c) in tmp_cov.items() if c is True]
+
+        def _pick_donor(cands: list[int], table: dict[int, tuple[str, bool | None]]) -> int | None:
+            if not cands:
+                return None
+            regular = [
+                pid for pid in cands
+                if "regular" in (table[pid][0] or "").lower()
+                and "fallback" not in (table[pid][0] or "").lower()
+            ]
+            pool = regular or [
+                pid for pid in cands
+                if "fallback" not in (table[pid][0] or "").lower()
+            ] or cands
+            return min(pool)
+
+        tmp_donor = _pick_donor(tmp_donors, tmp_cov)
+        tmp_victims = {
+            pid for pid, (_, c) in tmp_cov.items()
+            if c is False and pid != tmp_donor
+        }
+        return tmp_donor, tmp_victims, tmp_cov, forbidden_ranges
 
     def _replace_font_pptrs(
         self, env: Any, fpath: str, target_lang: str | None = None
@@ -3386,102 +4365,7 @@ class UnityParser(BaseParser):
         if not script:
             return
         try:
-            # ── 1. Catalog Unity Font assets (TTF coverage, negative signal) ─
-            # path_id → (name, covers: True/False/None). Used ONLY to mark a
-            # TMP atlas as missing when its matching TTF has no script glyphs.
-            # We never rewrite Font path_ids (glyph-index collision hazard).
-            font_cov: dict[int, tuple[str, bool | None]] = {}
-            font_by_base: dict[str, tuple[int, bool | None]] = {}
-            # Absolute [start, end) ranges that must NEVER be PPtr-patched.
-            forbidden_ranges: list[tuple[int, int]] = []
-            for obj in env.objects:
-                if obj.type.name != "Font":
-                    continue
-                try:
-                    bs = int(getattr(obj, "byte_start", -1))
-                    bsz = int(getattr(obj, "byte_size", 0))
-                    if bs >= 0 and bsz > 0:
-                        forbidden_ranges.append((bs, bs + bsz))
-                    data = obj.read()
-                    name = getattr(data, "m_Name", None) or ""
-                    blob = bytes(getattr(data, "m_FontData", b"") or b"")
-                    cov = _ttf_covers_script(blob, script) if blob else None
-                    font_cov[obj.path_id] = (name, cov)
-                    if name:
-                        font_by_base[_font_base_name(name)] = (obj.path_id, cov)
-                except Exception:
-                    continue
-
-            # ── 2. Catalog TMP FontAsset MonoBehaviours ────────────────────
-            # path_id → (name, covers)
-            tmp_cov: dict[int, tuple[str, bool | None]] = {}
-            for obj in env.objects:
-                if obj.type.name != "MonoBehaviour":
-                    continue
-                try:
-                    raw = bytes(obj.get_raw_data())
-                except Exception:
-                    continue
-                if len(raw) < 40:
-                    continue
-                strings = _mb_length_prefixed_strings(raw)
-                if not _looks_like_tmp_font_asset(strings):
-                    continue
-                try:
-                    bs = int(getattr(obj, "byte_start", -1))
-                    bsz = int(getattr(obj, "byte_size", 0))
-                    if bs >= 0 and bsz > 0:
-                        forbidden_ranges.append((bs, bs + bsz))
-                except Exception:
-                    pass
-                name = _tmp_font_display_name(strings)
-                charset = _tmp_charset_from_strings(strings)
-                cov: bool | None = None
-                if charset:
-                    cov = _charset_covers_script(charset, script)
-                if cov is None:
-                    # No charset (or unparseable): only use the matching TTF as
-                    # a NEGATIVE signal. A TTF without the script cannot back a
-                    # static atlas that has it. A TTF WITH the script still
-                    # doesn't prove the atlas baked those glyphs (LiberationSans
-                    # SDF on Touchstarved is Latin-only despite a full TTF) —
-                    # so leave coverage unknown rather than risk a bad donor.
-                    base = _font_base_name(name)
-                    ttf = font_by_base.get(base)
-                    if ttf is not None and ttf[1] is False:
-                        cov = False
-                tmp_cov[obj.path_id] = (name, cov)
-
-            if not tmp_cov:
-                return
-
-            # ── 3. Pick TMP donor (positive coverage only) ─────────────────
-            tmp_donors = [pid for pid, (_, c) in tmp_cov.items() if c is True]
-
-            # Prefer a "regular"/default-looking donor over a specialized one
-            # (e.g. Inter-Regular over a random bold). Stable: lowest path_id
-            # among names containing "regular", else lowest path_id overall.
-            def _pick_donor(cands: list[int], table: dict[int, tuple[str, bool | None]]) -> int | None:
-                if not cands:
-                    return None
-                regular = [
-                    pid for pid in cands
-                    if "regular" in (table[pid][0] or "").lower()
-                    and "fallback" not in (table[pid][0] or "").lower()
-                ]
-                pool = regular or [
-                    pid for pid in cands
-                    if "fallback" not in (table[pid][0] or "").lower()
-                ] or cands
-                return min(pool)
-
-            tmp_donor = _pick_donor(tmp_donors, tmp_cov)
-
-            # Victims = proven missing coverage. Unknown → leave alone.
-            tmp_victims = {
-                pid for pid, (_, c) in tmp_cov.items()
-                if c is False and pid != tmp_donor
-            }
+            tmp_donor, tmp_victims, tmp_cov, forbidden_ranges = self._find_tmp_donors_and_victims(env, script)
 
             if not tmp_victims:
                 return
@@ -3521,9 +4405,22 @@ class UnityParser(BaseParser):
             # ── 4. Size-preserving PPtr rewrite on disk ────────────────────
             # Unity PPtr (same file): int32 fileID=0 + int64 pathID.
             # Only rewrite hits OUTSIDE Font / TMP FontAsset object bodies so
-            # glyphIndex / internal source-font fields stay byte-verbatim.
-            with open(fpath, "rb") as f:
-                file_bytes = bytearray(f.read())
+            if fpath.lower().endswith(".split0"):
+                base_prefix = fpath[:-7]
+                parts_data = bytearray()
+                idx = 0
+                while True:
+                    part_path = f"{base_prefix}.split{idx}"
+                    if os.path.isfile(part_path):
+                        with open(part_path, "rb") as pf:
+                            parts_data.extend(pf.read())
+                        idx += 1
+                    else:
+                        break
+                file_bytes = parts_data
+            else:
+                with open(fpath, "rb") as f:
+                    file_bytes = bytearray(f.read())
 
             replaced = 0
             skipped_forbidden = 0
@@ -3546,15 +4443,18 @@ class UnityParser(BaseParser):
                     idx += 12
 
             if replaced > 0:
-                # Backup once per file via the parser's backup helper if root known
                 root = getattr(self, "_current_root", None)
                 if root:
                     try:
-                        self.backup_file(root, fpath)
+                        self._save_or_split_asset(root, fpath, bytes(file_bytes))
                     except Exception:
-                        pass
-                with open(fpath, "wb") as f:
-                    f.write(file_bytes)
+                        with open(fpath, "wb") as f:
+                            f.write(file_bytes)
+                        self._mark_modified_in_run(fpath)
+                else:
+                    with open(fpath, "wb") as f:
+                        f.write(file_bytes)
+                    self._mark_modified_in_run(fpath)
                 print(
                     f"[font] {os.path.basename(fpath)}: rewrote {replaced} PPtr(s) "
                     f"for missing {script} glyphs (TMP→{tmp_cov[tmp_donor][0]!r}; "
@@ -3588,7 +4488,20 @@ class UnityParser(BaseParser):
 
         for bundle_path in aa_bundles:
             try:
-                env = UnityPy.load(bundle_path)
+                rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
+                if self._is_modified_in_run(bundle_path):
+                    env = UnityPy.load(bundle_path)
+                else:
+                    orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
+                    if orig_bytes is not None:
+                        try:
+                            bio = io.BytesIO(orig_bytes)
+                            bio.name = bundle_path
+                            env = UnityPy.load(bio, path=os.path.dirname(bundle_path))
+                        except Exception:
+                            env = UnityPy.load(bundle_path)
+                    else:
+                        env = UnityPy.load(bundle_path)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -3614,7 +4527,19 @@ class UnityParser(BaseParser):
         for bundle_path in aa_bundles:
             rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
             try:
-                env = UnityPy.load(bundle_path)
+                if self._is_modified_in_run(bundle_path):
+                    env = UnityPy.load(bundle_path)
+                else:
+                    orig_bytes = self._read_asset_backup_original(root, bundle_path, rel_path)
+                    if orig_bytes is not None:
+                        try:
+                            bio = io.BytesIO(orig_bytes)
+                            bio.name = bundle_path
+                            env = UnityPy.load(bio, path=os.path.dirname(bundle_path))
+                        except Exception:
+                            env = UnityPy.load(bundle_path)
+                    else:
+                        env = UnityPy.load(bundle_path)
                 changed = False
 
                 for obj in env.objects:
@@ -3652,14 +4577,48 @@ class UnityParser(BaseParser):
                         pass
 
                 if changed:
-                    self.backup_file(root, bundle_path)
                     saved_bytes = None
                     try:
                         saved_bytes = env.file.save(packer="original")
                     except Exception:
-                        saved_bytes = env.file.save(packer="none")
-                    with open(bundle_path, "wb") as f:
-                        f.write(saved_bytes)
+                        try:
+                            saved_bytes = env.file.save(packer="none")
+                        except Exception:
+                            try:
+                                saved_bytes = env.file.save()
+                            except Exception:
+                                pass
+                    if not saved_bytes:
+                        try:
+                            saved_bytes = env.file.save()
+                        except Exception:
+                            pass
+
+                    if isinstance(saved_bytes, (bytes, bytearray)) and len(saved_bytes) > 0:
+                        self._save_or_split_asset(root, bundle_path, bytes(saved_bytes))
+                    else:
+                        # Multi-cab / container: fall back to env.save into temp dir
+                        tmp = tempfile.mkdtemp(prefix="interprex_unity_loc_")
+                        try:
+                            env.save(pack="none", out_path=tmp)
+                            base = os.path.basename(bundle_path)
+                            candidate = os.path.join(tmp, base)
+                            if not os.path.isfile(candidate):
+                                for dirpath, _, filenames in os.walk(tmp):
+                                    if base in filenames:
+                                        candidate = os.path.join(dirpath, base)
+                                        break
+                            if os.path.isfile(candidate):
+                                with open(candidate, "rb") as cf:
+                                    cdata = cf.read()
+                                self._save_or_split_asset(root, bundle_path, cdata)
+                            else:
+                                print(
+                                    f"UnityPy save produced no {base}; loc inject may be incomplete",
+                                    file=sys.stderr,
+                                )
+                        finally:
+                            shutil.rmtree(tmp, ignore_errors=True)
 
             except Exception as e:
                 print(f"Error injecting into bundle {bundle_path}: {e}", file=sys.stderr)
@@ -3673,17 +4632,9 @@ class UnityParser(BaseParser):
                         if f.startswith("catalog") and f.endswith(".json"):
                             self._disable_catalog_crc(cat_file)
                         elif f.startswith("catalog") and f.endswith(".bin"):
-                            print(
-                                f"[catalog] Addressables binary catalog detected: {f}. "
-                                "CRC check is compiled into catalog.bin; if the game fails to load modified bundles, "
-                                "CRC verification must be disabled in runtime Addressables settings.",
-                                file=sys.stderr,
-                            )
-                            if hasattr(self, "last_report") and self.last_report and hasattr(self.last_report, "caps"):
-                                self.last_report.caps.notes.append(
-                                    f"Binary Addressables catalog ({f}) detected: runtime CRC verification might be enforced."
-                                )
+                            self._disable_catalog_bin_crc(cat_file)
 
+        self.finalize_backups(root)
         return written
 
     def _disable_catalog_crc(self, catalog_path: str) -> bool:
@@ -3705,6 +4656,35 @@ class UnityParser(BaseParser):
                     if "m_Crc" in node and node["m_Crc"] != 0:
                         node["m_Crc"] = 0
                         inner_mod = True
+                    if "m_ExtraDataString" in node and isinstance(node["m_ExtraDataString"], str):
+                        try:
+                            import base64
+                            extra_raw = base64.b64decode(node["m_ExtraDataString"])
+                            sub_mod = False
+
+                            def _sub_utf8(m: re.Match[bytes]) -> bytes:
+                                nonlocal sub_mod
+                                sub_mod = True
+                                return m.group(1) + b"0" + b" " * (len(m.group(2)) - 1)
+
+                            def _sub_utf16(m: re.Match[bytes]) -> bytes:
+                                nonlocal sub_mod
+                                sub_mod = True
+                                k = len(m.group(2)) // 2
+                                return m.group(1) + b"0\x00" + b" \x00" * (k - 1)
+
+                            new_raw = re.sub(rb'("(?:m_Crc|m_CRC)"\s*:\s*)(\d+)', _sub_utf8, extra_raw)
+                            new_raw = re.sub(
+                                rb'("\x00m\x00_\x00[Cc]\x00[Rr]\x00[Cc]\x00"\x00:\x00(?:\x20\x00|\t\x00|\s\x00)*)((?:[0-9]\x00)+)',
+                                _sub_utf16,
+                                new_raw,
+                            )
+                            if sub_mod and new_raw != extra_raw:
+                                node["m_ExtraDataString"] = base64.b64encode(new_raw).decode("ascii")
+                                inner_mod = True
+                        except Exception:
+                            pass
+
                     for v in node.values():
                         if isinstance(v, (dict, list)):
                             if _disable_crc_recursive(v):
@@ -3729,10 +4709,71 @@ class UnityParser(BaseParser):
                         pass
                 with open(catalog_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False)
+                self._mark_modified_in_run(catalog_path)
                 return True
         except Exception as e:
             print(f"Error disabling catalog CRC in {catalog_path}: {e}", file=sys.stderr)
         return False
+
+    def _disable_catalog_bin_crc(self, catalog_path: str) -> bool:
+        """Neutralize CRC checks directly in binary Addressables catalog (*.bin) without altering file length or offsets."""
+        if not os.path.isfile(catalog_path):
+            return False
+        try:
+            with open(catalog_path, "rb") as f:
+                raw = f.read()
+
+            sub_mod = False
+
+            def _sub_utf8(m: re.Match[bytes]) -> bytes:
+                nonlocal sub_mod
+                sub_mod = True
+                return m.group(1) + b"0" + b" " * (len(m.group(2)) - 1)
+
+            def _sub_utf16(m: re.Match[bytes]) -> bytes:
+                nonlocal sub_mod
+                sub_mod = True
+                k = len(m.group(2)) // 2
+                return m.group(1) + b"0\x00" + b" \x00" * (k - 1)
+
+            new_raw = re.sub(rb'("(?:m_Crc|m_CRC)"\s*:\s*)(\d+)', _sub_utf8, raw)
+            new_raw = re.sub(
+                rb'("\x00m\x00_\x00[Cc]\x00[Rr]\x00[Cc]\x00"\x00:\x00(?:\x20\x00|\t\x00|\s\x00)*)((?:[0-9]\x00)+)',
+                _sub_utf16,
+                new_raw,
+            )
+
+            if sub_mod and new_raw != raw and len(new_raw) == len(raw):
+                root = getattr(self, "_current_root", None)
+                if root:
+                    try:
+                        self.backup_file(root, catalog_path)
+                    except Exception:
+                        pass
+                with open(catalog_path, "wb") as f:
+                    f.write(new_raw)
+                self._mark_modified_in_run(catalog_path)
+                print(
+                    f"[catalog] Successfully neutralized CRC check in binary catalog {os.path.basename(catalog_path)}",
+                    file=sys.stderr,
+                )
+                return True
+            else:
+                fname = os.path.basename(catalog_path)
+                print(
+                    f"[catalog] Addressables binary catalog detected: {fname}. "
+                    "CRC check is compiled into catalog.bin; if the game fails to load modified bundles, "
+                    "CRC verification must be disabled in runtime Addressables settings.",
+                    file=sys.stderr,
+                )
+                if hasattr(self, "last_report") and self.last_report and hasattr(self.last_report, "caps"):
+                    self.last_report.caps.notes.append(
+                        f"Binary Addressables catalog ({fname}) detected: runtime CRC verification might be enforced."
+                    )
+                return False
+        except Exception as e:
+            print(f"Error neutralizing binary catalog CRC in {catalog_path}: {e}", file=sys.stderr)
+            return False
 
     def _find_global_metadata(self, root: str) -> str | None:
         """Find global-metadata.dat inside root."""
@@ -3765,8 +4806,12 @@ class UnityParser(BaseParser):
             return []
 
         try:
-            with open(gm_path, "rb") as f:
-                raw = f.read()
+            orig_bytes = read_backup_original(root, rel_path)
+            if orig_bytes is not None:
+                raw = orig_bytes
+            else:
+                with open(gm_path, "rb") as f:
+                    raw = f.read()
 
             if len(raw) < 256:
                 return []
@@ -3810,8 +4855,16 @@ class UnityParser(BaseParser):
             return 0
 
         try:
-            with open(gm_path, "rb") as f:
-                raw = bytearray(f.read())
+            if self._is_modified_in_run(gm_path):
+                with open(gm_path, "rb") as f:
+                    raw = bytearray(f.read())
+            else:
+                orig_bytes = read_backup_original(root, rel_path)
+                if orig_bytes is not None:
+                    raw = bytearray(orig_bytes)
+                else:
+                    with open(gm_path, "rb") as f:
+                        raw = bytearray(f.read())
 
             if len(raw) < 256:
                 return 0
@@ -3866,12 +4919,12 @@ class UnityParser(BaseParser):
                 if p >= header_end:
                     break
                 sec_off, sec_sz = struct.unpack_from("<II", raw, p)
-                if sec_sz > 0 and 128 <= sec_off <= len(raw):
+                if sec_sz > 0 and 64 <= sec_off <= len(raw) and sec_off + sec_sz <= len(raw) + 16:
                     if sec_off < header_end:
                         header_end = sec_off
             for p in range(8, header_end, 8):
-                sec_off = struct.unpack_from("<I", raw, p)[0]
-                if sec_off >= data_offset + data_size:
+                sec_off, sec_sz = struct.unpack_from("<II", raw, p)
+                if sec_off >= data_offset + data_size and (sec_sz == 0 or sec_off + sec_sz <= len(raw) + 16):
                     struct.pack_into("<I", raw, p, sec_off + delta)
 
             struct.pack_into("<I", raw, 20, new_data_size)
@@ -3884,7 +4937,9 @@ class UnityParser(BaseParser):
             self.backup_file(root, gm_path)
             with open(gm_path, "wb") as f:
                 f.write(new_file)
+            self._mark_modified_in_run(gm_path)
 
+            self.finalize_backups(root)
             return len(replacements)
         except Exception as e:
             print(f"Error injecting IL2CPP metadata {gm_path}: {e}", file=sys.stderr)
@@ -3930,17 +4985,24 @@ class UnityParser(BaseParser):
             base = os.path.basename(fpath)
             fl = base.lower()
 
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except UnicodeDecodeError:
+            orig_bytes = read_backup_original(root, rel_path)
+            if orig_bytes is not None:
                 try:
-                    with open(fpath, "r", encoding="latin-1") as f:
+                    content = orig_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    content = orig_bytes.decode("latin-1", errors="replace")
+            else:
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
                         content = f.read()
+                except UnicodeDecodeError:
+                    try:
+                        with open(fpath, "r", encoding="latin-1") as f:
+                            content = f.read()
+                    except Exception:
+                        continue
                 except Exception:
                     continue
-            except Exception:
-                continue
 
             if not content.strip():
                 continue
@@ -4046,6 +5108,17 @@ class UnityParser(BaseParser):
                         ctx = f"StreamingAsset (TXT): {base}, Line: {line_idx + 1}"
                         results.append(self._mk(rel_path, path, sline, ctx))
 
+            # 5. XML
+            elif fl.endswith(".xml"):
+                try:
+                    xml_hits = _extract_xml_strings(content)
+                    for xml_path, val in xml_hits:
+                        path = ["StreamingFile", "xml", xml_path]
+                        ctx = f"StreamingAsset (XML): {base}, Path: {xml_path}"
+                        results.append(self._mk(rel_path, path, val, ctx))
+                except Exception:
+                    pass
+
         return results
 
     def _inject_streaming_files(
@@ -4062,17 +5135,37 @@ class UnityParser(BaseParser):
             base = os.path.basename(fpath)
             fl = base.lower()
 
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except UnicodeDecodeError:
+            if self._is_modified_in_run(fpath):
                 try:
-                    with open(fpath, "r", encoding="latin-1") as f:
+                    with open(fpath, "r", encoding="utf-8") as f:
                         content = f.read()
+                except UnicodeDecodeError:
+                    try:
+                        with open(fpath, "r", encoding="latin-1") as f:
+                            content = f.read()
+                    except Exception:
+                        continue
                 except Exception:
                     continue
-            except Exception:
-                continue
+            else:
+                orig_bytes = read_backup_original(root, rel_path)
+                if orig_bytes is not None:
+                    try:
+                        content = orig_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content = orig_bytes.decode("latin-1", errors="replace")
+                else:
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except UnicodeDecodeError:
+                        try:
+                            with open(fpath, "r", encoding="latin-1") as f:
+                                content = f.read()
+                        except Exception:
+                            continue
+                    except Exception:
+                        continue
 
             if not content.strip():
                 continue
@@ -4223,10 +5316,29 @@ class UnityParser(BaseParser):
                     modified = True
                     file_written += t_hits
 
+            # 5. XML
+            elif fl.endswith(".xml"):
+                try:
+                    xml_hits = _extract_xml_strings(content)
+                    xml_replacements: dict[str, str] = {}
+                    for xml_path, orig_val in xml_hits:
+                        path = ["StreamingFile", "xml", xml_path]
+                        sid = make_id(self.engine, rel_path, path, orig_val)
+                        if sid in translations:
+                            xml_replacements[xml_path] = translations[sid]
+                    if xml_replacements:
+                        new_content = _inject_xml_strings(content, xml_replacements)
+                        modified = True
+                        file_written += len(xml_replacements)
+                except Exception:
+                    pass
+
             if modified and new_content is not None:
                 self.backup_file(root, fpath)
                 with open(fpath, "w", encoding="utf-8") as f:
                     f.write(new_content)
+                self._mark_modified_in_run(fpath)
                 written += file_written
 
+        self.finalize_backups(root)
         return written

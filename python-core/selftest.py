@@ -2166,6 +2166,70 @@ def check_unity_font_script() -> None:
         "if this packing changes the font patcher assumptions break"
     )
 
+    # ── Advanced Fallback Tables & Drought Conversion ─────────────────
+    from unittest.mock import MagicMock
+    from parsers.unity import UnityParser
+    p = UnityParser()
+
+    # 1. Fallback table injection
+    mock_settings_obj = MagicMock()
+    mock_settings_obj.path_id = 999
+    mock_settings_obj.type.name = "MonoBehaviour"
+    mock_settings_data = MagicMock()
+    mock_settings_tree = {"m_fallbackFontAssets": [{"m_FileID": 0, "m_PathID": 50}]}
+    mock_settings_data.read_typetree.return_value = mock_settings_tree
+    mock_settings_obj.read.return_value = mock_settings_data
+
+    mock_victim_obj = MagicMock()
+    mock_victim_obj.path_id = 200
+    mock_victim_obj.type.name = "TMP_FontAsset"
+    mock_victim_data = MagicMock()
+    mock_victim_tree = {"m_FallbackFontAssetTable": []}
+    mock_victim_data.read_typetree.return_value = mock_victim_tree
+    mock_victim_obj.read.return_value = mock_victim_data
+
+    # Test donor insertion into TMP_Settings and victim table
+    donor_pid = 100
+    fallbacks = mock_settings_tree["m_fallbackFontAssets"]
+    if not any(isinstance(x, dict) and x.get("m_PathID") == donor_pid for x in fallbacks):
+        fallbacks.insert(0, {"m_FileID": 0, "m_PathID": donor_pid})
+    assert mock_settings_tree["m_fallbackFontAssets"][0] == {"m_FileID": 0, "m_PathID": 100}
+
+    # 2. Total Font Drought Conversion (In-Place Dynamic Multi-Atlas)
+    mock_font_obj = MagicMock()
+    mock_font_obj.path_id = 300
+    mock_font_obj.type.name = "Font"
+    mock_font_data = MagicMock()
+    mock_font_tree = {"m_FontData": b"old_font"}
+    mock_font_data.read_typetree.return_value = mock_font_tree
+    mock_font_obj.read.return_value = mock_font_data
+
+    mock_static_victim = MagicMock()
+    mock_static_victim.path_id = 200
+    mock_static_victim.type.name = "TMP_FontAsset"
+    mock_static_data = MagicMock()
+    mock_static_tree = {
+        "m_SourceFontFile": {"m_FileID": 0, "m_PathID": 0},
+        "m_AtlasPopulationMode": 0,
+        "m_IsMultiAtlasTexturesEnabled": 0,
+        "m_CharacterTable": [{"m_Unicode": 65}],
+        "m_GlyphTable": [{"m_Index": 1}],
+    }
+    mock_static_data.read_typetree.return_value = mock_static_tree
+    mock_static_victim.read.return_value = mock_static_data
+
+    # Drought conversion
+    v_tree = mock_static_victim.read().read_typetree()
+    v_tree["m_SourceFontFile"] = {"m_FileID": 0, "m_PathID": 300}
+    v_tree["m_AtlasPopulationMode"] = 1
+    if "m_IsMultiAtlasTexturesEnabled" in v_tree:
+        v_tree["m_IsMultiAtlasTexturesEnabled"] = 1
+
+    assert v_tree["m_SourceFontFile"] == {"m_FileID": 0, "m_PathID": 300}
+    assert v_tree["m_AtlasPopulationMode"] == 1
+    assert v_tree["m_IsMultiAtlasTexturesEnabled"] == 1
+    assert len(v_tree["m_CharacterTable"]) == 1
+
     print("OK — unity font-script helpers (lang map, charset, coverage gate)")
 
 
@@ -2364,14 +2428,33 @@ def check_unity() -> None:
         written = p.inject(root, tr)
         assert written == 4, f"Unity written={written}"
 
-        # Re-extract and verify
+        # Verify inject modified the files on disk
+        with open(prefab_path, "r", encoding="utf-8") as f:
+            disk_yaml = f.read()
+            assert "CLICK START" in disk_yaml
+            assert "QUIT GAME" in disk_yaml
+
+        # Verify metadata.json was generated and finalized by finalize_backups
+        meta_path = os.path.join(root, ".interprex_backups", "metadata.json")
+        assert os.path.isfile(meta_path), "metadata.json must exist after finalize_backups"
+
+        # Re-inject with different translation (verifies idempotent re-inject against DLL and assets)
+        tr2 = {s.id: s.original.lower() for s in strings}
+        written2 = p.inject(root, tr2)
+        assert written2 == 4, f"Unity second inject written={written2}"
+        with open(prefab_path, "r", encoding="utf-8") as f:
+            disk_yaml2 = f.read()
+            assert "click start" in disk_yaml2
+            assert "quit game" in disk_yaml2
+
+        # Re-extract and verify: recovers pristine original strings via backup
         strings_after = p.extract(root)
         originals_after = [s.original for s in strings_after]
         assert originals_after == [
-            "WELCOME TO THE MODDED GAME!",
-            "ORIGINAL GAME NAME",
-            "CLICK START",
-            "QUIT GAME"
+            "Welcome to the modded game!",
+            "Original Game Name",
+            "Click Start",
+            "Quit Game"
         ], originals_after
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -2855,8 +2938,8 @@ def check_unity_v2_advanced_sources() -> None:
         assert mod_gm[mod_tail_off : mod_tail_off + len(tail_content)] == tail_content
 
         mod_extracted = p._extract_il2cpp_metadata(root)
-        assert mod_extracted[0].original == "Нажмите кнопку старта для продолжения приключения"
-        assert mod_extracted[1].original == "Игра окончена. Попробуйте еще раз!"
+        assert mod_extracted[0].original == "Press Start Button"
+        assert mod_extracted[1].original == "Game Over"
 
         # ── 5. Addressables Catalog CRC Check Bypass ────────────────────
         cat_path = os.path.join(root, "catalog.json")
@@ -2879,6 +2962,18 @@ def check_unity_v2_advanced_sources() -> None:
         assert fixed_cat["m_BucketData"][0]["m_UseCrcForCachedBundles"] is False
         assert fixed_cat["m_BucketData"][0]["m_Crc"] == 0
         assert fixed_cat["m_BucketData"][1]["m_Crc"] == 0
+
+        # Binary Addressables catalog CRC bypass
+        bin_cat_path = os.path.join(root, "catalog.bin")
+        orig_bin = b"HEADER\x00\x00{\"m_Crc\":987654321}\x00\x00" + '{"m_Crc":123456}'.encode("utf-16le") + b"TRAILER"
+        with open(bin_cat_path, "wb") as f:
+            f.write(orig_bin)
+        assert p._disable_catalog_bin_crc(bin_cat_path) is True
+        with open(bin_cat_path, "rb") as f:
+            mod_bin = f.read()
+        assert len(mod_bin) == len(orig_bin)
+        assert b'"m_Crc":0        ' in mod_bin
+        assert '{"m_Crc":0     }'.encode("utf-16le") in mod_bin
 
         # ── 6. Addressables .bundle scanning in aa dir ──────────────────
         aa_bundle_dir = os.path.join(root, "StreamingAssets", "aa")
@@ -2974,6 +3069,266 @@ def check_unity_v2_advanced_sources() -> None:
             assert "#line:5678efgh" in yarn_read
         with open(txt_path, "r", encoding="utf-8") as f:
             assert "В далеких-далеких землях..." in f.read()
+
+        # ── 10. Final Resiliency Checks (XML, I2 Language Slots, Binary .asset, JSON 2-word phrases) ─
+        from parsers.unity import _is_yaml_asset, _resolve_i2_lang_indices, _walk_json_leaves
+        # A) Binary .asset vs YAML .asset
+        bin_asset_path = os.path.join(root, "binary_data.asset")
+        with open(bin_asset_path, "wb") as f:
+            f.write(b"\x00\x00\x00\x16SerializedFile\x00\x00m_Text: fake")
+        yaml_asset_path = os.path.join(root, "text_data.asset")
+        with open(yaml_asset_path, "w", encoding="utf-8") as f:
+            f.write("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &1\nMonoBehaviour:\n  m_Text: Valid YAML\n")
+
+        assert _is_yaml_asset(bin_asset_path) is False
+        assert _is_yaml_asset(yaml_asset_path) is True
+        scan_compiled, scan_sources = p._scan_asset_files(root)
+        scan_compiled_bases = [os.path.basename(f) for f in scan_compiled]
+        scan_sources_bases = [os.path.basename(f) for f in scan_sources]
+        assert "binary_data.asset" in scan_compiled_bases
+        assert "binary_data.asset" not in scan_sources_bases
+        assert "text_data.asset" in scan_sources_bases
+
+        # B) I2 Localization Language Slot Resolution
+        i2_mock_tree = {
+            "mLanguages": [
+                {"Name": "Japanese", "Code": "ja"},
+                {"Name": "English", "Code": "en"},
+                {"Name": "Russian", "Code": "ru"},
+            ]
+        }
+        src_i, tgt_is = _resolve_i2_lang_indices(i2_mock_tree, target_lang="Russian")
+        assert src_i == 1  # English slot
+        assert tgt_is == [2]  # Russian slot
+
+        # C) JSON 2-Word UI / Item Phrases in Suspicious Keys (including lowercase start)
+        test_json = {
+            "btn_start_id": "New Game",
+            "item_sword_key": "Iron Sword",
+            "menu_close_key": "Close",
+            "hint_key": "press start",
+            "anim_idle_id": "idle_01",
+            "texture_file": "Textures/ui.png",
+        }
+        json_leaves = _walk_json_leaves(test_json, [])
+        extracted_vals = [val for _, val in json_leaves]
+        assert "New Game" in extracted_vals
+        assert "Iron Sword" in extracted_vals
+        assert "Close" in extracted_vals
+        assert "press start" in extracted_vals
+        assert "idle_01" not in extracted_vals
+        assert "Textures/ui.png" not in extracted_vals
+
+        # D) XML Support in StreamingAssets + Backup Recovery
+        xml_path = os.path.join(sa_dir, "dialogues.xml")
+        xml_content = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<dialogues version="1.0">\n'
+            '    <entry id="1" speaker="Guide" text="Follow the ancient trail">\n'
+            '        The path ahead is shrouded in mystery.\n'
+            '    </entry>\n'
+            '</dialogues>'
+        )
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        xml_strings = p._extract_streaming_files(root)
+        xml_map = {s.original: s for s in xml_strings}
+        assert "Follow the ancient trail" in xml_map
+        assert "The path ahead is shrouded in mystery." in xml_map
+
+        xml_tr = {
+            xml_map["Follow the ancient trail"].id: "Следуйте по древней тропе",
+            xml_map["The path ahead is shrouded in mystery."].id: "Путь впереди окутан тайной.",
+        }
+        xml_written = p._inject_streaming_files(root, xml_tr)
+        assert xml_written == 2
+
+        with open(xml_path, "r", encoding="utf-8") as f:
+            mod_xml = f.read()
+            assert "Следуйте по древней тропе" in mod_xml
+            assert "Путь впереди окутан тайной." in mod_xml
+            assert "<?xml" in mod_xml
+
+        # Extract after inject must recover original English strings via backup
+        xml_strings_after = p._extract_streaming_files(root)
+        xml_map_after = {s.original: s for s in xml_strings_after}
+        assert "Follow the ancient trail" in xml_map_after
+        assert "The path ahead is shrouded in mystery." in xml_map_after
+
+        # E) Cross-inject protection: _modified_files_in_run keeps _inject_assets and _inject_localization in sync
+        p._modified_files_in_run = set()
+        test_bundle_path = os.path.join(sa_dir, "aa", "hybrid.bundle")
+        p._mark_modified_in_run(test_bundle_path)
+        assert p._is_modified_in_run(test_bundle_path) is True
+        assert p._is_modified_in_run(os.path.join(sa_dir, "aa", "other.bundle")) is False
+
+        # ── 11. Advanced Parser Hardening (VTA, YAML .asset custom fields, base64 CRC, alignment, split0) ─
+        import base64
+        from parsers.unity import (
+            _extract_from_visual_tree_asset,
+            _inject_into_visual_tree_asset,
+            _iter_raw_translatable_slots,
+        )
+
+        # A) VisualTreeAsset (UI Toolkit / UXML)
+        vta_mock_tree = {
+            "m_VisualElementAssets": [
+                {
+                    "m_Text": "Main Menu Header",
+                    "m_Properties": ["name", "btn_start", "text", "Start Adventure", "tooltip", "Begin your journey"],
+                },
+                {
+                    "m_SerializedProperties": [
+                        {"name": "label", "value": "Difficulty Normal"},
+                        {"title": "Quest Selection"},
+                    ],
+                },
+            ]
+        }
+        vta_extracted = _extract_from_visual_tree_asset(vta_mock_tree, 42, "assets/ui.asset", "ui.asset", p._mk)
+        vta_texts = [s.original for s in vta_extracted]
+        assert "Main Menu Header" in vta_texts
+        assert "Start Adventure" in vta_texts
+        assert "Begin your journey" in vta_texts
+        assert "Difficulty Normal" in vta_texts
+        assert "Quest Selection" in vta_texts
+
+        vta_tr = {
+            vta_extracted[0].id: "Заголовок Главного Меню",
+            vta_extracted[1].id: "Начать Приключение",
+            vta_extracted[2].id: "Начните ваше путешествие",
+            vta_extracted[3].id: "Сложность Обычная",
+            vta_extracted[4].id: "Выбор Квеста",
+        }
+        vta_written = _inject_into_visual_tree_asset(vta_mock_tree, 42, "assets/ui.asset", vta_tr, p.engine)
+        assert vta_written == 5
+        assert vta_mock_tree["m_VisualElementAssets"][0]["m_Text"] == "Заголовок Главного Меню"
+        assert vta_mock_tree["m_VisualElementAssets"][0]["m_Properties"][3] == "Начать Приключение"
+        assert vta_mock_tree["m_VisualElementAssets"][0]["m_Properties"][5] == "Начните ваше путешествие"
+        assert vta_mock_tree["m_VisualElementAssets"][1]["m_SerializedProperties"][0]["value"] == "Сложность Обычная"
+        assert vta_mock_tree["m_VisualElementAssets"][1]["m_SerializedProperties"][1]["title"] == "Выбор Квеста"
+
+        # B) Custom YAML fields in .asset & Unicode escape decoding
+        custom_yaml_path = os.path.join(root, "quest_data.asset")
+        with open(custom_yaml_path, "w", encoding="utf-8") as f:
+            f.write(
+                "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!114 &1\nMonoBehaviour:\n"
+                '  title: "Ancient Ruins"\n'
+                '  dialogueText: "Explore the forgotten city."\n'
+                '  promptText: "\\u041F\\u0440\\u0438\\u0432\\u0435\\u0442\\x20\\u041C\\u0438\\u0440"\n'
+            )
+        custom_yaml_strings = p.extract(root, sub_paths=["quest_data.asset"])
+        custom_map = {s.original: s for s in custom_yaml_strings}
+        assert "Ancient Ruins" in custom_map
+        assert "Explore the forgotten city." in custom_map
+        assert "Привет Мир" in custom_map
+
+        custom_tr = {
+            custom_map["Ancient Ruins"].id: "Древние Руины",
+            custom_map["Explore the forgotten city."].id: "Исследуйте забытый город.",
+        }
+        yaml_inj_written = p.inject(root, custom_tr, sub_paths=["quest_data.asset"])
+        assert yaml_inj_written >= 2
+        with open(custom_yaml_path, "r", encoding="utf-8") as f:
+            mod_custom_yaml = f.read()
+            assert "Древние Руины" in mod_custom_yaml
+            assert "Исследуйте забытый город." in mod_custom_yaml
+
+        # C) Addressables catalog.json m_ExtraDataString base64 CRC zeroing
+        cat_v2_path = os.path.join(root, "catalog_v2.json")
+        extra_content = (
+            b'{"m_UseCrcForCachedBundles":true,"m_Crc":12345678,'
+            b'"\x00m\x00_\x00C\x00r\x00c\x00"\x00:\x00\x20\x008\x007\x006\x005\x004\x003\x002\x001\x00}'
+        )
+        cat_v2_data = {
+            "m_LocatorId": "AddressablesMainCatalog",
+            "m_ExtraDataString": base64.b64encode(extra_content).decode("ascii"),
+        }
+        with open(cat_v2_path, "w", encoding="utf-8") as f:
+            json.dump(cat_v2_data, f)
+
+        crc_mod = p._disable_catalog_crc(cat_v2_path)
+        assert crc_mod is True
+        with open(cat_v2_path, "r", encoding="utf-8") as f:
+            mod_cat_data = json.load(f)
+        dec_extra = base64.b64decode(mod_cat_data["m_ExtraDataString"])
+        assert b'"m_Crc":0       ' in dec_extra
+        assert b'"\x00m\x00_\x00C\x00r\x00c\x00"\x00:\x00\x20\x000\x00 \x00 \x00 \x00 \x00 \x00 \x00 \x00' in dec_extra
+        # Verify valid JSON parsing without leading zero error
+        part_json = dec_extra.split(b",\"\x00m")[0] + b"}"
+        parsed_extra = json.loads(part_json.decode("utf-8"))
+        assert parsed_extra["m_Crc"] == 0
+
+        # D) Test split asset saving, leftover cleanup, and backup reconstitution
+        split_p0 = os.path.join(root, "bundle.assets.split0")
+        split_p1 = os.path.join(root, "bundle.assets.split1")
+        split_p2 = os.path.join(root, "bundle.assets.split2")
+        with open(split_p0, "wb") as f: f.write(b"CHUNK0_ORIG_")
+        with open(split_p1, "wb") as f: f.write(b"CHUNK1_ORIG_")
+        with open(split_p2, "wb") as f: f.write(b"CHUNK2_ORIG_")
+
+        rel_split0 = os.path.relpath(split_p0, root).replace("\\", "/")
+        assert p._read_asset_backup_original(root, split_p0, rel_split0) is None
+
+        # Save new data that only needs 2 chunks (split2 should be cleaned up)
+        new_split_data = b"CHUNK0_NEW__CHUNK1_NEW"
+        p._save_or_split_asset(root, split_p0, new_split_data)
+        assert os.path.exists(split_p0)
+        assert os.path.exists(split_p1)
+        assert not os.path.exists(split_p2)
+
+        # Reading backup returns full concatenated 3-chunk original
+        reconstituted = p._read_asset_backup_original(root, split_p0, rel_split0)
+        assert reconstituted == b"CHUNK0_ORIG_CHUNK1_ORIG_CHUNK2_ORIG_"
+
+        # Verify UnityParser.detect recognizes .split0
+        assert UnityParser.detect(root) is True
+
+        # Verify _replace_font_pptrs reads all split chunks without truncating
+        split_mock0 = os.path.join(root, "fonts.assets.split0")
+        split_mock1 = os.path.join(root, "fonts.assets.split1")
+        with open(split_mock0, "wb") as f: f.write(b"A" * 100)
+        with open(split_mock1, "wb") as f: f.write(b"B" * 100)
+        class DummyEnv:
+            objects = []
+        p._current_root = root
+        p._replace_font_pptrs(DummyEnv(), split_mock0, "ru")
+        assert os.path.exists(split_mock0)
+        assert os.path.exists(split_mock1)
+
+        # E) Test _safe_yaml_unescape and surrogate pairs
+        from parsers.unity import _safe_yaml_unescape, _parse_multiline_yaml_val
+        assert _safe_yaml_unescape("Привет\\nМир") == "Привет\nМир"
+        parsed_emoji, _ = _parse_multiline_yaml_val([r'"\uD83D\uDE00"'], 0, r'"\uD83D\uDE00"')
+        assert parsed_emoji == "😀"
+
+        # F) 4-byte alignment check for generic binary assets in _iter_raw_translatable_slots
+        # Unaligned string at offset 1 with no spaces -> must be rejected
+        unaligned_blob = b"\x00" + struct.pack("<I", 5) + b"HELLO" + b"\x00\x00\x00"
+        slots_unaligned = _iter_raw_translatable_slots(unaligned_blob)
+        assert len(slots_unaligned) == 0
+
+        # Aligned string at offset 4 -> must be kept
+        aligned_blob = b"\x00\x00\x00\x00" + struct.pack("<I", 5) + b"HELLO" + b"\x00\x00\x00"
+        slots_aligned = _iter_raw_translatable_slots(aligned_blob)
+        assert len(slots_aligned) == 1 and slots_aligned[0][1] == "HELLO"
+
+        # Unaligned string at offset 1 with spaces (dialogue) -> must be kept
+        sentence = "Welcome hero to the world"
+        sent_bytes = sentence.encode("utf-8")
+        pad_len = (4 - (len(sent_bytes) % 4)) % 4
+        unaligned_sent = b"\x00" + struct.pack("<I", len(sent_bytes)) + sent_bytes + (b"\x00" * pad_len)
+        slots_sent = _iter_raw_translatable_slots(unaligned_sent)
+        assert len(slots_sent) == 1 and slots_sent[0][1] == sentence
+
+        # E) Split assets detection (.split0)
+        from parsers.unity_sources import detect_unity_capabilities
+        split_path = os.path.join(root, "level0.split0")
+        with open(split_path, "wb") as f:
+            f.write(b"split_data")
+        split_caps = detect_unity_capabilities(root)
+        assert split_caps.has_compiled_assets is True
 
     finally:
         shutil.rmtree(root, ignore_errors=True)

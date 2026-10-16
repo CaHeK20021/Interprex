@@ -120,7 +120,7 @@ def is_valid_streaming_file(fpath: str, rel_path: str = "") -> bool:
         full_rel = (rel_path or fpath).lower().replace("\\", "/")
         if not any(hint in full_rel for hint in _STREAMING_TXT_ALLOW_HINTS):
             return False
-    return fl.endswith((".json", ".csv", ".tsv", ".yarn", ".txt"))
+    return fl.endswith((".json", ".csv", ".tsv", ".yarn", ".txt", ".xml"))
 
 
 @dataclass
@@ -358,7 +358,7 @@ def detect_unity_capabilities(
                 dll_n += 1
         if fl == "global-metadata.dat":
             caps.has_il2cpp = True
-        if fl.endswith(".assets"):
+        if fl.endswith((".assets", ".split0")):
             if not fl.endswith((".manifest", ".ress", ".resource")):
                 caps.has_compiled_assets = True
         elif fl.startswith("level") and "." not in fl:
