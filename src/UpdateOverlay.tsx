@@ -70,7 +70,7 @@ export default function UpdateOverlay({
     }
   }, [onStateChange]);
 
-  const checkUpdate = useCallback(async () => {
+  const checkUpdate = useCallback(async (isLaunch: boolean = false) => {
     if (isCheckingRef.current || isDownloadingRef.current) return;
     isCheckingRef.current = true;
     try {
@@ -82,6 +82,10 @@ export default function UpdateOverlay({
             version: update.version ?? "?",
             run: startDownload,
           });
+        }
+        // Auto-update on startup if app is not busy
+        if (isLaunch && !isAppBusyRef.current) {
+          startDownload();
         }
       } else {
         updateHandleRef.current = null;
@@ -96,10 +100,14 @@ export default function UpdateOverlay({
     }
   }, [startDownload]);
 
-  // Initial check on mount + periodic check every 15 minutes.
+  // Initial check on mount: auto-update on launch! Periodic check every 15 minutes.
+  const hasMountedRef = useRef(false);
   useEffect(() => {
-    checkUpdate();
-    const interval = setInterval(checkUpdate, 15 * 60 * 1000);
+    if (!hasMountedRef.current) {
+      hasMountedRef.current = true;
+      checkUpdate(true);
+    }
+    const interval = setInterval(() => checkUpdate(false), 15 * 60 * 1000);
     return () => clearInterval(interval);
   }, [checkUpdate]);
 
@@ -107,7 +115,7 @@ export default function UpdateOverlay({
   const prevBusyRef = useRef(isAppBusy ?? false);
   useEffect(() => {
     if (prevBusyRef.current && !isAppBusy) {
-      checkUpdate();
+      checkUpdate(false);
     }
     prevBusyRef.current = isAppBusy ?? false;
   }, [isAppBusy, checkUpdate]);

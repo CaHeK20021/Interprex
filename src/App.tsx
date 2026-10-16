@@ -1133,7 +1133,7 @@ export default function App() {
   const [proxyChecking, setProxyChecking] = useState(false);
   const [proxyCheckResults, setProxyCheckResults] =
     useState<Record<string, ProxyAutocheckResult> | null>(null);
-  const [appVersion, setAppVersion] = useState("0.0.131");
+  const [appVersion, setAppVersion] = useState("0.0.133");
   const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdateInfo | null>(null);
 
   useEffect(() => {
