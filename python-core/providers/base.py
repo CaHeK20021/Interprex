@@ -426,7 +426,7 @@ class Calibrator:
             if i - start >= max_batch_size:
                 break
             it = items[i]
-            cost = self.est_tokens(it.text) + self.est_tokens(it.context) + 12
+            cost = self.est_tokens(it.text) + int(self.est_tokens(it.context) * 0.35) + 12
             if i > start and used + cost > budget:
                 break
             used += cost

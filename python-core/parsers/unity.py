@@ -2969,10 +2969,10 @@ class UnityParser(BaseParser):
                         capped: list[str] = []
                         total = 0
                         for sib in siblings:
-                            if len(capped) >= 12:
+                            if len(capped) >= 2:
                                 break
                             addition = len(sib) + 2
-                            if total + addition > 600:
+                            if total + addition > 120:
                                 break
                             capped.append(sib)
                             total += addition

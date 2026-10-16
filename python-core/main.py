@@ -225,7 +225,7 @@ class TranslateReq(BaseModel):
 
 
 # Default window when the UI doesn't constrain it (cloud models, big local ones).
-_DEFAULT_CONTEXT_TOKENS = 8192
+_DEFAULT_CONTEXT_TOKENS = 24576
 
 
 @app.post("/ping")

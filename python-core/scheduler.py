@@ -85,7 +85,7 @@ _RETRY_BACKOFF_FIRST = 8
 _RETRY_BACKOFF_REST = 16
 
 # Default window when the UI doesn't constrain it (cloud models, big local ones).
-DEFAULT_CONTEXT_TOKENS = 8192
+DEFAULT_CONTEXT_TOKENS = 24576
 
 # Sliding window for tokens-per-minute pacing (provider TPM is almost always a
 # rolling 60s bucket). Events older than this are dropped from the per-key ledger.
@@ -225,7 +225,11 @@ class TranslationScheduler:
         self.req = req
         self.should_pause = should_pause
         self.provider = get_provider(req.provider)
-        self.window = req.max_context_tokens or DEFAULT_CONTEXT_TOKENS
+        raw_ctx = int(getattr(req, "max_context_tokens", 0) or 0)
+        if raw_ctx <= 8192 and str(getattr(req, "provider", "")).lower() not in ("ollama", "lmstudio", "local", "koboldcpp"):
+            self.window = DEFAULT_CONTEXT_TOKENS
+        else:
+            self.window = raw_ctx or DEFAULT_CONTEXT_TOKENS
 
         # --- dedup identical strings (same as the legacy path) ------------------
         # Translate each unique (text, context) ONCE, fan the result out to every
@@ -629,14 +633,15 @@ class TranslationScheduler:
         c = cal if cal is not None else self.cal
         with self.cond:
             prompt_tok = max(1, c.est_tokens(prompt))
+            text_only_tok = sum(c.est_tokens(it.text) + 10 for it in batch)
             out_ratio = max(0.1, float(c.out_ratio))
             samples = int(getattr(c, "_samples", 0) or 0)
         # Cold start (no usage samples yet): pad harder so concurrent threads
         # cannot under-reserve and dump the free-tier TPM in one burst.
         safety = _TPM_EST_SAFETY_COLD if samples <= 0 else _TPM_EST_SAFETY
         counts_output = getattr(self.provider, "tpm_counts_output", True)
-        multiplier = (1.0 + out_ratio) if counts_output else 1.0
-        return max(1, int(prompt_tok * multiplier * safety))
+        out_tok = int(text_only_tok * out_ratio) if counts_output else 0
+        return max(1, int((prompt_tok + out_tok) * safety))
 
     @staticmethod
     def _tpm_key_label(key: str, key_idx: int) -> str:
@@ -1080,7 +1085,7 @@ class TranslationScheduler:
                             for it in its:
                                 if len(candidates) >= max_b:
                                     break
-                                cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                cost = cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
                                 if len(candidates) > 0 and used + cost > budget:
                                     break
                                 used += cost
@@ -1120,14 +1125,27 @@ class TranslationScheduler:
 
                         # Token-pack one batch from the front of this file; balance tails so
                         # two threads get healthy halves instead of a full batch + tiny scrap.
-                        end = cal.next_batch(items, self.window, req.glossary, 0,
-                                             req.max_batch_size)
+                        budget = cal.input_budget(self.window, req.glossary)
+                        used_tokens = 0
+                        end = 0
+                        for it in items:
+                            if end >= req.max_batch_size:
+                                break
+                            cost = cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
+                            if end > 0 and used_tokens + cost > budget:
+                                break
+                            used_tokens += cost
+                            end += 1
+                        end = max(1, end)
                         tail = len(items) - end
                         min_tail = max(6, req.max_batch_size // 4)
+                        group_mode = getattr(req, "group_small_files", "auto")
                         if (
                             0 < tail < min_tail
                             and len(items) <= req.max_batch_size * 2
                             and self.cluster_error_streak == 0
+                            and (group_mode == "off" or len(self.pool) == 1)
+                            and self.worker_count > 1
                         ):
                             end = (len(items) + 1) // 2
 
@@ -1139,22 +1157,20 @@ class TranslationScheduler:
                         # Remnant / small file bundling:
                         # If batch has fewer items than min_fill and there are other files in the pool,
                         # greedily take items from subsequent files up to req.max_batch_size and token budget.
-                        group_mode = getattr(req, "group_small_files", "auto")
-                        min_fill = max(10, req.max_batch_size // 2)
-                        if group_mode != "off" and len(batch) < min_fill:
+                        if group_mode != "off" and len(batch) < req.max_batch_size:
                             budget = cal.input_budget(self.window, req.glossary)
                             used_tokens = sum(
-                                cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
                                 for it in batch
                             )
                             for other_fn, other_items in list(self.pool.items()):
-                                if not other_items:
+                                if other_fn == fname or not other_items:
                                     continue
                                 take_count = 0
                                 for it in other_items:
                                     if len(batch) >= req.max_batch_size:
                                         break
-                                    cost = cal.est_tokens(it.text) + cal.est_tokens(it.context) + 12
+                                    cost = cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
                                     if used_tokens + cost > budget:
                                         break
                                     used_tokens += cost
@@ -1185,7 +1201,7 @@ class TranslationScheduler:
             base_url=self.req.base_url,
             api_key=worker_key,
             model=self.req.model,
-            num_ctx=self.req.max_context_tokens,
+            num_ctx=self.window,
             timeout_seconds=float(getattr(self.req, "timeout_seconds", 0) or 0),
         )
         exact = self.provider.count_tokens(
@@ -1194,7 +1210,9 @@ class TranslationScheduler:
         )
         if exact is None:
             return False
-        return exact > cal.input_budget(self.window, self.req.glossary)
+        text_only_tok = sum(cal.est_tokens(it.text) + 8 for it in batch)
+        expected_out = int(text_only_tok * max(1.0, float(cal.out_ratio)))
+        return (exact + expected_out) > int(self.window * 0.92)
 
     def _shrink_overflow_exact(
         self, batch: list, cal: Calibrator, worker_key: str, fname: str,
@@ -1353,7 +1371,7 @@ class TranslationScheduler:
             base_url=req.base_url,
             api_key=worker_key,
             model=req.model,
-            num_ctx=req.max_context_tokens,
+            num_ctx=self.window,
             timeout_seconds=float(getattr(req, "timeout_seconds", 0) or 0),
         )
         prompt_chars = len(build_prompt(batch, req.target_lang, req.glossary,
