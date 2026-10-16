@@ -38,12 +38,28 @@ export default function UpdateOverlay({
   const startDownload = useCallback(async () => {
     if (isDownloadingRef.current) return;
     if (isAppBusyRef.current) return;
-    const update = updateHandleRef.current;
-    if (!update) return;
 
     isDownloadingRef.current = true;
     onStateChange(true);
     try {
+      // Re-check for the freshest release so we never download a stale intermediate version
+      let update = updateHandleRef.current;
+      try {
+        const fresh = await check();
+        if (fresh) {
+          update = fresh;
+          updateHandleRef.current = fresh;
+        }
+      } catch (checkErr) {
+        console.warn("[updater] pre-download re-check failed, falling back to cached update:", checkErr);
+      }
+
+      if (!update) {
+        onStateChange(false);
+        isDownloadingRef.current = false;
+        return;
+      }
+
       const version = update.version ?? "?";
       setState({ kind: "downloading", version, downloaded: 0, total: 0 });
 
