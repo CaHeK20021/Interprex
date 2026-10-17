@@ -299,15 +299,19 @@ function mergeWorkerEvent(
   prev: TranslateProgress | undefined,
   p: TranslateProgress,
 ): TranslateProgress {
-  const resetTry = p.phase ? WORKER_TRY_RESET.has(p.phase) : false;
+  const ph = p.phase ?? prev?.phase;
+  const resetTry = ph ? WORKER_TRY_RESET.has(ph) : false;
+  const isElapsedPhase = ph === "translating_batch" || ph === "finishing_batch";
+  const isWaitPhase = ph === "waiting_retry" || ph === "waiting_delay" || ph === "waiting_tpm";
   return {
     ...prev,
     ...p,
-    try_i: resetTry ? p.try_i : (p.try_i ?? prev?.try_i),
+    try_i: resetTry ? undefined : (p.try_i ?? prev?.try_i),
     batch_size: p.batch_size ?? prev?.batch_size,
     batch_num: p.batch_num ?? prev?.batch_num,
-    elapsed: p.elapsed ?? (resetTry ? undefined : prev?.elapsed),
-    error_class: p.error_class ?? prev?.error_class,
+    elapsed: isElapsedPhase ? (p.elapsed ?? prev?.elapsed ?? 0) : undefined,
+    wait_left: isWaitPhase ? (p.wait_left ?? prev?.wait_left ?? 0) : undefined,
+    error_class: resetTry ? undefined : (p.error_class ?? prev?.error_class),
   };
 }
 
@@ -831,6 +835,9 @@ export default function App() {
     baseUrl: string;
     apiKeys: string[];
     httpTimeoutS: number;
+    rpmLimit: number;
+    tpmLimitK: number;
+    maxBatchSize: number;
   } | null>(null);
   const shouldRestartRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
@@ -1837,15 +1844,18 @@ export default function App() {
           runSettingsRef.current.threads !== threads ||
           runSettingsRef.current.baseUrl !== baseUrl ||
           runSettingsRef.current.httpTimeoutS !== httpTimeoutS ||
+          runSettingsRef.current.rpmLimit !== rpmLimit ||
+          runSettingsRef.current.tpmLimitK !== tpmLimitK ||
+          runSettingsRef.current.maxBatchSize !== maxBatchSize ||
           JSON.stringify(runSettingsRef.current.apiKeys) !== JSON.stringify(apiKeys)
         );
         if (settingsChanged) {
           shouldRestartRef.current = true;
+          await abortTranslation();
           if (abortController) {
             abortController.abort();
             setAbortController(null);
           }
-          void abortTranslation();
           setIsPaused(false);
         } else {
           // Fresh pin session after resume: only landings from here on bubble.
@@ -1873,6 +1883,9 @@ export default function App() {
       baseUrl,
       apiKeys: [...apiKeys],
       httpTimeoutS,
+      rpmLimit,
+      tpmLimitK,
+      maxBatchSize,
     };
     shouldRestartRef.current = false;
     let ok = true;
@@ -1944,7 +1957,7 @@ export default function App() {
         abortControllerRef.current.abort();
         setAbortController(null);
       }
-      void abortTranslation();
+      await abortTranslation();
 
       const myClientRunId = ++clientRunIdRef.current;
       activeSidecarRunIdRef.current = null;
@@ -2079,12 +2092,18 @@ export default function App() {
               if (snap.phase) {
                 setWorkerPhases((prev) => ({ ...prev, [wi]: snap.phase! }));
               }
-              const sec =
-                snap.elapsed && snap.elapsed > 0
-                  ? snap.elapsed
-                  : snap.wait_left && snap.wait_left > 0
-                    ? snap.wait_left
-                    : 0;
+              const isWaitPh =
+                snap.phase === "waiting_retry" ||
+                snap.phase === "waiting_delay" ||
+                snap.phase === "waiting_tpm";
+              const isElapsedPh =
+                snap.phase === "translating_batch" ||
+                snap.phase === "finishing_batch";
+              const sec = isWaitPh
+                ? (snap.wait_left && snap.wait_left > 0 ? snap.wait_left : 0)
+                : isElapsedPh
+                  ? (snap.elapsed && snap.elapsed > 0 ? snap.elapsed : 0)
+                  : 0;
               setWorkerTimes((prev) => ({
                 ...prev,
                 [wi]: sec,
@@ -2270,24 +2289,24 @@ export default function App() {
           bumpSessionError(prev ?? emptySessionLog(activeRoot ?? "", provider, model), msg),
         );
       }
-      if (e instanceof Error && e.name === "AbortError" || (e instanceof DOMException && e.name === "AbortError")) {
-        setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
-        setProgress(null);
-        setInjectProgress(null);
-        workerSnapRef.current = {};
-        setKeyStatuses({});
-        setWorkerPhases({});
-        setWorkerTimes({});
-        setIsPaused(false);
+      if ((e instanceof Error && e.name === "AbortError") || (e instanceof DOMException && e.name === "AbortError")) {
+        if (!shouldRestartRef.current) {
+          setPhase((curr) => curr === "injecting" ? "injecting" : "idle");
+          setProgress(null);
+          setInjectProgress(null);
+          workerSnapRef.current = {};
+          setKeyStatuses({});
+          setWorkerPhases({});
+          setWorkerTimes({});
+          setIsPaused(false);
+        }
       } else {
         fail(e);
       }
     }
     if (shouldRestartRef.current) {
       shouldRestartRef.current = false;
-      setTimeout(() => {
-        translateAll(targetIds);
-      }, 50);
+      return await translateAll(targetIds, extraInstruction);
     }
     return { ok, project: ok ? currentProject : undefined };
   }
@@ -3053,6 +3072,19 @@ export default function App() {
     timerSec: number,
     fallbackMsg?: string,
   ) {
+    if (!snap && fallbackMsg) {
+      const isOk = ph === "completed_batch" || ph === "done";
+      const isErr = ph === "error";
+      const isPaused = ph === "paused";
+      return {
+        tone: isOk ? ("ok" as const) : isErr ? ("err" as const) : isPaused ? ("paused" as const) : ("busy" as const),
+        badgeText: null,
+        badgeType: null,
+        bottomText: fallbackMsg,
+        displayTimer: timerSec > 0 ? `${timerSec}с` : "",
+      };
+    }
+
     const tryI = snap?.try_i ?? 0;
     const isRetry = tryI > 0;
     const batchNum = snap?.batch_num;
@@ -3070,7 +3102,7 @@ export default function App() {
     if (ph === "translating_batch") {
       if (isRetry) {
         tone = "retry";
-        badgeText = `Попытка ${tryI + 1}`;
+        badgeText = `Повтор #${tryI}`;
         badgeType = "retry";
         bottomText = batchSize ? `Повтор запроса · ${batchSize} строк` : "Повтор запроса";
       } else {
@@ -3084,7 +3116,7 @@ export default function App() {
       if (timerSec > 0) displayTimer = `${timerSec}с`;
     } else if (ph === "waiting_retry" || ph === "batch_error") {
       tone = "retry";
-      badgeText = `Попытка ${tryI + 1}`;
+      badgeText = `Повтор #${tryI + 1}`;
       badgeType = "retry";
       bottomText = batchSize ? `Пауза перед повтором · ${batchSize} строк` : "Пауза перед повтором";
       if (timerSec > 0) displayTimer = `${timerSec}с`;

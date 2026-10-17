@@ -551,6 +551,7 @@ class TranslationScheduler:
         self.aborted = False
         self.run_id = f"{int(time.time() * 1000)}_{id(self):x}"
         self._emit_seq = 0
+        self.worker_last_phase: dict[int, str] = {}
         self.tok_in = 0
         self.tok_out = 0
         self.batches = 0
@@ -604,6 +605,7 @@ class TranslationScheduler:
         with self.cond:
             self._emit_seq += 1
             seq = self._emit_seq
+            self.worker_last_phase[worker_idx] = phase
             done = len(self.result)
             batches = self.batches
             requests_sent = self.requests_sent
@@ -2258,7 +2260,6 @@ class TranslationScheduler:
         stagger_offset = (self.delay_seconds * thread_rank / self.threads
                           if self.delay_seconds > 0 and self.threads > 1 else 0.0)
         self._initial_stagger(worker_idx)
-        is_resting = False
         while not self._is_aborted():
             kind, payload = self.claim_batch(worker_idx, cal, worker_key)
             if kind == _DONE:
@@ -2266,16 +2267,16 @@ class TranslationScheduler:
                     self._emit(worker_idx, "done", status="Done")
                 return
             if kind == _REST:
-                if not is_resting:
+                with self.cond:
+                    last_ph = self.worker_last_phase.get(worker_idx)
+                if last_ph != "resting":
                     self._emit(worker_idx, "resting", status="Resting")
-                    is_resting = True
                 # Block until state changes (a peer finished or reclaimed), so a
                 # resting worker neither busy-spins nor misses returned work.
                 with self.cond:
                     if not self._run_done_locked() and not self._is_aborted():
                         self.cond.wait(timeout=0.5)
                 continue
-            is_resting = False
 
             _fname, batch = payload
             batch = self._shrink_overflow_exact(batch, cal, worker_key, _fname)
