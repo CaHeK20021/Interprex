@@ -394,13 +394,19 @@ class Calibrator:
     def est_tokens(self, text: str) -> int:
         return max(1, int(len(text) / self.chars_per_token) + 1)
 
-    def input_budget(self, window: int, glossary: dict[str, str]) -> int:
+    def input_budget(self, window: int, glossary: dict[str, str], tpm_limit: int = 0) -> int:
         glossary_tokens = sum(self.est_tokens(f"{k} => {v}")
                               for k, v in glossary.items())
         fixed = _PROMPT_OVERHEAD_TOKENS + glossary_tokens
         # Reserve output by the learned ratio, with a safety margin so a noisy
         # estimate errs toward a smaller (safe) batch rather than overflow.
-        return max(1, int((window - fixed) / (1 + self.out_ratio) * 0.92))
+        budget = max(1, int((window - fixed) / (1 + self.out_ratio) * 0.92))
+        if tpm_limit > 0:
+            # A single batch must never consume more than 40% of the entire minute TPM window.
+            # E.g. at 16,000 TPM, batch input tokens capped at ~0.40 * 16000 / (1 + out_ratio)
+            tpm_max_input = max(50, int((tpm_limit * 0.40 - fixed) / (1 + self.out_ratio)))
+            budget = min(budget, tpm_max_input)
+        return max(1, budget)
 
     def observe(self, prompt_chars: int, usage: "Usage") -> None:
         """Fold one batch's exact usage into the running estimate. Ignores empty

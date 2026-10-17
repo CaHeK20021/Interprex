@@ -3106,7 +3106,6 @@ export default function App() {
     const batchNum = snap?.batch_num;
     const batchSize = snap?.batch_size;
     const waitLeft = snap?.wait_left ?? 0;
-    const tpmEst = snap?.tpm_est;
     const statusStr = (snap?.status || "").toLowerCase();
 
     let tone: "busy" | "retry" | "pacing" | "ok" | "err" | "paused" | "stopped" = "stopped";
@@ -3123,10 +3122,6 @@ export default function App() {
         bottomText = batchSize ? `Повтор запроса · ${batchSize} строк` : "Повтор запроса";
       } else {
         tone = "busy";
-        if (batchNum) {
-          badgeText = `#${batchNum}`;
-          badgeType = "batch";
-        }
         bottomText = batchSize ? `Перевод · ${batchSize} строк` : "Перевод";
       }
       if (timerSec > 0) displayTimer = `${timerSec}с`;
@@ -3149,7 +3144,7 @@ export default function App() {
       if (timerSec > 0) displayTimer = `${timerSec}с`;
     } else if (ph === "waiting_tpm") {
       tone = "pacing";
-      bottomText = tpmEst ? `Ожидание окна TPM (~${tpmEst} ток.)` : "Ожидание окна TPM";
+      bottomText = "Ожидание окна TPM";
       displayTimer = waitLeft > 0 ? `${waitLeft}с` : "TPM";
     } else if (ph === "finishing_batch") {
       tone = "busy";

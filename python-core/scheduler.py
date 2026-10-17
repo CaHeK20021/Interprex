@@ -151,6 +151,15 @@ def _classify_error(msg: str) -> str:
     if any(k in m for k in geo_markers):
         return "auth"
 
+    # Pure Rate Limit (429 / RPM/TPM quota exhausted) — MUST be checked BEFORE
+    # auth_markers because Google's 429 message contains "check your plan and billing details".
+    rate_markers = (
+        "429", "too many", "rate limit", "rate-limit",
+        "resource exhausted", "resource_exhausted", "quota", "[retry_after=",
+    )
+    if any(k in m for k in rate_markers):
+        return "rate"
+
     auth_markers = (
         "401", "403", "api key not valid", "invalid api key", "invalid_api_key",
         "api_key_invalid", "permission", "unauthor", "expired", "billing",
@@ -163,14 +172,6 @@ def _classify_error(msg: str) -> str:
     )
     if any(k in m for k in auth_markers):
         return "auth"
-
-    # Pure Rate Limit (429 / RPM/TPM quota exhausted)
-    rate_markers = (
-        "429", "too many", "rate limit", "rate-limit",
-        "resource exhausted", "resource_exhausted", "quota",
-    )
-    if any(k in m for k in rate_markers):
-        return "rate"
 
     # Temporary server / gateway overload (502, 503, 504)
     overload_markers = (
@@ -903,6 +904,25 @@ class TranslationScheduler:
                 if worker_key in self.dead_keys:
                     return False
                 now = time.time()
+                cd = self.key_cooldown.get(worker_key, 0.0)
+                if self.cluster_error_streak >= 3 and self.cluster_cooldown_until > cd:
+                    cd = self.cluster_cooldown_until
+                if cd > now + 0.05:
+                    wait_s = cd - now
+                    wait_left = int(math.ceil(wait_s))
+                    bnum = self.worker_batch_no.get(worker_idx, self.batch_seq + 1)
+                    emit_key = ("cooldown", wait_left)
+                    if emit_key != last_emit_key:
+                        last_emit_key = emit_key
+                        self._emit(
+                            worker_idx,
+                            "waiting_delay",
+                            status=f"Key cooldown ({wait_left}s left)...",
+                            wait_left=wait_left,
+                            batch_num=bnum or None,
+                        )
+                    self.cond.wait(timeout=min(0.5, max(0.05, wait_s)))
+                    continue
                 ready_at = self._tpm_earliest_fit_locked(worker_key, est, now)
                 if ready_at <= now + 0.001:
                     self._tpm_reserve_locked(worker_idx, worker_key, est)
@@ -1115,7 +1135,7 @@ class TranslationScheduler:
                     if self.auto_group_small_files:
                         # Собираем кандидатов из разных файлов
                         candidates = []  # список кортежей (fname, item)
-                        budget = cal.input_budget(self.window, req.glossary)
+                        budget = cal.input_budget(self.window, req.glossary, self.tpm_limit)
                         used = 0
                         max_b = req.max_batch_size
 
@@ -1163,7 +1183,7 @@ class TranslationScheduler:
 
                         # Token-pack one batch from the front of this file; balance tails so
                         # two threads get healthy halves instead of a full batch + tiny scrap.
-                        budget = cal.input_budget(self.window, req.glossary)
+                        budget = cal.input_budget(self.window, req.glossary, self.tpm_limit)
                         used_tokens = 0
                         end = 0
                         for it in items:
@@ -1196,7 +1216,7 @@ class TranslationScheduler:
                         # If batch has fewer items than min_fill and there are other files in the pool,
                         # greedily take items from subsequent files up to req.max_batch_size and token budget.
                         if group_mode != "off" and len(batch) < req.max_batch_size:
-                            budget = cal.input_budget(self.window, req.glossary)
+                            budget = cal.input_budget(self.window, req.glossary, self.tpm_limit)
                             used_tokens = sum(
                                 cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
                                 for it in batch
@@ -1424,6 +1444,7 @@ class TranslationScheduler:
         auth_fails = 0  # consecutive auth-class failures → kill the key fast
         server_500_hits = 0  # cumulative server-class failures on this batch life
         splits_done = 0  # max 1 split per batch life to avoid cascade bisection into dust
+        rate_hits = 0  # consecutive rate-limit (429) hits on this batch life
 
         for try_i in range(BATCH_TRIES):
             if self._is_aborted() or worker_key in self.dead_keys:
@@ -1445,7 +1466,7 @@ class TranslationScheduler:
                         and self._remaining_locked() > 0
                         and len(batch) < req.max_batch_size
                     ):
-                        budget = cal.input_budget(self.window, req.glossary)
+                        budget = cal.input_budget(self.window, req.glossary, self.tpm_limit)
                         used_tokens = sum(
                             cal.est_tokens(it.text) + int(cal.est_tokens(it.context) * 0.35) + 12
                             for it in batch
@@ -1590,6 +1611,66 @@ class TranslationScheduler:
                     batch_size=len(batch),
                     try_i=try_i,
                 )
+                rate_floor = 0.0
+                if kind == "rate":
+                    rate_hits += 1
+                    # Auto-detect TPM limit from provider 429 message if not configured:
+                    if "input_token_count" in err_str or "token" in err_str.lower():
+                        m_lim = re.search(r"limit:\s*(\d+)", err_str, re.IGNORECASE)
+                        if m_lim and self.tpm_limit <= 0:
+                            detected_tpm = int(m_lim.group(1))
+                            if detected_tpm > 0:
+                                with self.cond:
+                                    self.tpm_limit = detected_tpm
+                                logger.info(
+                                    "[Worker %d] Auto-detected TPM limit from 429: %d",
+                                    worker_idx, detected_tpm,
+                                )
+                    # If this is a token quota error or repeated 429 on this batch, split in half!
+                    is_token_429 = "token" in err_str.lower() or "input_token_count" in err_str.lower()
+                    if (is_token_429 or rate_hits >= 2) and len(batch) >= 6:
+                        mid = len(batch) // 2
+                        leftover = batch[mid:]
+                        del batch[mid:]
+                        with self.cond:
+                            for it in reversed(leftover):
+                                fn = self.item_file.get(it.id, "")
+                                self.pool.setdefault(fn, []).insert(0, it)
+                        logger.info(
+                            "[Worker %d] Token/rate 429: bisected batch into %d items (returned %d to pool)",
+                            worker_idx, len(batch), len(leftover),
+                        )
+                        if getattr(cal, "_samples", 0) == 0:
+                            cal.chars_per_token = max(1.2, cal.chars_per_token * 0.8)
+
+                    m_retry = re.search(r"\[retry_after=([0-9.]+)s?\]", err_str)
+                    retry_delay_from_err = float(m_retry.group(1)) if m_retry else None
+                    if retry_delay_from_err is not None and retry_delay_from_err > 0:
+                        rate_floor = retry_delay_from_err
+                    else:
+                        rate_floor = (
+                            self.delay_seconds
+                            if self.delay_seconds > 0
+                            else _RATE_COOLDOWN_NO_RPM_S
+                        )
+                    with self.cond:
+                        self.key_cooldown[worker_key] = max(
+                            self.key_cooldown.get(worker_key, 0.0),
+                            time.time() + rate_floor,
+                        )
+                elif kind == "overload":
+                    rate_floor = (
+                        max(6.0, min(self.delay_seconds, 12.0))
+                        if _RETRY_BACKOFF_FIRST > 0
+                        else 0.0
+                    )
+                    if rate_floor > 0:
+                        with self.cond:
+                            self.key_cooldown[worker_key] = max(
+                                self.key_cooldown.get(worker_key, 0.0),
+                                time.time() + rate_floor,
+                            )
+
                 # Release TPM reserve: errors NEVER spend TPM quota on cloud LLMs (500/503/429/400).
                 # Committing phantom est_tokens on error chokes the 60s sliding window.
                 # Only a client-side ReadTimeout (where the server generated for 200s+) spent tokens.
@@ -1751,37 +1832,7 @@ class TranslationScheduler:
                         ):
                             return ({}, False, False)
                         # Unpaused: fall through to normal back-off then retry.
-                    rate_floor = 0.0
-                    if kind == "rate":
-                        m_retry = re.search(r"\[retry_after=([0-9.]+)s?\]", err_str)
-                        retry_delay_from_err = float(m_retry.group(1)) if m_retry else None
-                        if retry_delay_from_err is not None and retry_delay_from_err > 0:
-                            rate_floor = retry_delay_from_err
-                        else:
-                            rate_floor = (
-                                self.delay_seconds
-                                if self.delay_seconds > 0
-                                else _RATE_COOLDOWN_NO_RPM_S
-                            )
-                        with self.cond:
-                            self.key_cooldown[worker_key] = max(
-                                self.key_cooldown.get(worker_key, 0.0),
-                                time.time() + rate_floor,
-                            )
-                    elif kind == "overload":
-                        # 502/503/504: temporary server capacity hiccup; short key cooldown
-                        rate_floor = (
-                            max(6.0, min(self.delay_seconds, 12.0))
-                            if _RETRY_BACKOFF_FIRST > 0
-                            else 0.0
-                        )
-                        if rate_floor > 0:
-                            with self.cond:
-                                self.key_cooldown[worker_key] = max(
-                                    self.key_cooldown.get(worker_key, 0.0),
-                                    time.time() + rate_floor,
-                                )
-                    elif kind == "server":
+                    if kind == "server":
                         # 500: Do NOT lock the key! Siblings work fine. Fast local backoff.
                         rate_floor = 3.0 if _RETRY_BACKOFF_FIRST > 0 else 0.0
                     elif not reached:
