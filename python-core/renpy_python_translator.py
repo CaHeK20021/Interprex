@@ -65,7 +65,7 @@ from providers.base import get_http_client
 
 # Reuse the SAME error bucketing the main scheduler uses, so this path fails over
 # identically (no duplicated marker lists to drift out of sync).
-from scheduler import _classify_error, _reached_server
+from scheduler import _classify_error, _format_key_death_reason, _reached_server
 
 # ---------------------------------------------------------------------------
 # Classification cache — persists between runs so identical candidates are not
@@ -858,9 +858,12 @@ def _run_batches_over_keypool(batches, keys, threads, delay_seconds, label, proc
                         with dead_lock:
                             dead_keys.add(key)
                             last_key_dead = len(dead_keys) >= len(keys)
+                        k_num = (keys.index(key) + 1) if (keys and key in keys) else (worker_idx + 1)
+                        masked = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else (key or "unknown")
+                        death_reason = _format_key_death_reason(str(e))
                         logger.warning(
-                            "Thread %d key failed; requeueing batch %d/%d",
-                            worker_idx, batch_idx + 1, total,
+                            "Thread %d Key #%d (%s) failed: %s; requeueing batch %d/%d",
+                            worker_idx, k_num, masked, death_reason, batch_idx + 1, total,
                         )
                         if last_key_dead:
                             # No survivor left to take it — account so the pool ends;

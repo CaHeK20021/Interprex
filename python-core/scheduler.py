@@ -193,6 +193,30 @@ def _classify_error(msg: str) -> str:
     return "other"
 
 
+def _format_key_death_reason(err: str) -> str:
+    """Extract a user-friendly, concise reason why an API key was marked dead."""
+    m = (err or "").lower()
+    if any(k in m for k in ("daily_limit", "per day", "per_day", "daily quota", "requests per day")):
+        return "Daily quota exceeded (Requests per day limit reached)"
+    if any(k in m for k in (
+        "в вашей стране недоступен", "стране недоступен",
+        "location is not supported", "region is not supported",
+        "unsupported country", "not available in your country", "geoblock",
+    )):
+        return "Geoblock (Location not supported / VPN required)"
+    if any(k in m for k in ("no credits", "insufficient credits", "insufficient funds", "402", "balance")):
+        return "No credits / Insufficient balance"
+    if any(k in m for k in ("api key not valid", "invalid api key", "invalid_api_key", "api_key_invalid", "invalid key", "key not found")):
+        return "Invalid API key"
+    if "401" in m or "unauthor" in m:
+        return "401 Unauthorized (Invalid or expired API key)"
+    if "403" in m or "permission" in m or "forbidden" in m:
+        return "403 Forbidden (Access denied / IP or API blocked)"
+    clean = re.sub(r"\[Worker\s*\d+\]\s*", "", err or "")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:120] if clean else "Authentication / Quota failed"
+
+
 def _reached_server(msg: str) -> bool:
     """True if a failed request still hit the provider's server (so it spent the
     quota), False for a pure connection failure that never arrived. On every
@@ -494,6 +518,7 @@ class TranslationScheduler:
         self.in_flight_workers: set[int] = set()
         self.avg_batch_items = float(req.max_batch_size or 30)
         self.dead_keys: set[str] = set()
+        self.key_death_reasons: dict[str, str] = {}
         # Per-key cooldown: monotonic wall-clock time until which this key should
         # not be hit again, set when ANY worker on the key sees a rate/overload
         # error. Sibling workers on the SAME key honour it (and workers on other
@@ -1648,18 +1673,27 @@ class TranslationScheduler:
                         return ({}, False, True)
 
                 if kind == "auth":
-                    # An invalid/expired key won't fix itself this run. Give it a
-                    # couple of grace tries (a 401 can be a transient edge blip),
-                    # then declare the key dead so its work fails over fast rather
-                    # than burning ~26 minutes of pointless retries.
                     auth_fails += 1
-                    if auth_fails >= 2:
+                    reason = _format_key_death_reason(err_str)
+                    with self.cond:
+                        self.key_death_reasons[worker_key] = reason
+                    is_strictly_permanent = any(
+                        m in err_str.lower()
+                        for m in (
+                            "daily_limit", "per day", "per_day", "daily quota", "requests per day",
+                            "api key not valid", "invalid api key", "invalid_api_key", "api_key_invalid",
+                            "user not found", "no credits", "insufficient credits",
+                        )
+                    )
+                    if auth_fails >= (1 if is_strictly_permanent else 2):
+                        k_num = (self.keys_to_use.index(worker_key) + 1) if (self.keys_to_use and worker_key in self.keys_to_use) else (worker_idx + 1)
+                        masked = f"{worker_key[:4]}...{worker_key[-4:]}" if len(worker_key) > 8 else (worker_key or "unknown")
                         logger.error(
-                            "[Worker %d] Key looks invalid (%s). Failing it over.",
-                            worker_idx, err_str[:200],
+                            "[Worker %d] Key #%d (%s) failed (%s). Failing it over.",
+                            worker_idx, k_num, masked, reason,
                         )
                         with self.cond:
-                            self.errors.append(f"[Worker {worker_idx + 1}] {e}")
+                            self.errors.append(f"[Worker {worker_idx + 1}] Key #{k_num} ({masked}) failed: {reason} ({e})")
                         return ({}, True, False)
                 else:
                     auth_fails = 0
@@ -2246,8 +2280,19 @@ class TranslationScheduler:
             if key_died:
                 with self.cond:
                     self.dead_keys.add(worker_key)
+                    reason = self.key_death_reasons.get(worker_key, "Authorization or quota exhausted")
                     self.cond.notify_all()
-                self._emit(worker_idx, "error", status="Error: key failed")
+                k_num = (self.keys_to_use.index(worker_key) + 1) if (self.keys_to_use and worker_key in self.keys_to_use) else (worker_idx + 1)
+                masked = f"{worker_key[:4]}...{worker_key[-4:]}" if len(worker_key) > 8 else (worker_key or "unknown")
+                err_detail = reason or "Authorization or quota exhausted"
+                err_msg = f"Key #{k_num} ({masked}) failed: {err_detail}"
+                logger.error("[Worker %d] %s", worker_idx, err_msg)
+                self._emit(
+                    worker_idx,
+                    "error",
+                    status=err_msg,
+                    last_error=err_msg,
+                )
                 return
 
             # Если воркер добровольно сдал батч (Tail Storm Yield: tr_map пуст и не safety_skip),

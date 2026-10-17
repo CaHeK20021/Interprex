@@ -136,6 +136,47 @@ function emptySessionLog(
 function classifySessionError(raw: string): { key: string; label: string } {
   const s = (raw || "").trim();
   const m = s.toLowerCase();
+
+  // Specific key failure events: keep the key identifier and exact reason separate
+  // so the user clearly sees which of their keys failed and why.
+  const keyFailedMatch = s.match(/(?:key|ключ)\s*#(\d+)\s*\(([^)]+)\)\s*(?:failed|отключён|отвалился)?[:\s—-]*(.*)/i);
+  if (keyFailedMatch) {
+    const keyNum = keyFailedMatch[1];
+    const masked = keyFailedMatch[2];
+    const reason = keyFailedMatch[3]?.trim() || "Dead / Quota exhausted";
+    return {
+      key: `key_dead_${keyNum}_${masked}`,
+      label: `Ключ #${keyNum} (${masked}) — ${reason}`,
+    };
+  }
+
+  if (m === "error: key failed" || m === "key failed") {
+    return { key: "key_failed_generic", label: "Ошибка API-ключа (исчерпан лимит или недействителен)" };
+  }
+
+  // Daily quota (RPD) vs RPM
+  if (
+    m.includes("daily_limit") ||
+    m.includes("per day") ||
+    m.includes("per_day") ||
+    m.includes("daily quota") ||
+    m.includes("requests per day")
+  ) {
+    return { key: "daily_limit", label: "Daily limit exceeded — исчерпан суточный лимит запросов (RPD)" };
+  }
+
+  // Geoblock / Unsupported region
+  if (
+    m.includes("location is not supported") ||
+    m.includes("region is not supported") ||
+    m.includes("unsupported country") ||
+    m.includes("not available in your country") ||
+    m.includes("geoblock") ||
+    m.includes("стране недоступен")
+  ) {
+    return { key: "geoblock", label: "Geoblock — регион не поддерживается (нужен VPN)" };
+  }
+
   if (
     m.includes("429") ||
     m.includes("rate limit") ||
