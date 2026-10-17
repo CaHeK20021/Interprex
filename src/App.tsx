@@ -15,6 +15,7 @@ import {
   createBackup,
   pauseTranslation,
   resumeTranslation,
+  abortTranslation,
   detectMods,
   keyLimits,
   translateRenpyPython,
@@ -1116,6 +1117,9 @@ export default function App() {
   // Last per-worker progress snapshot. Status text is formatted FROM this, not
   // from the raw event, so omitted try_i/elapsed on a tick can't blink the card.
   const workerSnapRef = useRef<Record<number, TranslateProgress>>({});
+  const clientRunIdRef = useRef<number>(0);
+  const activeSidecarRunIdRef = useRef<string | null>(null);
+  const workerLastSeqRef = useRef<Record<number, number>>({});
   // Models the chosen backend can serve, and which one it has loaded right now.
   // Populated from the sidecar so the user picks instead of typing the name.
   const [models, setModels] = useState<string[]>([]);
@@ -1841,6 +1845,7 @@ export default function App() {
             abortController.abort();
             setAbortController(null);
           }
+          void abortTranslation();
           setIsPaused(false);
         } else {
           // Fresh pin session after resume: only landings from here on bubble.
@@ -1935,6 +1940,16 @@ export default function App() {
         : 0;
       const runTpmLimit = runTpmK * 1000;
 
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        setAbortController(null);
+      }
+      void abortTranslation();
+
+      const myClientRunId = ++clientRunIdRef.current;
+      activeSidecarRunIdRef.current = null;
+      workerLastSeqRef.current = {};
+
       setProgress({
         done: initialDone,
         total: totalUnique,
@@ -2000,6 +2015,22 @@ export default function App() {
             extraInstruction: extraInstruction ?? "",
           },
           (p) => {
+            if (clientRunIdRef.current !== myClientRunId) return;
+            if (p.run_id) {
+              if (activeSidecarRunIdRef.current === null) {
+                activeSidecarRunIdRef.current = p.run_id;
+              } else if (activeSidecarRunIdRef.current !== p.run_id) {
+                return;
+              }
+            }
+            const wi = p.worker_idx ?? p.key_idx;
+            if (p.seq !== undefined && wi !== undefined) {
+              if ((workerLastSeqRef.current[wi] ?? -1) >= p.seq) {
+                return;
+              }
+              workerLastSeqRef.current[wi] = p.seq;
+            }
+
             // LOAD-BEARING: `done` is MONOTONIC. Concurrent workers emit NDJSON
             // out of order; a late event can carry a STALE lower len(result)
             // than a peer already reported (esp. when completed_batch used to
@@ -2010,7 +2041,6 @@ export default function App() {
               totalUnique,
               initialDone + (p.done ?? 0),
             );
-            const wi = p.worker_idx ?? p.key_idx;
             const snap = wi !== undefined
               ? mergeWorkerEvent(workerSnapRef.current[wi], p)
               : p;
@@ -3017,6 +3047,96 @@ export default function App() {
     return "";
   }
 
+  function getWorkerCardContent(
+    snap: TranslateProgress | undefined,
+    ph: string,
+    timerSec: number,
+    fallbackMsg?: string,
+  ) {
+    const tryI = snap?.try_i ?? 0;
+    const isRetry = tryI > 0;
+    const batchNum = snap?.batch_num;
+    const batchSize = snap?.batch_size;
+    const waitLeft = snap?.wait_left ?? 0;
+    const tpmEst = snap?.tpm_est;
+    const statusStr = (snap?.status || "").toLowerCase();
+
+    let tone: "busy" | "retry" | "pacing" | "ok" | "err" | "paused" | "stopped" = "stopped";
+    let badgeText: string | null = null;
+    let badgeType: "batch" | "retry" | null = null;
+    let bottomText = "";
+    let displayTimer = "";
+
+    if (ph === "translating_batch") {
+      if (isRetry) {
+        tone = "retry";
+        badgeText = `Попытка ${tryI + 1}`;
+        badgeType = "retry";
+        bottomText = batchSize ? `Повтор запроса · ${batchSize} строк` : "Повтор запроса";
+      } else {
+        tone = "busy";
+        if (batchNum) {
+          badgeText = `#${batchNum}`;
+          badgeType = "batch";
+        }
+        bottomText = batchSize ? `Перевод · ${batchSize} строк` : "Перевод";
+      }
+      if (timerSec > 0) displayTimer = `${timerSec}с`;
+    } else if (ph === "waiting_retry" || ph === "batch_error") {
+      tone = "retry";
+      badgeText = `Попытка ${tryI + 1}`;
+      badgeType = "retry";
+      bottomText = batchSize ? `Пауза перед повтором · ${batchSize} строк` : "Пауза перед повтором";
+      if (timerSec > 0) displayTimer = `${timerSec}с`;
+    } else if (ph === "waiting_delay") {
+      tone = "pacing";
+      const isCooldown = statusStr.includes("cooldown") || statusStr.includes("охлаждение");
+      if (isCooldown) {
+        bottomText = "Охлаждение лимитов API";
+      } else if (batchNum) {
+        bottomText = `Пакет #${batchNum} готов · пауза RPM`;
+      } else {
+        bottomText = "Пауза RPM";
+      }
+      if (timerSec > 0) displayTimer = `${timerSec}с`;
+    } else if (ph === "waiting_tpm") {
+      tone = "pacing";
+      bottomText = tpmEst ? `Ожидание окна TPM (~${tpmEst} ток.)` : "Ожидание окна TPM";
+      displayTimer = waitLeft > 0 ? `${waitLeft}с` : "TPM";
+    } else if (ph === "finishing_batch") {
+      tone = "busy";
+      bottomText = batchSize ? `Завершение пакета · ${batchSize} строк` : "Завершение пакета";
+      if (timerSec > 0) displayTimer = `${timerSec}с`;
+    } else if (ph === "completed_batch") {
+      tone = "ok";
+      bottomText = batchNum ? `Пакет #${batchNum} готов` : "Пакет готов";
+    } else if (ph === "paused") {
+      tone = "paused";
+      bottomText = "На паузе";
+    } else if (ph === "resting") {
+      tone = "stopped";
+      bottomText = "Ожидание очереди";
+    } else if (ph === "done") {
+      tone = "stopped";
+      bottomText = "Завершено";
+    } else if (ph === "error") {
+      tone = "err";
+      bottomText = snap?.status || "Ключ не сработал";
+    } else if (ph === "initializing") {
+      tone = "busy";
+      bottomText = "Инициализация...";
+    } else {
+      tone = "stopped";
+      bottomText = snap?.status || fallbackMsg || "Ожидание очереди";
+    }
+
+    if (!bottomText && fallbackMsg) {
+      bottomText = fallbackMsg;
+    }
+
+    return { tone, badgeText, badgeType, bottomText, displayTimer };
+  }
+
   const busy = phase !== "idle";
 
   // Static "translated X / Y" counts for a loaded project, by UNIQUE (text,
@@ -3787,31 +3907,12 @@ export default function App() {
             </div>
             <div className="workers-grid">
               {Array.from({ length: visible }, (_, i) => {
-                const ph = workerPhases[i] ?? "idle";
-                const msg = keyStatuses[i] ?? "";
+                const snap = workerSnapRef.current[i];
+                const ph = workerPhases[i] ?? snap?.phase ?? "idle";
                 const sec = workerTimes[i] ?? 0;
-                // Strip redundant trailing seconds from status text so it won't truncate,
-                // as the timer is displayed in the dedicated top-right badge.
-                const cleanMsg = msg
-                  ? msg.replace(/\s*[\u00B7\u2014\-]\s*\d+\s*(?:сек|s|c|sec)\b.*$/i, "").trim()
-                  : "";
-                // Traffic-light tone: request in flight (yellow), answer landed
-                // (green), errored (red), or stopped/idle (grey — a thread that
-                // finished or went to rest). Waiting/paused keep their own accent.
-                const tone =
-                  ph === "completed_batch"
-                    ? "ok"
-                    : ph === "error" || ph === "batch_error"
-                      ? "err"
-                      : ph === "translating_batch" ||
-                          ph === "finishing_batch" ||
-                          ph === "initializing"
-                        ? "busy"
-                        : ph === "paused"
-                          ? "idle" // purple/paused accent via phase-paused CSS
-                          : ph === "done" || ph === "resting" || ph === "idle"
-                            ? "stopped"
-                            : "idle";
+                const fallbackMsg = keyStatuses[i] ?? "";
+                const { tone, badgeText, badgeType, bottomText, displayTimer } = getWorkerCardContent(snap, ph, sec, fallbackMsg);
+
                 return (
                   <div key={i} className={`worker-card phase-${ph} tone-${tone}`}>
                     <div className="worker-card-head">
@@ -3819,12 +3920,19 @@ export default function App() {
                         <span className={`worker-dot tone-${tone}`} />
                         {t("workerLabel")(i + 1)}
                       </span>
-                      <span className={`worker-card-timer ${sec > 0 ? "active" : ""}`}>
-                        {sec > 0 ? `${sec}с` : ""}
-                      </span>
+                      <div className="worker-card-head-right">
+                        {badgeText && (
+                          <span className={`worker-card-badge ${badgeType === "retry" ? "badge-retry" : "badge-batch"}`}>
+                            {badgeText}
+                          </span>
+                        )}
+                        <span className={`worker-card-timer ${displayTimer ? "active" : ""}`}>
+                          {displayTimer}
+                        </span>
+                      </div>
                     </div>
-                    <span className="worker-card-status" title={msg || (t("statusResting") as string)}>
-                      {cleanMsg || t("statusResting")}
+                    <span className="worker-card-status" title={bottomText}>
+                      {bottomText}
                     </span>
                   </div>
                 );

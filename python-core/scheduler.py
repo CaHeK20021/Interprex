@@ -549,6 +549,8 @@ class TranslationScheduler:
         self.result: dict[str, str] = {}  # rep id -> translation (authoritative)
         self.errors: list[str] = []
         self.aborted = False
+        self.run_id = f"{int(time.time() * 1000)}_{id(self):x}"
+        self._emit_seq = 0
         self.tok_in = 0
         self.tok_out = 0
         self.batches = 0
@@ -600,6 +602,8 @@ class TranslationScheduler:
     def _emit(self, worker_idx, phase, status="", **extra) -> None:
         """Queue one NDJSON progress event for the stream consumer."""
         with self.cond:
+            self._emit_seq += 1
+            seq = self._emit_seq
             done = len(self.result)
             batches = self.batches
             requests_sent = self.requests_sent
@@ -609,6 +613,8 @@ class TranslationScheduler:
             )
         evt = {
             "type": "progress",
+            "run_id": self.run_id,
+            "seq": seq,
             "done": done,
             "total": self.total,
             "batches": batches,
@@ -947,7 +953,9 @@ class TranslationScheduler:
                     )
             # Sleep the remainder (capped) so we recheck soon when a sibling
             # unreserves; never a flat 1s that would re-lockstep threads.
-            time.sleep(min(0.35, max(0.05, wait_s)))
+            with self.cond:
+                if not self.aborted:
+                    self.cond.wait(timeout=min(0.35, max(0.05, wait_s)))
         return False
 
     # -- pool primitives (call under self.cond) ---------------------------------
@@ -1381,12 +1389,17 @@ class TranslationScheduler:
                         elapsed=elapsed,
                     )
         if tr is None and not self._is_aborted():
-            ok, val = res_queue.get(timeout=1.0)
-            if ok:
-                tr = val
-            else:
-                raise val
+            try:
+                ok, val = res_queue.get(timeout=1.0)
+                if ok:
+                    tr = val
+                else:
+                    raise val
+            except queue.Empty:
+                pass
         if tr is None:
+            if self._is_aborted():
+                raise RuntimeError("Translation aborted.")
             raise RuntimeError("Translation thread terminated without result.")
         return tr
 
@@ -1537,6 +1550,10 @@ class TranslationScheduler:
                 return (batch_tr, False, False)
 
             except Exception as e:  # noqa: BLE001
+                if self._is_aborted():
+                    if tpm_held:
+                        self._tpm_commit(worker_idx, worker_key, 0)
+                    return ({}, False, False)
                 err_str = str(e)
                 is_safety = "GEMINI_SAFETY_BLOCK" in err_str
                 batch_contents = [{"id": it.id, "text": it.text} for it in batch]
@@ -1980,9 +1997,11 @@ class TranslationScheduler:
             if cfg and getattr(cfg, "api_key", None):
                 with self.cond:
                     cd = max(self.key_cooldown.get(cfg.api_key, 0.0), self.cluster_cooldown_until)
-                wait = cd - time.time()
-                if wait > 0:
-                    time.sleep(wait)
+                    wait = cd - time.time()
+                    if wait > 0:
+                        self.cond.wait(timeout=wait)
+            if self._is_aborted():
+                break
             try:
                 retry_prompt = build_prompt(
                     retry_batch, self.req.target_lang, self.req.glossary,
@@ -2075,7 +2094,10 @@ class TranslationScheduler:
         extra.setdefault("batch_size", extra.get("batch_size", 0))
         self._emit(worker_idx, "paused", **extra)
         while self.should_pause() and not self._is_aborted():
-            time.sleep(0.5)
+            with self.cond:
+                if self._is_aborted():
+                    break
+                self.cond.wait(timeout=0.2)
         return not self._is_aborted()
 
     def _wait_if_paused_before_retry(self, worker_idx, batch, next_try_i: int) -> bool:
@@ -2144,9 +2166,12 @@ class TranslationScheduler:
                 elapsed=elapsed,
                 wait_left=wait_left,
             )
-            # Sleep the EXACT remainder (capped at 1s for abort/pause responsiveness).
+            # Sleep the EXACT remainder (capped at 0.5s for abort/pause responsiveness).
             # Flat 1.0s would round sub-second stagger up and re-lockstep siblings.
-            time.sleep(min(1.0, remaining))
+            with self.cond:
+                if self._is_aborted():
+                    return
+                self.cond.wait(timeout=min(0.5, remaining))
 
     def _pace_delay(self, worker_idx, t0, stagger_offset=0.0) -> None:
         """Sleep only until last_fire + delay_seconds (wall-clock RPM spacing).
@@ -2190,7 +2215,10 @@ class TranslationScheduler:
                 wait_left=wait_left,
                 batch_num=bnum or None,
             )
-            time.sleep(min(1.0, remaining))
+            with self.cond:
+                if self._is_aborted():
+                    return
+                self.cond.wait(timeout=min(0.5, remaining))
 
     # -- the worker loop --------------------------------------------------------
 
@@ -2214,7 +2242,10 @@ class TranslationScheduler:
             remaining = offset - (time.time() - start)
             if remaining <= 0:
                 return
-            time.sleep(min(1.0, remaining))
+            with self.cond:
+                if self._is_aborted():
+                    return
+                self.cond.wait(timeout=min(0.5, remaining))
 
     def worker_loop(self, worker_idx: int, worker_key: str) -> None:
         # Shared run calibrator — see self.cal. Do NOT construct a per-thread
@@ -2231,7 +2262,8 @@ class TranslationScheduler:
         while not self._is_aborted():
             kind, payload = self.claim_batch(worker_idx, cal, worker_key)
             if kind == _DONE:
-                self._emit(worker_idx, "done", status="Done")
+                if not self._is_aborted():
+                    self._emit(worker_idx, "done", status="Done")
                 return
             if kind == _REST:
                 if not is_resting:
@@ -2240,7 +2272,7 @@ class TranslationScheduler:
                 # Block until state changes (a peer finished or reclaimed), so a
                 # resting worker neither busy-spins nor misses returned work.
                 with self.cond:
-                    if not self._run_done_locked():
+                    if not self._run_done_locked() and not self._is_aborted():
                         self.cond.wait(timeout=0.5)
                 continue
             is_resting = False
@@ -2265,6 +2297,9 @@ class TranslationScheduler:
                 # STALE lower done than a peer already reported → main progress
                 # bar jumped 89→15→40 as NDJSON reordered concurrent emits.
                 self.finish_batch(worker_idx, batch, tr_map, key_died, _safety)
+
+            if self._is_aborted():
+                return
 
             # Emit translations after result is updated so `done` includes this
             # batch. Frontend still monotonic-maxes done as a belt-and-suspenders.
@@ -2323,8 +2358,13 @@ class TranslationScheduler:
             # seeds bars from this event. Omitting tpm_* here left the panel
             # blank until a worker emitted (and never showed if an old sidecar
             # path never paced), which read as "TPM ignored".
+            with self.cond:
+                self._emit_seq += 1
+                init_seq = self._emit_seq
             init_evt: dict = {
                 "type": "progress",
+                "run_id": self.run_id,
+                "seq": init_seq,
                 "done": self._done_count(),
                 "total": self.total,
                 "batches": 0,
@@ -2400,6 +2440,8 @@ class TranslationScheduler:
                     yield from self._spawn_and_drain(sweep_assignment)
 
             with self.cond:
+                self._emit_seq += 1
+                done_seq = self._emit_seq
                 done = len(self.result)
                 errors = list(self.errors)
                 aborted = self.aborted
@@ -2419,6 +2461,8 @@ class TranslationScheduler:
             )
             yield json.dumps({
                 "type": "done",
+                "run_id": self.run_id,
+                "seq": done_seq,
                 "translations": fanned,
                 "size_fixes": size_fixes,
                 "errors": errors,

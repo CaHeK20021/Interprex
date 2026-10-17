@@ -59,6 +59,8 @@ from providers.base import build_prompt  # noqa: F401 — kept for sidecar test 
 
 PORT = 8723  # mirror SIDECAR_PORT in src/lib/ipc.ts
 _should_pause = False
+_sched_lock = threading.Lock()
+_active_scheduler = None
 
 
 def start_watchdog():
@@ -256,6 +258,27 @@ def resume() -> dict:
     except Exception:
         pass
     logger.info("Translation resumed")
+    return {"ok": True}
+
+
+@app.post("/abort")
+def abort_translation() -> dict:
+    global _should_pause, _active_scheduler
+    _should_pause = False
+    with _sched_lock:
+        sched = _active_scheduler
+        _active_scheduler = None
+    if sched is not None:
+        try:
+            sched.set_aborted()
+        except Exception as e:
+            logger.warning("Error aborting scheduler: %s", e)
+    try:
+        import renpy_python_translator
+        renpy_python_translator.set_aborted(True)
+    except Exception:
+        pass
+    logger.info("Translation aborted")
     return {"ok": True}
 
 
@@ -722,12 +745,30 @@ def _translate_stream(req: TranslateReq):
     pause-correctness — lives in scheduler.TranslationScheduler. This wrapper just
     resets the process-wide pause flag and hands the scheduler a callable to read
     it, keeping the existing /pause and /resume endpoints working unchanged."""
-    global _should_pause
+    global _should_pause, _active_scheduler
+    with _sched_lock:
+        old_sched = _active_scheduler
+        _active_scheduler = None
+    if old_sched is not None:
+        logger.info("Aborting previous active TranslationScheduler before starting new run.")
+        try:
+            old_sched.set_aborted()
+        except Exception as e:
+            logger.warning("Error aborting previous scheduler: %s", e)
+
     _should_pause = False
     from scheduler import TranslationScheduler
 
     sched = TranslationScheduler(req, should_pause=lambda: _should_pause)
-    return sched.stream()
+    with _sched_lock:
+        _active_scheduler = sched
+
+    try:
+        yield from sched.stream()
+    finally:
+        with _sched_lock:
+            if _active_scheduler is sched:
+                _active_scheduler = None
 
 
 @app.post("/translate")

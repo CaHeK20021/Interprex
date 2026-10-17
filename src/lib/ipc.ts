@@ -289,6 +289,8 @@ export interface SidecarTranslateReq {
 
 /** Per-batch progress from the streaming /translate endpoint. */
 export interface TranslateProgress {
+  run_id?: string;
+  seq?: number;
   done: number; // strings translated so far
   total: number; // strings in this run
   batches: number; // batches completed so far
@@ -355,6 +357,21 @@ export interface TranslateResult {
   sizeFixes?: Record<string, number>;
 }
 
+/** Abort any in-progress translation on the sidecar. */
+export async function abortTranslation(): Promise<{ ok: boolean }> {
+  try {
+    const res = await fetch(`${BASE}/abort`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) return { ok: false };
+    return (await res.json()) as { ok: boolean };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * Run a translation through the sidecar, reading its NDJSON progress stream.
  * `onProgress` fires after every batch so the UI can drive a progress bar; the
@@ -391,6 +408,8 @@ export async function translateViaSidecar(
     const evt = JSON.parse(trimmed);
     if (evt.type === "progress") {
       onProgress?.({
+        run_id: evt.run_id,
+        seq: evt.seq,
         done: evt.done,
         total: evt.total,
         batches: evt.batches,

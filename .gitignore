@@ -71,3 +71,4 @@ build/
 python-core/_chk/
 python-core/_bp/
 python-core/scratch_temp/
+temp_workers_files/
