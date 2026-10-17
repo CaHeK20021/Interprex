@@ -265,6 +265,27 @@ _KNOWN_UI = frozenset({
     "achievements", "leaderboard", "profile", "skip", "score", "level",
     "fullscreen", "windowed", "easy", "normal", "hard", "extreme",
     "collectibles", "tips", "tutorials",
+    # Game / RPG terms & actions
+    "attack", "defense", "defence", "health", "mana", "stamina", "energy",
+    "strength", "agility", "dexterity", "intelligence", "wisdom", "luck",
+    "charisma", "vitality", "endurance", "perception", "speed", "damage",
+    "critical", "armor", "armour", "weapon", "shield", "potion", "victory",
+    "defeat", "retry", "chapter", "prologue", "epilogue", "locked", "unlocked",
+    "equipped", "completed", "failed", "success", "warning", "resolution",
+    "brightness", "sensitivity", "subtitles", "gamepad", "controller",
+    "keyboard", "mouse", "gallery", "glossary", "codex", "bestiary", "crafting",
+    "skills", "talents", "perks", "stats", "status", "character", "party",
+    "guild", "shop", "store", "merchant", "tavern", "dungeon", "enemy",
+    "target", "range", "heal", "poison", "bleed", "stun", "freeze", "burn",
+    "curse", "rarity", "common", "uncommon", "rare", "epic", "legendary",
+    "consumable", "reward", "rewards", "claim", "collect", "loot", "chest",
+    "backpack", "stash", "sort", "filter", "search", "clear", "select",
+    "inspect", "examine", "read", "talk", "speak", "listen", "look", "open",
+    "unlock", "jump", "crouch", "sprint", "walk", "run", "rest", "sleep",
+    "wait", "camp", "cook", "repair", "combine", "discard", "destroy", "rename",
+    "mute", "unmute", "voice", "music", "sound", "effects", "ambience",
+    "accessibility", "autosave", "quicksave", "quickload", "overwrite", "empty",
+    "paused", "loading", "saving", "offline", "online", "hello", "goodbye", "thanks",
 })
 
 # ── Blacklist: однословные слова которые выглядят как текст, но это код ─────
@@ -553,13 +574,48 @@ def _iter_raw_translatable_slots(raw: bytes) -> list[tuple[int, str]]:
     return out
 
 
-def _is_game_text(text: str) -> bool:
+def _is_debug_or_dev_string(s: str) -> bool:
+    """Filter developer logs, C# exceptions, and default Unity engine objects."""
+    t = s.strip()
+    if not t:
+        return False
+    # Exceptions and assertions
+    if re.search(
+        r'\b(NullReferenceException|ArgumentException|ArgumentNullException|InvalidOperationException|'
+        r'IndexOutOfRangeException|KeyNotFoundException|NotImplementedException|NotSupportedException|'
+        r'FormatException|StackOverflowException|Unhandled exception|Assertion failed)\b',
+        t, re.I
+    ):
+        return True
+    # Technical logs
+    if re.search(
+        r'^(Failed to |Cannot find |Could not find |Unable to |Object reference not set|'
+        r'Coroutine couldn\'t|Missing component|Missing prefab|Shader not found|'
+        r'Texture .* is not readable|Material .* doesn\'t have|Index out of range|'
+        r'Invalid parameter|Error loading |Error parsing |Error initializing )',
+        t, re.I
+    ):
+        return True
+    # Default technical GameObject names
+    if t.lower() in {
+        "main camera", "directional light", "point light", "spot light", "area light",
+        "event system", "canvas scaler", "graphic raycaster", "standalone input module",
+        "new gameobject", "reflection probe", "post process volume", "global volume", "audio mixer"
+    }:
+        return True
+    return False
+
+
+def _is_game_text(text: str, *, allow_title_word: bool = False) -> bool:
     t = text.strip()
 
     # ── Базовые проверки ────────────────────────────────────────────────────
     if len(t) < 2:
         return False
     if not any(c.isalpha() for c in t):
+        return False
+
+    if _is_debug_or_dev_string(t):
         return False
 
     plain = _strip_rich_tags(t).strip()
@@ -600,6 +656,12 @@ def _is_game_text(text: str) -> bool:
     # Все-капсовое короткое слово без подчеркиваний -> кнопка UI (PLAY, EXIT)
     if plain.isupper() and len(plain) <= 20 and "_" not in plain:
         return True
+
+    # Title-case singles: in structured tables (StringTable, I2, DialogueEntry, CSV)
+    # allow words like "Chapter", "Attack", etc. if allow_title_word=True
+    if allow_title_word and re.match(r"^[A-Z][a-z]{2,18}$", plain):
+        if not _is_engine_identifier(plain) and plain.lower() not in _KNOWN_CODE:
+            return True
 
     # Title-case singles: no auto-accept (Goto / Master / actor ids).
     return False
@@ -1021,7 +1083,7 @@ def _walk_typetree_generic(node: Any, path_parts: list[str]) -> list[tuple[list[
             if k in _SKIP_TYPETREE_BRANCHES:
                 continue
             if isinstance(v, str):
-                if _is_typetree_text_field(k) and _is_game_text(v):
+                if _is_typetree_text_field(k) and _is_game_text(v, allow_title_word=True):
                     out.append((path_parts + [k], v))
             elif isinstance(v, (dict, list)):
                 out.extend(_walk_typetree_generic(v, path_parts + [k]))
@@ -1038,7 +1100,7 @@ def _walk_typetree_generic(node: Any, path_parts: list[str]) -> list[tuple[list[
                 isinstance(item, str)
                 and parent_field
                 and _is_typetree_text_field(parent_field)
-                and _is_game_text(item)
+                and _is_game_text(item, allow_title_word=True)
             ):
                 out.append((path_parts + [str(idx)], item))
     return out
@@ -1218,12 +1280,12 @@ def _extract_xml_strings(xml_text: str) -> list[tuple[str, str]]:
     def _walk(elem: ET.Element, path: str) -> None:
         if elem.text:
             t = elem.text.strip()
-            if t and _is_game_text(t):
+            if t and _is_game_text(t, allow_title_word=True):
                 out.append((f"{path}:text", t))
         for attr_name, attr_val in elem.attrib.items():
             if attr_name.lower() in _XML_TRANSLATABLE_ATTRS and isinstance(attr_val, str):
                 v = attr_val.strip()
-                if v and _is_game_text(v):
+                if v and _is_game_text(v, allow_title_word=True):
                     out.append((f"{path}:attr:{attr_name}", v))
         for idx, child in enumerate(elem):
             _walk(child, f"{path}.{idx}")
@@ -1260,6 +1322,58 @@ def _inject_xml_strings(xml_text: str, replacements: dict[str, str]) -> str:
     return res
 
 
+_LANG_TO_ISO_CODES: dict[str, tuple[str, ...]] = {
+    "ru": ("ru", "ru-ru", "russian", "русский"),
+    "russian": ("ru", "ru-ru", "russian", "русский"),
+    "uk": ("uk", "uk-ua", "ukrainian", "українська"),
+    "ukrainian": ("uk", "uk-ua", "ukrainian", "українська"),
+    "es": ("es", "es-es", "es-mx", "es-419", "spanish", "español"),
+    "spanish": ("es", "es-es", "es-mx", "es-419", "spanish", "español"),
+    "de": ("de", "de-de", "german", "deutsch"),
+    "german": ("de", "de-de", "german", "deutsch"),
+    "fr": ("fr", "fr-fr", "fr-ca", "french", "français"),
+    "french": ("fr", "fr-fr", "fr-ca", "french", "français"),
+    "it": ("it", "it-it", "italian", "italiano"),
+    "italian": ("it", "it-it", "italian", "italiano"),
+    "pt": ("pt", "pt-br", "pt-pt", "portuguese", "português"),
+    "portuguese": ("pt", "pt-br", "pt-pt", "portuguese", "português"),
+    "pl": ("pl", "pl-pl", "polish", "polski"),
+    "polish": ("pl", "pl-pl", "polish", "polski"),
+    "tr": ("tr", "tr-tr", "turkish", "türkçe"),
+    "turkish": ("tr", "tr-tr", "turkish", "türkçe"),
+    "ja": ("ja", "ja-jp", "jp", "japanese", "日本語"),
+    "japanese": ("ja", "ja-jp", "jp", "japanese", "日本語"),
+    "zh": ("zh", "zh-cn", "zh-hans", "zh-tw", "zh-hant", "cn", "chinese", "中文", "简体中文", "繁體中文"),
+    "chinese": ("zh", "zh-cn", "zh-hans", "zh-tw", "zh-hant", "cn", "chinese", "中文", "简体中文", "繁體中文"),
+    "ko": ("ko", "ko-kr", "kr", "korean", "한국어"),
+    "korean": ("ko", "ko-kr", "kr", "korean", "한국어"),
+}
+
+
+def _matches_unity_locale(code: str, name: str, target_lang: str | None) -> bool:
+    if not target_lang:
+        return False
+    t_low = target_lang.strip().lower()
+    if not t_low:
+        return False
+    t_code = re.split(r"[-_\s(]", t_low)[0]
+    aliases = _LANG_TO_ISO_CODES.get(t_low) or _LANG_TO_ISO_CODES.get(t_code) or (t_low, t_code)
+    c_low = (code or "").strip().lower()
+    n_low = (name or "").strip().lower()
+    for alias in aliases:
+        if not alias:
+            continue
+        if len(alias) <= 3:
+            # Short ISO code: match exact code or prefix with delimiter (es-es, es_mx, es(la))
+            if c_low == alias or c_low.startswith((alias + "-", alias + "_", alias + " ", alias + "(")):
+                return True
+        else:
+            # Full language word: safe to match in name or code
+            if alias in n_low or alias in c_low:
+                return True
+    return False
+
+
 def _resolve_i2_lang_indices(tree: dict, target_lang: str | None = None) -> tuple[int, list[int]]:
     """Find source (English/primary) language index and target language indices in I2 LanguageSource."""
     m_langs = None
@@ -1285,17 +1399,12 @@ def _resolve_i2_lang_indices(tree: dict, target_lang: str | None = None) -> tupl
 
     target_indices: list[int] = []
     if target_lang:
-        t_low = target_lang.strip().lower()
         for idx, lang_info in enumerate(m_langs):
             if not isinstance(lang_info, dict):
                 continue
-            code = str(lang_info.get("Code", "")).strip().lower()
-            name = str(lang_info.get("Name", "")).strip().lower()
-            if (
-                t_low == code
-                or t_low in name
-                or (t_low in ("ru", "russian") and (code == "ru" or "russian" in name))
-            ):
+            code = str(lang_info.get("Code", ""))
+            name = str(lang_info.get("Name", ""))
+            if _matches_unity_locale(code, name, target_lang):
                 if idx not in target_indices:
                     target_indices.append(idx)
 
@@ -2088,12 +2197,17 @@ class UnityParser(BaseParser):
 
     def engine_prompt_addon(self) -> str:
         return (
-            "TECHNICAL STRINGS (UI / GAME INTERFACE): these strings come from a Unity "
-            "game and are used in menus, HUD, and system messages.\n"
-            "FORMAT SPECIFIERS: preserve {0}, {1}, {UserName}, %s, %d and similar "
-            "patterns EXACTLY — they are filled in at runtime.\n"
-            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings.\n"
-            "TONE: use a neutral, professional register. Avoid overly literary style."
+            "UNITY LOCALIZATION RULES:\n"
+            "CONTEXT-ADAPTIVE TONE:\n"
+            "  • DIALOGUE & STORY (when context mentions 'Kind: content', 'Speaker', 'Actor', 'Conversation', "
+            "'DialogueEntry', 'Ink', 'Yarn', or shows 'Prev'/'Next' lines): translate as natural, expressive spoken "
+            "dialogue or literary narrative matching character voice. Default to informal address ('ты') among peers/friends "
+            "unless hierarchy or strangers dictate formal ('вы').\n"
+            "  • UI & MENUS (when context mentions 'GameObject', 'Type: Text', 'VisualTreeAsset', or short UI keys): "
+            "use a concise, idiomatic game interface style.\n"
+            "FORMAT SPECIFIERS & TAGS: preserve {0}, {1}, {0:0.0}, {UserName}, %s, %d, [var], and rich-text tags "
+            "like <color=#...>, </color>, <size=...>, <b>, <i>, <sprite=...>, <link=...> EXACTLY as they appear.\n"
+            "ESCAPE SEQUENCES: keep literal \\n and \\t as-is inside strings."
         )
 
     def _run_editor(self, args: list[str]) -> str:
@@ -2183,6 +2297,16 @@ class UnityParser(BaseParser):
 
         self._generator_cache[cache_key] = generator
         return generator
+
+    def _attach_generator(self, root: str, env: Any) -> None:
+        unity_version = None
+        for obj in env.objects:
+            unity_version = getattr(obj.assets_file, "unity_version", None)
+            if unity_version:
+                break
+        generator = self._get_generator(root, unity_version)
+        if generator:
+            env.typetree_generator = generator
 
     def _scan_asset_files(self, root: str, sub_paths: list[str] | None = None) -> tuple[list[str], list[str]]:
         compiled_files = []
@@ -2579,7 +2703,7 @@ class UnityParser(BaseParser):
                                         if term_key and isinstance(langs, list) and langs:
                                             idx = src_idx if src_idx < len(langs) else 0
                                             val = langs[idx]
-                                            if isinstance(val, str) and val and not val.isspace() and _is_game_text(val):
+                                            if isinstance(val, str) and val and not val.isspace() and _is_game_text(val, allow_title_word=True):
                                                 path = ["Asset", "I2Term", str(obj.path_id), str(term_key)]
                                                 context = f"I2 Localization: {term_key}, File: {os.path.basename(fpath)}, PathID: {obj.path_id}"
                                                 results.append(self._mk(rel_path, path, val, context))
@@ -2608,7 +2732,7 @@ class UnityParser(BaseParser):
                                                                 title = fld.get("title")
                                                                 if title in ("Dialogue Text", "Menu Text"):
                                                                     val = fld.get("value")
-                                                                    if isinstance(val, str) and val and not val.isspace() and _is_game_text(val):
+                                                                    if isinstance(val, str) and val and not val.isspace() and _is_game_text(val, allow_title_word=True):
                                                                         path = ["Asset", "DialogueEntry", str(obj.path_id), str(entry_id), str(title)]
                                                                         ctx_parts = []
                                                                         if conv_title:
@@ -2762,7 +2886,7 @@ class UnityParser(BaseParser):
                                                     for ci in text_col_indices:
                                                         if ci < len(row):
                                                             val = row[ci]
-                                                            if val and _is_game_text(val):
+                                                            if val and _is_game_text(val, allow_title_word=True):
                                                                 col_name = header[ci] if ci < len(header) else str(ci)
                                                                 path = ["TextAsset", str(obj.path_id), "csv", str(r_idx), str(ci)]
                                                                 context = f"TextAsset (CSV): {asset_name}, Row: {r_idx} (key={key_prefix}), Col: {col_name}, File: {os.path.basename(fpath)}"
@@ -2983,7 +3107,7 @@ class UnityParser(BaseParser):
                     ):
                         possible_names.append(s)
 
-                for offset, s in candidates:
+                for idx_c, (offset, s) in enumerate(candidates):
                     t = s.strip()
                     path = ["AssetRaw", obj.type.name, str(obj.path_id), str(offset)]
                     key = (rel_path, tuple(path), t)
@@ -2994,22 +3118,41 @@ class UnityParser(BaseParser):
                     ctx_parts = [f"File: {base}", f"PathID: {obj.path_id}"]
                     if is_content:
                         ctx_parts.append("Kind: content")
-                    if possible_names and len(possible_names) <= 3 and " " in t and len(t) > 10:
+                    if possible_names and len(possible_names) <= 3 and (is_content or (" " in t and len(t) > 6)):
                         ctx_parts.append(f"Speakers in this block: {', '.join(possible_names)}")
-                    siblings = [x for x in texts if x != t]
-                    if siblings and " " in t and len(t) > 10:
-                        capped: list[str] = []
-                        total = 0
-                        for sib in siblings:
-                            if len(capped) >= 2:
-                                break
-                            addition = len(sib) + 2
-                            if total + addition > 120:
-                                break
-                            capped.append(sib)
-                            total += addition
-                        if capped:
-                            ctx_parts.append(f"Other strings in this block: {'; '.join(capped)}")
+
+                    if is_content or (" " in t and len(t) > 6):
+                        prev_lines = [texts[j] for j in range(max(0, idx_c - 2), idx_c) if texts[j] and texts[j] != t]
+                        next_line = texts[idx_c + 1] if (idx_c + 1 < len(texts) and texts[idx_c + 1] != t) else ""
+                        neighbor_parts = []
+                        if prev_lines:
+                            prev_str = " -> ".join(prev_lines)
+                            if len(prev_str) > 160:
+                                prev_str = prev_str[:157] + "..."
+                            neighbor_parts.append(f"Prev: {prev_str}")
+                        if next_line:
+                            next_str = next_line
+                            if len(next_str) > 160:
+                                next_str = next_str[:157] + "..."
+                            neighbor_parts.append(f"Next: {next_str}")
+
+                        if neighbor_parts:
+                            ctx_parts.append(" | ".join(neighbor_parts))
+                        else:
+                            siblings = [x for x in texts if x != t]
+                            if siblings:
+                                capped: list[str] = []
+                                total = 0
+                                for sib in siblings:
+                                    if len(capped) >= 2:
+                                        break
+                                    addition = len(sib) + 2
+                                    if total + addition > 120:
+                                        break
+                                    capped.append(sib)
+                                    total += addition
+                                if capped:
+                                    ctx_parts.append(f"Other strings in this block: {'; '.join(capped)}")
 
                     results.append(self._mk(rel_path, path, t, ", ".join(ctx_parts)))
                     added += 1
@@ -3231,6 +3374,7 @@ class UnityParser(BaseParser):
                         env = UnityPy.load(bundle_path)
                 else:
                     env = UnityPy.load(bundle_path)
+                self._attach_generator(root, env)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -3272,6 +3416,7 @@ class UnityParser(BaseParser):
                         env = UnityPy.load(bundle_path)
                 else:
                     env = UnityPy.load(bundle_path)
+                self._attach_generator(root, env)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -3295,6 +3440,8 @@ class UnityParser(BaseParser):
                         for entry in tree["m_TableData"]:
                             value = entry.get("m_Localized", "")
                             if not value or value.isspace():
+                                continue
+                            if not _is_game_text(value, allow_title_word=True):
                                 continue
                             entry_id = entry["m_Id"]
                             key_name = id_to_key.get(entry_id, str(entry_id))
@@ -4558,6 +4705,7 @@ class UnityParser(BaseParser):
                             env = UnityPy.load(bundle_path)
                     else:
                         env = UnityPy.load(bundle_path)
+                self._attach_generator(root, env)
                 for obj in env.objects:
                     if obj.type.name != "MonoBehaviour":
                         continue
@@ -4580,8 +4728,6 @@ class UnityParser(BaseParser):
 
         # Phase 2: Inject into StringTables
         written = 0
-        tl = (target_lang or "").lower()
-        tl_code = tl.split("-")[0].split("_")[0] if tl else ""
 
         for bundle_path in loc_files:
             rel_path = os.path.relpath(bundle_path, root).replace("\\", "/")
@@ -4599,6 +4745,7 @@ class UnityParser(BaseParser):
                             env = UnityPy.load(bundle_path)
                     else:
                         env = UnityPy.load(bundle_path)
+                self._attach_generator(root, env)
                 changed = False
 
                 col_entry_translations: dict[tuple[str, int], str] = {}
@@ -4618,13 +4765,7 @@ class UnityParser(BaseParser):
                         id_to_key = shared.get("id_to_key", {})
                         collection_name = shared.get("name") or getattr(obj, "name", None) or getattr(data, "name", None) or "Unknown"
 
-                        is_target_locale = bool(
-                            tl_code and (
-                                raw_locale.lower() == tl
-                                or raw_locale.lower().startswith(tl_code)
-                                or (tl_code in ("ru", "russian") and raw_locale.lower() in ("ru", "ru-ru", "russian"))
-                            )
-                        )
+                        is_target_locale = _matches_unity_locale(raw_locale, "", target_lang)
                         if is_target_locale:
                             target_locale_tables.append((obj, data, tree, collection_name, raw_locale))
 
@@ -5146,7 +5287,7 @@ class UnityParser(BaseParser):
                                 for ci in text_col_indices:
                                     if ci < len(row):
                                         val = row[ci]
-                                        if val and _is_game_text(val):
+                                        if val and _is_game_text(val, allow_title_word=True):
                                             col_name = header[ci] if ci < len(header) else str(ci)
                                             path = ["StreamingFile", "csv", str(r_idx), str(ci)]
                                             ctx = f"StreamingAsset (CSV): {base}, Row: {r_idx} (key={key_prefix}), Col: {col_name}"

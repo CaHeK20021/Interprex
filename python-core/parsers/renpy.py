@@ -566,7 +566,20 @@ def is_technical_string(s: str) -> bool:
     # `{/i}` contains a `/`, so `{i}Exhausting.{/i}` (one word, no space, has a
     # `.`) would otherwise be misread as a file path and the line silently
     # dropped — real bug on Beyond the Turquoise Stars ("{i}Exhausting.{/i}").
-    content = _RENPY_SUB_RE.sub("", _RENPY_TAG_RE.sub("", cleaned))
+    content = _RENPY_SUB_RE.sub("", _RENPY_TAG_RE.sub("", cleaned)).strip()
+
+    # Code identifiers, booleans, and layout constants without spaces
+    if " " not in content:
+        if "_" in content:
+            return True
+        if re.match(r'^[a-z]+[A-Z][a-zA-Z0-9]*$', content):
+            return True
+        low = content.lower()
+        if low in {"true", "false", "none", "null", "default", "auto"}:
+            return True
+        if content.islower() and low in {"left", "right", "center", "top", "bottom"}:
+            return True
+
     # A spaceless slug containing a path separator and a dot is a path even with
     # an unknown extension (audio/se/click.foo). Prose has spaces; paths don't.
     if " " not in content and ("/" in content or "\\" in content) and "." in content:
@@ -1267,46 +1280,29 @@ class RenPyParser(BaseParser):
 
     def engine_prompt_addon(self) -> str:
         return (
-            "REN'PY SYNTAX RULES:\n"
-            "VARIABLES & INTERPOLATION: text may contain [variable_name] or [expr] "
-            "sequences \u2014 these are runtime interpolations. Copy them VERBATIM into the "
-            "translation; never translate the name inside the brackets.\n"
-            "STYLE TAGS: sequences like {b}, {i}, {u}, {s}, {color=#fff}, {size=*0.8}, "
-            "{alpha=*0.5}, {p}, {w}, {nw}, {fast}, {cps=N} are Ren'Py display tags. "
-            "Preserve all opening and closing tags exactly as they appear.\n"
-            "SCENE / TONE: the 'context' field often contains the label name (e.g. "
-            "'label: romance', 'label: dm', 'label: office') and may include the "
-            "immediately preceding dialogue line: Prev line: '...' (speaker). Use it "
-            "to match tone and register, maintain consistent T-V distinction (\u0442\u044b/\u0432\u044b), "
-            "and resolve gender or pronoun ambiguities. Visual novels are highly personal; "
-            "when translating 'you' into languages with T-V distinction (like Russian, "
-            "Spanish, French, German), default to the informal address (e.g., '\u0442\u044b', "
-            "'t\u00fa', 'tu', 'du') unless the context clearly dictates a formal address (e.g., "
-            "a teacher, boss, or stranger).\n"
-            "DIALOGUE NATURALNESS: these are spoken lines of a visual novel. The "
-            "translation should sound like a real person talking, not a subtitle or a "
-            "technical manual.\n"
-            "FIXED-WIDTH CAPTIONS: some items carry a fixed_width flag and constraints "
-            "like max_chars and/or max_pixels. These render inside a fixed-size UI box "
-            "(a Ren'Py menu choice or screen button). Prefer a translation that fits the "
-            "limits. If max_pixels is specified, estimate the visual width (Cyrillic "
-            "glyphs are ~10-20% wider than Latin) and try to stay within it.\n"
-            "CRITICAL \u2014 NEVER ABBREVIATE OR TRUNCATE A WORD: do NOT write "
-            "'\u0421\u043e\u0445' for '\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435', "
-            "'\u041d\u0430\u0441\u0442\u0440.' for '\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438', "
-            "'\u041f\u0440\u043e\u0434.' for '\u041f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c'. "
-            "A single word MUST always be spelled out in full, even if it would exceed "
-            "the limit \u2014 the app shrinks the font to make a whole word fit, so a full "
-            "word that is slightly too long is CORRECT and a clipped/abbreviated word is "
-            "WRONG. Only when the caption is THREE OR MORE words may you shorten it, and "
-            "only by rephrasing with a shorter synonym or dropping filler \u2014 never by "
-            "abbreviating. Example: 'Start a New Game' (3+ words) -> "
-            "'\u041d\u043e\u0432\u0430\u044f \u0438\u0433\u0440\u0430' (rephrased, fine). "
-            "Example: 'Save' (1 word) -> '\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435' in full "
-            "(NOT '\u0421\u043e\u0445\u0440.' or '\u0421\u043e\u0445'), even if longer than the box. "
-            "These limits are constraints to RESPECT, never text to translate."
+            "REN'PY LOCALIZATION RULES:\n"
+            "VARIABLES & INTERPOLATION: Text may contain [variable_name] or [expr!t] sequences — these are "
+            "runtime Python interpolations. Copy them VERBATIM (same spelling, case, and brackets); never translate "
+            "identifiers inside square brackets.\n"
+            "STYLE TAGS: Preserve all Ren'Py text tags verbatim: {b}, {/b}, {i}, {/i}, {u}, {s}, {color=#...}, "
+            "{/color}, {size=...}, {/size}, {alpha=...}, {font=...}, {a=...}, {/a}, {p}, {w}, {w=0.5}, {nw}, "
+            "{fast}, {cps=N}, {done}. Never translate tag names or drop closing tags.\n"
+            "DIALOGUE & CHOICE CONTEXT:\n"
+            "  • 'Speaker: Name' indicates who is speaking the line — use the character's name and context to "
+            "inflect first-person past-tense verbs and adjectives for the speaker's gender.\n"
+            "  • 'Prev: [A]: ... | Last: [B]: ...' or 'Prev line: ...' shows the preceding lines in the conversation "
+            "— use them to keep the reply natural and infer the addressee's gender and relationship.\n"
+            "  • 'Prompt: ... (speaker)' on a menu choice shows the question/situation the player is responding to "
+            "— translate the choice as a natural spoken or action response to that prompt.\n"
+            "  • Default to informal address ('ты') in visual novels unless the relationship clearly requires formal ('вы').\n"
+            "FIXED-WIDTH CAPTIONS: Some items carry fixed_width=true with max_chars, max_pixels, or max_lines. "
+            "These render inside fixed-size UI buttons. Prefer a concise translation that fits the budget.\n"
+            "CRITICAL — NEVER ABBREVIATE OR TRUNCATE WORDS: Do NOT write 'Сох' or 'Сохр.' for 'Сохранение', "
+            "'Настр.' for 'Настройки', or 'Прод.' for 'Продолжить'. A 1–2 word caption MUST always be written as "
+            "complete, unabbreviated words even if it exceeds max_chars (the engine automatically shrinks the font "
+            "to fit). Only when a caption has THREE OR MORE words may you shorten it by choosing a more concise "
+            "synonym or dropping filler words — never by clipping words with periods."
         )
-
 
     # --- detection --------------------------------------------------------
     @staticmethod
@@ -1445,7 +1441,7 @@ class RenPyParser(BaseParser):
 
     # --- shared traversal -------------------------------------------------
     @staticmethod
-    def _scan(text: str):
+    def _scan(text: str, initial_char_names: dict[str, str] | None = None):
         """Yield one record per translatable string, in file order. Each record:
 
             {
@@ -1471,10 +1467,10 @@ class RenPyParser(BaseParser):
         global_label = ""
         # (label, kind) -> running count for narrative strings.
         counts: dict[tuple[str, str], int] = {}
-        last_dialogue: dict[str, str] | None = None
+        recent_dialogues: list[dict[str, str]] = []
         # variable name -> display name, built from `define` lines so that
         # `e "Hello."` can be annotated with "Eileen" instead of just "e".
-        char_names: dict[str, str] = {}
+        char_names: dict[str, str] = dict(initial_char_names) if initial_char_names else {}
 
         # Screen state.
         # screen_indent: indent column of the 'screen' keyword line; -1 = not
@@ -1576,7 +1572,7 @@ class RenPyParser(BaseParser):
                 continue
 
             if _RESET_FLOW_RE.match(line):
-                last_dialogue = None
+                recent_dialogues = []
                 continue
 
             # Inside an inline `translate <lang> …:` block? Its body is already
@@ -1593,7 +1589,7 @@ class RenPyParser(BaseParser):
             if to:
                 translate_indent = len(to.group("indent"))
                 pending_prefix = []  # don't let a stale prefix bind across it
-                last_dialogue = None
+                recent_dialogues = []
                 continue
 
             # Translatable PREFIX nodes accumulate, waiting for the next say to
@@ -1622,7 +1618,7 @@ class RenPyParser(BaseParser):
                 screen_for_indent = -1
                 pending_caption = False
                 menu_indent = -1
-                last_dialogue = None
+                recent_dialogues = []
                 continue
  
             # -- Screen interior ------------------------------------------
@@ -1636,7 +1632,7 @@ class RenPyParser(BaseParser):
                     screen_counts = {}
                     screen_for_vars = {}
                     screen_for_indent = -1
-                    last_dialogue = None
+                    recent_dialogues = []
                     # fall through to narrative processing below
                 else:
                     # Track for-loop variable bindings: `for x, w in [("STR", 137), ...]:`
@@ -1709,7 +1705,7 @@ class RenPyParser(BaseParser):
                 set_label(m.group("name"))
                 pending_caption = False
                 menu_indent = -1
-                last_dialogue = None
+                recent_dialogues = []
                 continue
 
             # menu: opener — arm the caption flag for the first say inside.
@@ -1723,14 +1719,13 @@ class RenPyParser(BaseParser):
                     set_label(nm.group("name"))
                 pending_caption = True
                 menu_indent = cur_indent
-                last_dialogue = None
+                # Do NOT clear recent_dialogues here, so choices inside can see Prompt line!
                 continue
 
             # Leaving the menu block (dedent to/past the menu keyword) disarms.
             if menu_indent >= 0 and cur_indent <= menu_indent:
                 pending_caption = False
                 menu_indent = -1
-                last_dialogue = None
 
             # Character display names: define e = Character("Eileen", ...)
             # _LINE_RE never matches these (= breaks the prefix pattern), so
@@ -1907,19 +1902,36 @@ class RenPyParser(BaseParser):
             # Finalize context and track dialogue history
             if native_kind == "say":
                 ctx = f"Label: {label} | Speaker: {speaker}" if not is_generic else f"Speaker: {speaker}"
-                if last_dialogue is not None:
-                    prev_text = last_dialogue["text"]
-                    if len(prev_text) > 250:
-                        prev_text = prev_text[:150] + "..."
-                    ctx += f" | Prev line: '{prev_text}' ({last_dialogue['speaker']})"
+                if recent_dialogues:
+                    if len(recent_dialogues) == 1:
+                        prev_text = recent_dialogues[0]["text"]
+                        if len(prev_text) > 250:
+                            prev_text = prev_text[:150] + "..."
+                        ctx += f" | Prev line: '{prev_text}' ({recent_dialogues[0]['speaker']})"
+                    else:
+                        d1, d2 = recent_dialogues[-2], recent_dialogues[-1]
+                        t1 = d1["text"][:120] + "..." if len(d1["text"]) > 150 else d1["text"]
+                        t2 = d2["text"][:120] + "..." if len(d2["text"]) > 150 else d2["text"]
+                        ctx += f" | Prev: [{d1['speaker']}]: '{t1}' | Last: [{d2['speaker']}]: '{t2}'"
                 
                 # Update dialogue state
                 if speaker == "extend":
-                    if last_dialogue is not None and m.group("text").strip():
-                        sep = " " if not (last_dialogue["text"].endswith(" ") or m.group("text").startswith(" ")) else ""
-                        last_dialogue["text"] += sep + m.group("text")
+                    if recent_dialogues and m.group("text").strip():
+                        sep = " " if not (recent_dialogues[-1]["text"].endswith(" ") or m.group("text").startswith(" ")) else ""
+                        recent_dialogues[-1]["text"] += sep + m.group("text")
                 elif m.group("text").strip():
-                    last_dialogue = {"text": m.group("text"), "speaker": speaker}
+                    recent_dialogues.append({"text": m.group("text"), "speaker": speaker})
+                    if len(recent_dialogues) > 2:
+                        recent_dialogues.pop(0)
+            elif native_kind == "menu_choice":
+                ctx = f"Label: {label}" if not is_generic else ""
+                if recent_dialogues:
+                    prompt_d = recent_dialogues[-1]
+                    p_text = prompt_d["text"]
+                    if len(p_text) > 250:
+                        p_text = p_text[:150] + "..."
+                    ctx_prompt = f"Prompt: '{p_text}' ({prompt_d['speaker']})"
+                    ctx = f"{ctx} | {ctx_prompt}" if ctx else ctx_prompt
             else:
                 if kind == "say":
                     ctx = f"Label: {label} | Speaker: {speaker}" if not is_generic else f"Speaker: {speaker}"
@@ -2090,13 +2102,34 @@ class RenPyParser(BaseParser):
         if temp_dir:
             self._decompile_temp_dirs.append(temp_dir)
 
+    def _collect_all_char_names(self, sources: list[tuple[str, str]]) -> dict[str, str]:
+        """Pre-scan all sources to collect character variable -> name mappings across files."""
+        char_names: dict[str, str] = {}
+        for _, text in sources:
+            for _, line in iter_logical_lines(text):
+                cm = _CHAR_DEF_RE.match(line)
+                if cm:
+                    var = cm.group("var")
+                    name_m = re.search(
+                        r'\(\s*["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']'
+                        r'|\bname\s*=\s*["\']([^"\'\\]*(?:\\.[^"\'\\]*)*)["\']',
+                        line,
+                    )
+                    if name_m:
+                        name = name_m.group(1) or name_m.group(2)
+                        if name:
+                            char_names[var] = name
+        return char_names
+
     # --- extract ----------------------------------------------------------
     def extract(self, root: str, sub_paths: list[str] | None = None) -> list[TranslationString]:
         self._decompile_rpyc_files(root)
         try:
             results: list[TranslationString] = []
-            for file_rel, text in self._iter_sources(root, sub_paths):
-                for rec in self._scan(text):
+            sources = list(self._iter_sources(root, sub_paths))
+            global_char_names = self._collect_all_char_names(sources)
+            for file_rel, text in sources:
+                for rec in self._scan(text, initial_char_names=global_char_names):
                     if rec["original"].strip():
                         results.append(self._mk(file_rel, rec["path"], rec["original"],
                                                 rec.get("context", "")))
@@ -2267,13 +2300,15 @@ class RenPyParser(BaseParser):
                         string_entries.setdefault(common_tl_rel, []).append(
                             ("RenPy Common", old_s, new_s))
 
-            for file_rel, text in self._iter_sources(root, sub_paths):
+            sources = list(self._iter_sources(root, sub_paths))
+            global_char_names = self._collect_all_char_names(sources)
+            for file_rel, text in sources:
                 tl_rel = self._tl_rel(file_rel, lang)
                 for m in _FONT_REF_RE.finditer(text):
                     game_font_files.add(m.group(0).strip('"'))
                 seen_ids: dict[str, int] = {}
 
-                for rec in self._scan(text):
+                for rec in self._scan(text, initial_char_names=global_char_names):
                     sid = self._id(file_rel, rec["path"], rec["original"])
                     kind = rec["native_kind"]
 

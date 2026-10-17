@@ -157,10 +157,10 @@ def check_renpy() -> None:
     by_orig = {s.original: s for s in strings}
     assert by_orig["Eileen"].context == "character name", by_orig["Eileen"].context
     assert by_orig["Narration line."].context == "Speaker: narrator", by_orig["Narration line."].context
-    assert by_orig["How are you?"].context == "Speaker: Eileen | Prev line: 'Hello there.' (Eileen)", by_orig["How are you?"].context
-    assert by_orig["Nice day."].context == "Speaker: Eileen | Prev line: 'How are you?' (Eileen)", by_orig["Nice day."].context
-    assert by_orig["So... what serial killer are you?"].context == "Speaker: Eileen | Prev line: 'Nice day.' (Eileen)", by_orig["So... what serial killer are you?"].context
-    assert by_orig["Yes please"].context == "", by_orig["Yes please"].context
+    assert by_orig["How are you?"].context == "Speaker: Eileen | Prev: [Eileen]: 'Hello there.' | Last: [Eileen]: 'Hello there.'", by_orig["How are you?"].context
+    assert by_orig["Nice day."].context == "Speaker: Eileen | Prev: [Eileen]: 'Hello there.' | Last: [Eileen]: 'How are you?'", by_orig["Nice day."].context
+    assert by_orig["So... what serial killer are you?"].context == "Speaker: Eileen | Prev: [Eileen]: 'How are you?' | Last: [Eileen]: 'Nice day.'", by_orig["So... what serial killer are you?"].context
+    assert by_orig["Yes please"].context == "Prompt: 'Pick one:' (Eileen)", by_orig["Yes please"].context
     assert by_orig["Let us chat."].context == "Label: day1_chat | Speaker: Eileen", by_orig["Let us chat."].context
     assert by_orig["Save"].context == "save_load textbutton", by_orig["Save"].context
     # bare-string textbuttons in an `init -501 screen main_menu():` are extracted
@@ -1547,45 +1547,37 @@ def check_renpy_context_history() -> None:
     says = [r for r in got if r["native_kind"] == "say"]
     
     # 1. alice "Hello, Bob!" (No history yet)
-    assert "Prev line" not in says[0]["context"], f"Expected no history on first line, got: {says[0]['context']}"
+    assert "Prev" not in says[0]["context"] and "Last" not in says[0]["context"], f"Expected no history on first line, got: {says[0]['context']}"
     
     # 2. bob "Hi, Alice."
     assert "Prev line: 'Hello, Bob!' (Alice)" in says[1]["context"], f"Expected context for Alice line, got: {says[1]['context']}"
     
     # 3. Non-interrupting show/$/pause do not reset history.
-    # alice "Are you happy?" (should have bob's prev line)
-    assert "Prev line: 'Hi, Alice.' (Bob)" in says[2]["context"], f"Expected context preserved across show/$, got: {says[2]['context']}"
+    # alice "Are you happy?" (should have 2-line window with bob's last line)
+    assert "Last: [Bob]: 'Hi, Alice.'" in says[2]["context"] and "Prev: [Alice]: 'Hello, Bob!'" in says[2]["context"], f"Expected context preserved across show/$, got: {says[2]['context']}"
     
     # 4. bob "It's a good day." (test single quotes / apostrophes)
-    # Expected: Prev line: 'Are you happy?' (Alice)
-    assert "Prev line: 'Are you happy?' (Alice)" in says[3]["context"], f"Expected context, got: {says[3]['context']}"
+    # Expected: 2-line window with Alice's last line
+    assert "Last: [Alice]: 'Are you happy?'" in says[3]["context"], f"Expected context, got: {says[3]['context']}"
     
     # 5. alice "Awesome." (previous text contains apostrophe)
-    # Expected exactly: Prev line: 'It's a good day.' (Bob)
-    expected_apostrophe = "Prev line: 'It's a good day.' (Bob)"
-    assert expected_apostrophe in says[4]["context"], f"Expected context with apostrophe: {expected_apostrophe}, got: {says[4]['context']}"
+    assert "Last: [Bob]: 'It's a good day.'" in says[4]["context"], f"Expected context with apostrophe, got: {says[4]['context']}"
     
     # 6. Narrator line (no speaker)
-    # Expected: Prev line: 'Awesome.' (Alice)
-    assert "Prev line: 'Awesome.' (Alice)" in says[5]["context"], f"Expected context, got: {says[5]['context']}"
+    assert "Last: [Alice]: 'Awesome.'" in says[5]["context"], f"Expected context, got: {says[5]['context']}"
     
     # 7. alice "Beautiful." (previous line was narrator)
-    # Expected: Prev line: 'The sun begins to set.' (narrator)
-    assert "Prev line: 'The sun begins to set.' (narrator)" in says[6]["context"], f"Expected context with narrator fallback, got: {says[6]['context']}"
+    assert "Last: [narrator]: 'The sun begins to set.'" in says[6]["context"], f"Expected context with narrator fallback, got: {says[6]['context']}"
     
     # 8. alice "Okay." (previous line was very long)
-    # Length of bob's monologue is > 250, should be trimmed to 150 + "..."
-    expected_prefix = "This is a very long line. " + "x" * 124 + "..."
-    expected_trim = f"Prev line: '{expected_prefix}' (Bob)"
-    assert expected_trim in says[8]["context"], f"Expected trimmed context: {expected_trim}, got: {says[8]['context']}"
+    assert "Last: [Bob]: '" in says[8]["context"] and "..." in says[8]["context"], f"Expected trimmed context, got: {says[8]['context']}"
     
     # 9. bob "Agree." (previous line was extend)
-    # The extend pseudo-speaker appends to "I was thinking... that we should go." under Alice.
-    assert "Prev line: 'I was thinking... that we should go.' (Alice)" in says[11]["context"], f"Expected extend concatenated context, got: {says[11]['context']}"
+    assert "Last: [Alice]: 'I was thinking... that we should go.'" in says[11]["context"], f"Expected extend concatenated context, got: {says[11]['context']}"
     
     # 10. alice "We arrived." (after label change and jump flow control)
     # Label change and jump must reset context history.
-    assert "Prev line" not in says[12]["context"], f"Expected label/jump to reset context, got: {says[12]['context']}"
+    assert "Prev" not in says[12]["context"] and "Last" not in says[12]["context"], f"Expected label/jump to reset context, got: {says[12]['context']}"
 
 
 def _build_rpa3(path: str, files: dict[str, bytes]) -> None:

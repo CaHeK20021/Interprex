@@ -328,6 +328,18 @@ SYSTEM_INSTRUCTION = (
     "Changing any of these WILL crash the game.\n"
     "Do not resolve escape characters; if the source contains a literal '\\n', keep exactly '\\n' in the translation "
     "instead of inserting a real newline.\n"
+    "SCENE CONTINUITY: Strings in a batch are ordered sequentially from the same file. Read adjacent "
+    "items together to maintain consistent character voice, terminology, gender agreement, and T-V distinction "
+    "(informal 'ты' vs formal 'вы').\n"
+    "UNKNOWN GENDER: When the target language marks gender on verbs or adjectives (Russian, Spanish, French, "
+    "German, Polish, etc.) and neither the text nor the context reveals the subject's gender (e.g. a system "
+    "banner like 'HAS BEEN EXECUTED' or a player-agnostic line), use a natural GENDER-NEUTRAL phrasing "
+    "(impersonal construction, noun phrase, or present/future tense) — NEVER write awkward slash/bracket forms "
+    "like 'казнён(а)', 'готов/а', or 'executed(a)'. Example: 'HAS BEEN EXECUTED' -> 'КАЗНЬ СВЕРШЕНА'. "
+    "When the speaker or listener gender IS clear from the speaker name or adjacent lines, use the proper gendered form.\n"
+    "TECHNICAL PASSTHROUGH GUARDRAIL: If a source string is clearly an untranslatable code identifier, "
+    "internal variable/animation/method name, file path, debug/exception log, or consists solely of tags/placeholders "
+    "that slipped through filtering, return the original string UNCHANGED in 'translated'.\n"
     "Return ONLY a JSON object containing an 'items' array, where each item has 'id' (from the input) "
     "and 'translated' (the translated string). Example:\n"
     "{\n"
@@ -473,25 +485,33 @@ SKIP_CONTEXTS = {
 
 def hard_skip(entry: dict) -> bool:
     v = entry["value"]
-    
     v_stripped = v.strip()
-    
     if not v_stripped:
         return True
-    
-    if "/" in v or "\\" in v:
-        return True
-    
+
     if re.match(r'^#[0-9a-fA-F]{3,8}$', v_stripped):
         return True
 
-    if v_stripped.startswith((',', ']', '[', ')', '(', '=', '+', '-', '*', '%', '/', ';', '{', '}')) or \
-       v_stripped.endswith((',', ']', '[', ')', '(', '=', '+', '-', '*', '%', '/', ';', '{', '}')):
-        return True
-    
     if any(f in entry["raw_line"] for f in SKIP_CONTEXTS):
         return True
-    
+
+    # Strip Ren'Py tags {b}, {/b}, {color=...} and interpolations [var] before structural checks
+    plain = re.sub(r'\[[^\]]+\]', '', re.sub(r'\{/?[a-zA-Z][^}]*\}', '', v_stripped)).strip()
+    if not plain or not any(c.isalpha() for c in plain):
+        return True
+
+    # File paths or single-word snake_case / code identifiers
+    if "/" in plain or "\\" in plain:
+        if " " not in plain or re.search(r'\.[a-zA-Z0-9]{2,5}$', plain):
+            return True
+    if " " not in plain and "\n" not in plain:
+        if "_" in plain or re.match(r'^[a-z]+[A-Z][a-zA-Z0-9]*$', plain):
+            return True
+
+    if plain.startswith((',', ']', '[', ')', '(', '=', '+', '*', '%', '/', ';', '{', '}')) or \
+       plain.endswith((',', ']', '[', ')', '(', '=', '+', '-', '*', '%', '/', ';', '{', '}')):
+        return True
+
     return False
 
 
@@ -1995,7 +2015,7 @@ def run_self_tests():
 
 def main(args_list=None):
     parser = argparse.ArgumentParser(description="Ren'Py Inline Python String Translator")
-    parser.add_argument("--root", type=str, required=True, help="Path to the game directory")
+    parser.add_argument("--root", type=str, default="", help="Path to the game directory")
     parser.add_argument("--api-key", type=str, default="", help="Single Gemini API Key (legacy; superseded by --api-keys)")
     parser.add_argument("--api-keys", type=str, default="", help="All API keys: JSON array, or comma-separated. Spreads work across keys with failover.")
     parser.add_argument("--target-lang", type=str, default="russian", help="Target language name")
@@ -2036,6 +2056,10 @@ def main(args_list=None):
         run_self_tests()
         sys.exit(0)
         
+    if not args.root:
+        logger.error("--root is required when not running tests")
+        sys.exit(1)
+
     game_path = Path(args.root)
     if not game_path.is_dir():
         logger.error("Game path does not exist: %s", args.root)
