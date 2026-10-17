@@ -239,6 +239,14 @@ def ping() -> dict:
 def pause() -> dict:
     global _should_pause
     _should_pause = True
+    with _sched_lock:
+        sched = _active_scheduler
+    if sched is not None:
+        try:
+            with sched.cond:
+                sched.cond.notify_all()
+        except Exception:
+            pass
     try:
         import renpy_python_translator
         renpy_python_translator.set_paused(True)
@@ -252,6 +260,14 @@ def pause() -> dict:
 def resume() -> dict:
     global _should_pause
     _should_pause = False
+    with _sched_lock:
+        sched = _active_scheduler
+    if sched is not None:
+        try:
+            with sched.cond:
+                sched.cond.notify_all()
+        except Exception:
+            pass
     try:
         import renpy_python_translator
         renpy_python_translator.set_paused(False)

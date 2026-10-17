@@ -840,6 +840,9 @@ export default function App() {
     maxBatchSize: number;
   } | null>(null);
   const shouldRestartRef = useRef(false);
+  const latestTranslateAllRef = useRef<
+    (targetIds?: string[], extraInstruction?: string, overrideProject?: ProjectFile) => Promise<{ ok: boolean; project?: ProjectFile }>
+  >(null as any);
   const [error, setError] = useState<string | null>(null);
   // Search box: `searchQuery` is the DEBOUNCED value that the heavy filter
   // (filteredStrings, a pass over all 7000+ rows) actually reads.
@@ -1851,11 +1854,11 @@ export default function App() {
         );
         if (settingsChanged) {
           shouldRestartRef.current = true;
-          await abortTranslation();
           if (abortController) {
             abortController.abort();
             setAbortController(null);
           }
+          await abortTranslation();
           setIsPaused(false);
         } else {
           // Fresh pin session after resume: only landings from here on bubble.
@@ -1874,8 +1877,14 @@ export default function App() {
   }
 
 
-  async function translateAll(targetIds?: string[], extraInstruction?: string): Promise<{ ok: boolean; project?: ProjectFile }> {
-    if (!project || !engine) return { ok: false };
+  async function translateAll(
+    targetIds?: string[],
+    extraInstruction?: string,
+    overrideProject?: ProjectFile,
+  ): Promise<{ ok: boolean; project?: ProjectFile }> {
+    latestTranslateAllRef.current = translateAll;
+    const baseProject = overrideProject ?? project;
+    if (!baseProject || !engine) return { ok: false };
     runSettingsRef.current = {
       provider,
       model,
@@ -1889,7 +1898,7 @@ export default function App() {
     };
     shouldRestartRef.current = false;
     let ok = true;
-    let currentProject = project;
+    let currentProject = baseProject;
     try {
       setPhase("translating");
       setIsPaused(false);
@@ -1912,7 +1921,7 @@ export default function App() {
       const scopedStrings = strings.filter(inScope);
 
       const todo = scopedStrings.filter((s) => {
-        const entry = project.strings[s.id];
+        const entry = baseProject.strings[s.id];
         if (targetIds) {
           return targetIds.includes(s.id);
         }
@@ -2011,7 +2020,7 @@ export default function App() {
           {
             provider,
             targetLang: target,
-            glossary: project?.glossary ?? {},
+            glossary: baseProject?.glossary ?? {},
             // Read base_url fresh: a just-run autocheck may have updated it this
             // same tick, after the `baseUrl` state closure was captured.
             config: { baseUrl: loadProviderSetting("providerBaseUrl", provider, ""), apiKeys: nonEmptyKeys, model },
@@ -2196,86 +2205,92 @@ export default function App() {
           },
           controller.signal,
         );
-        setProgress(null);
-        workerSnapRef.current = {};
-        setKeyStatuses({});
-        setWorkerPhases({});
-        setWorkerTimes({});
-        setIsPaused(false);
-        // Authoritative final merge: built on top of whatever live-merges already
-        // applied during the run, not the stale `project` captured at call time.
-        currentProject = mergeTranslations(currentProject, result.translations, strings);
-        // Carry measured font-shrink factors to the writeBack/inject step.
-        sizeFixesRef.current = result.sizeFixes ?? {};
-        setProject(currentProject);
-        if (translationMode === "mods" && targetIds) {
-          setEditedModPaths((prev) => {
-            const next = new Set(prev);
-            let changed = false;
-            for (const id of Object.keys(result.translations)) {
-              const strObj = strings.find((s) => s.id === id);
-              if (strObj) {
-                const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
-                if (mPath && !next.has(mPath)) {
-                  next.add(mPath);
-                  changed = true;
+        if (shouldRestartRef.current) {
+          currentProject = mergeTranslations(currentProject, result.translations, strings);
+          setProject(currentProject);
+          await saveProject(currentProject).catch(() => {});
+        } else {
+          setProgress(null);
+          workerSnapRef.current = {};
+          setKeyStatuses({});
+          setWorkerPhases({});
+          setWorkerTimes({});
+          setIsPaused(false);
+          // Authoritative final merge: built on top of whatever live-merges already
+          // applied during the run, not the stale `project` captured at call time.
+          currentProject = mergeTranslations(currentProject, result.translations, strings);
+          // Carry measured font-shrink factors to the writeBack/inject step.
+          sizeFixesRef.current = result.sizeFixes ?? {};
+          setProject(currentProject);
+          if (translationMode === "mods" && targetIds) {
+            setEditedModPaths((prev) => {
+              const next = new Set(prev);
+              let changed = false;
+              for (const id of Object.keys(result.translations)) {
+                const strObj = strings.find((s) => s.id === id);
+                if (strObj) {
+                  const mPath = getModPathForString(strObj, detectedMods, gameRoot, modsDir);
+                  if (mPath && !next.has(mPath)) {
+                    next.add(mPath);
+                    changed = true;
+                  }
                 }
               }
+              return changed ? next : prev;
+            });
+          }
+          setPhase("saving");
+          await saveProject(currentProject);
+          setPhase("idle");
+          // Terminal errors may already be in groups from live batch_error emits;
+          // still fold any leftover (e.g. key death) without double-spam of retries.
+          if (result.errors.length) {
+            setSessionLog((prev) => {
+              if (!prev) return prev;
+              let next = prev;
+              for (const err of result.errors) {
+                if (!err) continue;
+                // Only bump if this exact terminal message's class is still at 0
+                // for "auth" after live emits — actually live already counted each
+                // attempt. Terminal list is often 1 summary per dead key: still
+                // useful as +1 if we never got live events (abort path). Prefer
+                // not to double-count identical buckets that already have hits
+                // for the same classify key when the message is a subset.
+                const { key } = classifySessionError(err);
+                const already = next.errorGroups.some((g) => g.key === key && g.count > 0);
+                // If we already tallied this class live, skip the terminal dup.
+                if (already) continue;
+                next = bumpSessionError(next, err);
+              }
+              return next === prev ? prev : next;
+            });
+          }
+          if (result.aborted) {
+            // Stop the full pipeline (writeBack / python / autofix) — partial
+            // rows are already auto-saved to the project file.
+            ok = false;
+            const done = Object.keys(result.translations).length;
+            const details = result.errors.length
+              ? "\n\n" + result.errors.map((err) => `• ${err}`).join("\n")
+              : "";
+            setError((t("translateAborted")(done, todo.length) as string) + details);
+          } else if (result.errors.length) {
+            // Errors mean failed batches / dead keys. MUST stop the pipeline:
+            // previously ok stayed true, so "Translate" proceeded to Ren'Py
+            // Python-string translation with a broken API key (User not found
+            // etc.) and burned more quota after a partial main pass.
+            ok = false;
+            const done = Object.keys(result.translations).length;
+            const details = result.errors.map((err) => `• ${err}`).join("\n");
+            setError(
+              `${t("translateErrors")(result.errors.length, done, todo.length) as string}\n\n${details}`,
+            );
+          } else {
+            const uniqueCount = Object.keys(result.translations).length;
+            if (uniqueCount > 0) {
+              const totalCount = targetIds ? targetIds.length : strings.length;
+              showToast((t("translateSuccess") as any)(uniqueCount, totalCount));
             }
-            return changed ? next : prev;
-          });
-        }
-        setPhase("saving");
-        await saveProject(currentProject);
-        setPhase("idle");
-        // Terminal errors may already be in groups from live batch_error emits;
-        // still fold any leftover (e.g. key death) without double-spam of retries.
-        if (result.errors.length) {
-          setSessionLog((prev) => {
-            if (!prev) return prev;
-            let next = prev;
-            for (const err of result.errors) {
-              if (!err) continue;
-              // Only bump if this exact terminal message's class is still at 0
-              // for "auth" after live emits — actually live already counted each
-              // attempt. Terminal list is often 1 summary per dead key: still
-              // useful as +1 if we never got live events (abort path). Prefer
-              // not to double-count identical buckets that already have hits
-              // for the same classify key when the message is a subset.
-              const { key } = classifySessionError(err);
-              const already = next.errorGroups.some((g) => g.key === key && g.count > 0);
-              // If we already tallied this class live, skip the terminal dup.
-              if (already) continue;
-              next = bumpSessionError(next, err);
-            }
-            return next === prev ? prev : next;
-          });
-        }
-        if (result.aborted) {
-          // Stop the full pipeline (writeBack / python / autofix) — partial
-          // rows are already auto-saved to the project file.
-          ok = false;
-          const done = Object.keys(result.translations).length;
-          const details = result.errors.length
-            ? "\n\n" + result.errors.map((err) => `• ${err}`).join("\n")
-            : "";
-          setError((t("translateAborted")(done, todo.length) as string) + details);
-        } else if (result.errors.length) {
-          // Errors mean failed batches / dead keys. MUST stop the pipeline:
-          // previously ok stayed true, so "Translate" proceeded to Ren'Py
-          // Python-string translation with a broken API key (User not found
-          // etc.) and burned more quota after a partial main pass.
-          ok = false;
-          const done = Object.keys(result.translations).length;
-          const details = result.errors.map((err) => `• ${err}`).join("\n");
-          setError(
-            `${t("translateErrors")(result.errors.length, done, todo.length) as string}\n\n${details}`,
-          );
-        } else {
-          const uniqueCount = Object.keys(result.translations).length;
-          if (uniqueCount > 0) {
-            const totalCount = targetIds ? targetIds.length : strings.length;
-            showToast((t("translateSuccess") as any)(uniqueCount, totalCount));
           }
         }
       } finally {
@@ -2306,10 +2321,11 @@ export default function App() {
     }
     if (shouldRestartRef.current) {
       shouldRestartRef.current = false;
-      return await translateAll(targetIds, extraInstruction);
+      return await latestTranslateAllRef.current(targetIds, extraInstruction, currentProject);
     }
     return { ok, project: ok ? currentProject : undefined };
   }
+  latestTranslateAllRef.current = translateAll;
 
   async function writeBack(proj?: ProjectFile, forceModPaths?: string[]): Promise<boolean> {
     const p = proj ?? project;

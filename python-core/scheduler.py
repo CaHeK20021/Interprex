@@ -2241,13 +2241,16 @@ class TranslationScheduler:
             return
         start = time.time()
         while not self._is_aborted():
+            if self.should_pause():
+                if not self._park_while_paused(worker_idx):
+                    return
             remaining = offset - (time.time() - start)
             if remaining <= 0:
                 return
             with self.cond:
                 if self._is_aborted():
                     return
-                self.cond.wait(timeout=min(0.5, remaining))
+                self.cond.wait(timeout=min(0.2, remaining))
 
     def worker_loop(self, worker_idx: int, worker_key: str) -> None:
         # Shared run calibrator — see self.cal. Do NOT construct a per-thread
