@@ -8323,9 +8323,12 @@ def check_gamemaker() -> None:
         test_png2.save(bio2, format="PNG")
         png_blob2 = bio2.getvalue()
 
-        # TPAG: 1 item (22 bytes) with shared page coordinates (src_x=16, src_y=16, src_w=128, src_h=64)
+        # TPAG: 2 items (22 bytes each) with shared page coordinates (src_x=16, src_y=16, src_w=128, src_h=64)
         tpag_data = bytearray()
-        tpag_data.extend(struct.pack("<II", 1, 0))  # count=1, item_ptr placeholder
+        tpag_data.extend(struct.pack("<III", 2, 0, 0))  # count=2, item0_ptr, item1_ptr placeholders
+        tpag0_rel = len(tpag_data)
+        tpag_data.extend(struct.pack("<10Hh", 16, 16, 128, 64, 0, 0, 128, 64, 128, 64, 0))
+        tpag1_rel = len(tpag_data)
         tpag_data.extend(struct.pack("<10Hh", 16, 16, 128, 64, 0, 0, 128, 64, 128, 64, 0))
         while len(tpag_data) % 4 != 0:
             tpag_data.append(0)
@@ -8343,10 +8346,16 @@ def check_gamemaker() -> None:
             glyph_rel_offsets.append(len(font_record))
             font_record.extend(struct.pack("<HHHHHhhH", c, 10, 10, 8, 12, 8, 0, 0))
 
+        # Multi-font: 2 fonts in FONT chunk (verifies subsequent font glyph pointers don't drift)
+        font_record2 = bytearray(font_record)
         font_data = bytearray()
-        font_data.extend(struct.pack("<I", 1))  # font_count = 1
-        font_data.extend(struct.pack("<I", 0))  # fp placeholder
+        font_data.extend(struct.pack("<III", 2, 0, 0))  # font_count = 2, fp0, fp1 placeholders
+        fr0_rel = len(font_data)
         font_data.extend(font_record)
+        while len(font_data) % 4 != 0:
+            font_data.append(0)
+        fr1_rel = len(font_data)
+        font_data.extend(font_record2)
         while len(font_data) % 4 != 0:
             font_data.append(0)
 
@@ -8399,17 +8408,28 @@ def check_gamemaker() -> None:
         struct.pack_into("<I", code_data, 4, code_off + 8)
         struct.pack_into("<I", code_data, 8, strg_off + str_rel_offsets[7] + 4)
 
-        # TPAG item pointer
-        struct.pack_into("<I", tpag_data, 4, tpag_off + 8)
-        tpag_item_abs = tpag_off + 8
+        # TPAG item pointers
+        tpag_item0_abs = tpag_off + tpag0_rel
+        tpag_item1_abs = tpag_off + tpag1_rel
+        struct.pack_into("<I", tpag_data, 4, tpag_item0_abs)
+        struct.pack_into("<I", tpag_data, 8, tpag_item1_abs)
 
-        struct.pack_into("<I", font_data, 4, font_off + 8)
-        fp = font_off + 8
-        struct.pack_into("<I", font_data, 8, strg_off + str_rel_offsets[0] + 4)
-        struct.pack_into("<I", font_data, 8 + 28, tpag_item_abs)  # tpag_ptr
+        fp0 = font_off + fr0_rel
+        fp1 = font_off + fr1_rel
+        struct.pack_into("<I", font_data, 4, fp0)
+        struct.pack_into("<I", font_data, 8, fp1)
+
+        struct.pack_into("<I", font_data, fr0_rel, strg_off + str_rel_offsets[0] + 4)
+        struct.pack_into("<I", font_data, fr0_rel + 28, tpag_item0_abs)  # tpag_ptr
         for i, g_rel in enumerate(glyph_rel_offsets):
-            gp_abs = fp + g_rel
-            struct.pack_into("<I", font_data, 8 + g_ptrs_start + i * 4, gp_abs)
+            gp_abs = fp0 + g_rel
+            struct.pack_into("<I", font_data, fr0_rel + g_ptrs_start + i * 4, gp_abs)
+
+        struct.pack_into("<I", font_data, fr1_rel, strg_off + str_rel_offsets[0] + 4)
+        struct.pack_into("<I", font_data, fr1_rel + 28, tpag_item1_abs)  # tpag_ptr
+        for i, g_rel in enumerate(glyph_rel_offsets):
+            gp_abs = fp1 + g_rel
+            struct.pack_into("<I", font_data, fr1_rel + g_ptrs_start + i * 4, gp_abs)
 
         for i, s_rel in enumerate(str_rel_offsets):
             struct.pack_into("<I", strg_data, 4 + i * 4, strg_off + s_rel)
@@ -8522,39 +8542,48 @@ def check_gamemaker() -> None:
         assert "Строка 1#Строка 2".encode("utf-8") in mod_data, "GMS1 '#' newline not preserved"
         assert "Сохранить прогресс?%%".encode("utf-8") in mod_data, "Undertale '%%' terminator not restored"
 
-        # Check Cyrillic font range & verify real Pillow render (coordinates vary):
+        # Check Cyrillic font range & verify real Pillow render on all fonts (verifying subsequent font pointers don't drift):
         font_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "FONT"]
         assert len(font_chunks) == 1
-        fp = struct.unpack_from("<I", mod_data, font_chunks[0][1] + 4)[0]
-        r_end = struct.unpack_from("<I", mod_data, fp + 24)[0]
-        assert r_end >= 0x0451, f"Expected font r_end >= 0x0451, got {r_end}"
+        foff = font_chunks[0][1]
+        fc = struct.unpack_from("<I", mod_data, foff)[0]
+        assert fc == 2, f"Expected 2 fonts, got {fc}"
+        for fidx in range(fc):
+            fp = struct.unpack_from("<I", mod_data, foff + 4 + fidx * 4)[0]
+            r_end = struct.unpack_from("<I", mod_data, fp + 24)[0]
+            assert r_end >= 0x0451, f"Expected font {fidx} r_end >= 0x0451, got {r_end}"
 
-        # Find glyphs table
-        gc_pos = None
-        for pos in range(fp + 40, fp + 68, 4):
-            gc = struct.unpack_from("<I", mod_data, pos)[0]
-            first_p = struct.unpack_from("<I", mod_data, pos + 4)[0]
-            if gc > 0 and first_p == pos + 4 + gc * 4:
-                gc_pos = pos
-                break
-        assert gc_pos is not None, "Glyph count position not found in augmented font"
-        new_gc = struct.unpack_from("<I", mod_data, gc_pos)[0]
-        cyr_glyphs = []
-        cyr_glyphs_full = []
-        for i in range(new_gc):
-            gp = struct.unpack_from("<I", mod_data, gc_pos + 4 + i * 4)[0]
-            char_c, gx, gy, gw, gh = struct.unpack_from("<HHHHH", mod_data, gp)
-            cyr_glyphs_full.append((char_c, gx, gy, gw, gh))
-            if 0x0410 <= char_c <= 0x0420:
-                cyr_glyphs.append((char_c, gx, gy, gw, gh))
-        assert len(cyr_glyphs) >= 10, "Cyrillic glyphs missing in font"
-        # Verify coordinates are NOT stubs (Pillow rendered distinct bounding boxes and positions)
-        assert len(set(g[1] for g in cyr_glyphs)) > 1, "Cyrillic gx coordinates must vary (not a stub)"
+            # Find glyphs table
+            gc_pos = None
+            for pos in range(fp + 40, fp + 68, 4):
+                gc = struct.unpack_from("<I", mod_data, pos)[0]
+                first_p = struct.unpack_from("<I", mod_data, pos + 4)[0]
+                if gc > 0 and first_p == pos + 4 + gc * 4:
+                    gc_pos = pos
+                    break
+            assert gc_pos is not None, f"Glyph count position not found in augmented font {fidx}"
+            new_gc = struct.unpack_from("<I", mod_data, gc_pos)[0]
+            cyr_glyphs = []
+            cyr_glyphs_full = []
+            ptrs = [struct.unpack_from("<I", mod_data, gc_pos + 4 + i * 4)[0] for i in range(new_gc)]
+            for i, gp in enumerate(ptrs):
+                assert gp + 16 <= len(mod_data), f"Font {fidx} glyph pointer {gp} out of bounds"
+                char_c, gx, gy, gw, gh = struct.unpack_from("<HHHHH", mod_data, gp)
+                cyr_glyphs_full.append((char_c, gx, gy, gw, gh))
+                if 0x0410 <= char_c <= 0x0420:
+                    cyr_glyphs.append((char_c, gx, gy, gw, gh))
 
-        # Verify baseline alignment: lowercase 'а' (0x0430) spans down to baseline matching capital 'А' (0x0410)
-        glyph_A = next(g for g in cyr_glyphs_full if g[0] == 0x0410)
-        glyph_a = next(g for g in cyr_glyphs_full if g[0] == 0x0430)
-        assert glyph_a[4] >= glyph_A[4] - 1, f"Lowercase 'а' height ({glyph_a[4]}) must align to baseline with capital 'А' ({glyph_A[4]})"
+            # Verify char codes are strictly ascending without duplicates (required for runtime binary search)
+            chars = [g[0] for g in cyr_glyphs_full]
+            assert all(chars[k] < chars[k+1] for k in range(len(chars)-1)), f"Font {fidx} char codes not strictly ascending!"
+            assert len(cyr_glyphs) >= 10, f"Cyrillic glyphs missing in font {fidx}"
+            # Verify coordinates are NOT stubs (Pillow rendered distinct bounding boxes and positions)
+            assert len(set(g[1] for g in cyr_glyphs)) > 1, f"Cyrillic gx coordinates must vary in font {fidx} (not a stub)"
+
+            # Verify baseline alignment: lowercase 'а' (0x0430) spans down to baseline matching capital 'А' (0x0410)
+            glyph_A = next(g for g in cyr_glyphs_full if g[0] == 0x0410)
+            glyph_a = next(g for g in cyr_glyphs_full if g[0] == 0x0430)
+            assert glyph_a[4] >= glyph_A[4] - 1, f"Font {fidx}: Lowercase 'а' height ({glyph_a[4]}) must align to baseline with capital 'А' ({glyph_A[4]})"
 
         # Check modified TXTR PNG opens via Image.open & verify strict blob_ptr monotonicity
         txtr_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "TXTR"]
@@ -8568,14 +8597,19 @@ def check_gamemaker() -> None:
         blob1_new = struct.unpack_from("<I", mod_data, ep1_new + 4)[0]
         assert blob0_new < blob1_new, f"Strict blob_ptr monotonicity violated: {blob0_new} >= {blob1_new}"
 
-        # Verify TPAG updated to new shared atlas region: src_x=0, src_y=128, src_w=256, src_h>=100
+        # Verify TPAG updated to new shared atlas regions:
         tpag_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "TPAG"]
         assert len(tpag_chunks) == 1
-        tpag_item_p = struct.unpack_from("<I", mod_data, tpag_chunks[0][1] + 4)[0]
-        sx, sy, sw, sh = struct.unpack_from("<4H", mod_data, tpag_item_p)
-        assert sx == 0 and sy == 128, f"TPAG not updated to new region: ({sx}, {sy})"
-        assert sw == 256, f"TPAG width must be 256, got {sw}"
-        assert sh >= 100, f"TPAG height must cover new glyphs, got {sh}"
+        tpag_item0_p = struct.unpack_from("<I", mod_data, tpag_chunks[0][1] + 4)[0]
+        sx0, sy0, sw0, sh0 = struct.unpack_from("<4H", mod_data, tpag_item0_p)
+        assert sx0 == 0 and sy0 == 128, f"TPAG 0 not updated to new region: ({sx0}, {sy0})"
+        assert sw0 == 256, f"TPAG 0 width must be 256, got {sw0}"
+        assert sh0 >= 100, f"TPAG 0 height must cover new glyphs, got {sh0}"
+
+        tpag_item1_p = struct.unpack_from("<I", mod_data, tpag_chunks[0][1] + 8)[0]
+        sx1, sy1, sw1, sh1 = struct.unpack_from("<4H", mod_data, tpag_item1_p)
+        assert sx1 == 0 and sy1 >= sy0 + sh0, f"TPAG 1 not stacked below TPAG 0: sy1={sy1}, sy0+sh0={sy0+sh0}"
+        assert sw1 == 256 and sh1 >= 100, f"TPAG 1 dimensions invalid: {sw1}x{sh1}"
 
         txtr_img0 = Image.open(io.BytesIO(mod_data[blob0_new:]))
         assert txtr_img0.size in ((256, 256), (256, 512)), f"Expected reasonable POT texture, got {txtr_img0.size}"

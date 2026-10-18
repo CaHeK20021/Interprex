@@ -1273,7 +1273,7 @@ class GameMakerParser(BaseParser):
             # Write glyphs
             new_g_ptrs = []
             for g in glyphs:
-                gp_abs = new_fp + len(appended_buf)
+                gp_abs = base_appended_off + len(appended_buf)
                 new_g_ptrs.append(gp_abs)
                 appended_buf.extend(
                     struct.pack(
