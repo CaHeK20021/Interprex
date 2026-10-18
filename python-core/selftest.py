@@ -1111,7 +1111,25 @@ def check_renpy_risk() -> None:
     assert found and found.endswith("Game.exe"), found
     # No exe at all -> None (player machine without the SDK), never raises.
     assert _find_engine_exe(tempfile.mkdtemp()) is None
-    print("OK — renpy engine-lint: actionable vs benign classification, exe discovery")
+    # Baseline diff: pre-existing original game bug vs genuine translation bug
+    from parsers.renpy import _parse_lint_output
+    mock_lint = (
+        "game/day1_2.rpyc:4507 Close text tag '{/sc}' does not match open text tag '{cps}'. (in \"No...\")\n"
+        "game/tl/russian/day1_2.rpy:10917 Close text tag '{/sc}' does not match open text tag '{cps}'. (in \"Нет...\")\n"
+        "game/tl/russian/script.rpy:100 Close text tag '{/b}' does not match open text tag '{i}'. (in \"Новая...\")\n"
+    )
+    m_ours, m_other = _parse_lint_output(mock_lint, "russian")
+    assert len(m_ours) == 2
+    assert m_other == 1
+    # day1_2.rpy finding was pre-existing in day1_2.rpyc -> marked pre_existing and NOT actionable
+    day1_f = next(f for f in m_ours if "day1_2" in f["file"])
+    assert day1_f["pre_existing"] is True
+    assert day1_f["actionable"] is False
+    # script.rpy finding was introduced in translation -> actionable
+    script_f = next(f for f in m_ours if "script" in f["file"])
+    assert script_f.get("pre_existing") is not True
+    assert script_f["actionable"] is True
+    print("OK — renpy engine-lint: actionable vs benign classification, exe discovery, baseline diff")
 
     # --- %-format escaping (deterministic crash-class fix at inject time) ---
     from parsers.renpy import _escape_bad_percent as _pf
@@ -1155,7 +1173,8 @@ def check_renpy_risk() -> None:
     assert _rt("{i}x{/color}{/i}") == "{i}x{/i}"
     # VALID markup is left byte-verbatim (no false positives).
     for ok in ("{i}hi{/i}", "plain text", "{size=+4}big{/size}",
-               "{b}{i}x{/i}{/b}", "text{/}", "{w=0.5}wait", "no tags at all"):
+               "{b}{i}x{/i}{/b}", "text{/}", "{w=0.5}wait", "no tags at all",
+               "{{Привет}}", "Двойные {{скобки}} экранированы"):
         assert _rt(ok) == ok, f"valid markup altered: {ok!r}"
     # Ambiguous / unmatched close we CAN'T safely guess -> leave verbatim, never crash.
     assert _rt("{w=0.5}wait{/i}weird") == "{w=0.5}wait{/i}weird"
@@ -1174,11 +1193,17 @@ def check_renpy_risk() -> None:
     assert _rt('К несчастью для него, Эван ещё не закончил.{Далеко нет.}') == 'К несчастью для него, Эван ещё не закончил. Далеко нет.'
     # Q-tag typo restored to {w}
     assert _rt('И всё же он ничего не увидел.{q} Как знать') == 'И всё же он ничего не увидел.{w} Как знать'
+    # Kinetic Text Tags and author tag auto-healing (The King and The Beast real cases)
+    assert _rt("{sc=3}{cps=20}Нет нет нет{w=1}, пожалуйста!{/sc}") == "{sc=3}{cps=20}Нет нет нет{w=1}, пожалуйста!{/cps}{/sc}"
+    assert _rt("{sc=5}{b}{size=50}{color=#ff0000}Ты моя!{/color}{/size}{/sc}") == "{sc=5}{b}{size=50}{color=#ff0000}Ты моя!{/color}{/size}{/b}{/sc}"
+    assert _rt("{sc=5}{b}{size=50}{color=#ff0000}Ты моя!{/size}{/sc}") == "{sc=5}{b}{size=50}{color=#ff0000}Ты моя!{/color}{/size}{/b}{/sc}"
     # Idempotent: re-running never re-mangles a fixed string.
     for s in ("{i}x{/iR}", "{b}{i}y{/iX}{/b}", "{i}ok{/i}", "plain",
               "{i}{b}test.{/i}{/b}", "{i}x{/color}", "{color=#fff}red{/i}",
               '"{i}Тем...{w} {b}Убив [mc]?!{/b}{/w}{/i}"',
-              'Ты любишь вовсе не {iменя{/i}, а {i}мои страдания{/i}.'):
+              'Ты любишь вовсе не {iменя{/i}, а {i}мои страдания{/i}.',
+              "{sc=3}{cps=20}Нет нет нет{w=1}, пожалуйста!{/sc}",
+              "{sc=5}{b}{size=50}{color=#ff0000}Ты моя!{/color}{/size}{/sc}"):
         assert _rt(_rt(s)) == _rt(s), f"not idempotent: {s!r}"
     print("OK — renpy text-tag repair: corrupted close fixed, valid verbatim, idempotent")
 
@@ -8239,11 +8264,373 @@ def check_rpgmaker() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def check_gamemaker() -> None:
+    import struct
+    import io
+    from PIL import Image
+    from parsers.gamemaker import GameMakerParser, _parse_form_chunks
+
+    td = tempfile.mkdtemp(prefix="interprex_gm_test_")
+    try:
+        strings_list = [
+            "Welcome to the game!",           # 0: dialogue
+            "Press &y&SPACE&!& to jump",       # 1: dialogue RoR tag
+            "Line 1#Line 2",                   # 2: dialogue '#' newline
+            "Save progress?%%",                # 3: dialogue Undertale term
+            "idle",                            # 4: cmp state machine key -> skip
+            "obj_player",                      # 5: in OBJT -> skip
+            "s",                               # 6: single letter -> skip
+            "gml_Object_obj_player_Create_0",  # 7: code name
+        ]
+
+        # Pre-build STRG string records
+        str_records = []
+        for s in strings_list:
+            utf8 = s.encode("utf-8")
+            rec = struct.pack("<I", len(utf8)) + utf8 + b"\x00"
+            pad = (4 - (len(rec) % 4)) % 4
+            rec += b"\x00" * pad
+            str_records.append(rec)
+
+        gen8_data = b"\x01\x0e" + b"\x00" * 62  # version 14
+        objt_data = bytearray(b"\x00" * 16)
+
+        code_record = bytearray()
+        code_record.extend(struct.pack("<II", 0, 52))  # cname_ptr placeholder, bc_len = 52
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 0))
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 1))
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 2))
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 3))
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 4))
+        code_record.extend(struct.pack("<I", (0x15 << 24)))  # cmp
+        code_record.extend(struct.pack("<II", (0xC0 << 24) | (0x06 << 16), 6))
+
+        code_data = bytearray()
+        code_data.extend(struct.pack("<I", 1))  # code_count = 1
+        code_data.extend(struct.pack("<I", 0))  # cp placeholder
+        code_data.extend(code_record)
+        while len(code_data) % 4 != 0:
+            code_data.append(0)
+
+        # Real test PNGs for texture page 0 (font) and page 1 (sprite)
+        test_png = Image.new("RGBA", (256, 128), (0, 0, 0, 0))
+        bio = io.BytesIO()
+        test_png.save(bio, format="PNG")
+        png_blob = bio.getvalue()
+
+        test_png2 = Image.new("RGBA", (64, 64), (100, 100, 100, 255))
+        bio2 = io.BytesIO()
+        test_png2.save(bio2, format="PNG")
+        png_blob2 = bio2.getvalue()
+
+        # TPAG: 1 item (22 bytes) with shared page coordinates (src_x=16, src_y=16, src_w=128, src_h=64)
+        tpag_data = bytearray()
+        tpag_data.extend(struct.pack("<II", 1, 0))  # count=1, item_ptr placeholder
+        tpag_data.extend(struct.pack("<10Hh", 16, 16, 128, 64, 0, 0, 128, 64, 128, 64, 0))
+        while len(tpag_data) % 4 != 0:
+            tpag_data.append(0)
+
+        font_record = bytearray(b"\x00" * 48)
+        struct.pack_into("<H", font_record, 20, 65)  # r_start
+        struct.pack_into("<I", font_record, 24, 90)  # r_end
+        font_record.extend(struct.pack("<I", 26))      # gc = 26 at offset 48
+
+        g_ptrs_start = len(font_record)
+        font_record.extend(b"\x00" * (26 * 4))
+
+        glyph_rel_offsets = []
+        for c in range(65, 91):
+            glyph_rel_offsets.append(len(font_record))
+            font_record.extend(struct.pack("<HHHHHhhH", c, 10, 10, 8, 12, 8, 0, 0))
+
+        font_data = bytearray()
+        font_data.extend(struct.pack("<I", 1))  # font_count = 1
+        font_data.extend(struct.pack("<I", 0))  # fp placeholder
+        font_data.extend(font_record)
+        while len(font_data) % 4 != 0:
+            font_data.append(0)
+
+        strg_header = bytearray()
+        strg_header.extend(struct.pack("<I", len(strings_list)))
+        strg_header.extend(b"\x00" * (len(strings_list) * 4))
+
+        strg_data = bytearray(strg_header)
+        str_rel_offsets = []
+        for r in str_records:
+            str_rel_offsets.append(len(strg_data))
+            strg_data.extend(r)
+        while len(strg_data) % 4 != 0:
+            strg_data.append(0)
+
+        # Multi-page TXTR: 2 texture pages (page 0 font, page 1 sprite)
+        txtr_data = bytearray()
+        txtr_data.extend(struct.pack("<III", 2, 0, 0))  # count=2, ep0, ep1
+        txtr_data.extend(struct.pack("<II", 1, 0))      # ep0: scaled=1, blob_ptr placeholder
+        txtr_data.extend(struct.pack("<II", 1, 0))      # ep1: scaled=1, blob_ptr placeholder
+        blob0_rel = len(txtr_data)
+        txtr_data.extend(png_blob)
+        pad0 = (4 - (len(png_blob) % 4)) % 4
+        txtr_data.extend(b"\x00" * pad0)
+        blob1_rel = len(txtr_data)
+        txtr_data.extend(png_blob2)
+        while len(txtr_data) % 4 != 0:
+            txtr_data.append(0)
+
+        audo_data = bytearray()
+        audo_data.extend(struct.pack("<II", 1, 0))
+        audo_data.extend(b"DUMMY_AUDIO_BYTES_12345678901234")
+        while len(audo_data) % 4 != 0:
+            audo_data.append(0)
+
+        form_hdr_size = 8
+        gen8_off = form_hdr_size + 8
+        objt_off = gen8_off + len(gen8_data) + 8
+        code_off = objt_off + len(objt_data) + 8
+        tpag_off = code_off + len(code_data) + 8
+        font_off = tpag_off + len(tpag_data) + 8
+        strg_off = font_off + len(font_data) + 8
+        txtr_off = strg_off + len(strg_data) + 8
+        audo_off = txtr_off + len(txtr_data) + 8
+
+        obj_player_str_off = strg_off + str_rel_offsets[5]
+        struct.pack_into("<I", objt_data, 0, 1)
+        struct.pack_into("<I", objt_data, 4, obj_player_str_off + 4)
+
+        struct.pack_into("<I", code_data, 4, code_off + 8)
+        struct.pack_into("<I", code_data, 8, strg_off + str_rel_offsets[7] + 4)
+
+        # TPAG item pointer
+        struct.pack_into("<I", tpag_data, 4, tpag_off + 8)
+        tpag_item_abs = tpag_off + 8
+
+        struct.pack_into("<I", font_data, 4, font_off + 8)
+        fp = font_off + 8
+        struct.pack_into("<I", font_data, 8, strg_off + str_rel_offsets[0] + 4)
+        struct.pack_into("<I", font_data, 8 + 28, tpag_item_abs)  # tpag_ptr
+        for i, g_rel in enumerate(glyph_rel_offsets):
+            gp_abs = fp + g_rel
+            struct.pack_into("<I", font_data, 8 + g_ptrs_start + i * 4, gp_abs)
+
+        for i, s_rel in enumerate(str_rel_offsets):
+            struct.pack_into("<I", strg_data, 4 + i * 4, strg_off + s_rel)
+
+        ep0 = txtr_off + 12
+        ep1 = txtr_off + 20
+        struct.pack_into("<I", txtr_data, 4, ep0)
+        struct.pack_into("<I", txtr_data, 8, ep1)
+        blob0_abs = txtr_off + blob0_rel
+        blob1_abs = txtr_off + blob1_rel
+        struct.pack_into("<I", txtr_data, 16, blob0_abs)
+        struct.pack_into("<I", txtr_data, 24, blob1_abs)
+
+        ap = audo_off + 8
+        struct.pack_into("<I", audo_data, 4, ap)
+
+        file_bytes = bytearray()
+        file_bytes.extend(b"FORM")
+        file_bytes.extend(struct.pack("<I", 0))
+
+        def add_chunk(tag: bytes, data: bytearray):
+            file_bytes.extend(tag)
+            file_bytes.extend(struct.pack("<I", len(data)))
+            file_bytes.extend(data)
+
+        add_chunk(b"GEN8", gen8_data)
+        add_chunk(b"OBJT", objt_data)
+        add_chunk(b"CODE", code_data)
+        add_chunk(b"TPAG", tpag_data)
+        add_chunk(b"FONT", font_data)
+        add_chunk(b"STRG", strg_data)
+        add_chunk(b"TXTR", txtr_data)
+        add_chunk(b"AUDO", audo_data)
+
+        struct.pack_into("<I", file_bytes, 4, len(file_bytes) - 8)
+
+        dw = os.path.join(td, "data.win")
+        with open(dw, "wb") as f:
+            f.write(file_bytes)
+
+        lang_dir = os.path.join(td, "lang")
+        os.makedirs(lang_dir, exist_ok=True)
+        with open(os.path.join(lang_dir, "english.json"), "w", encoding="utf-8") as f:
+            json.dump({"menu": {"start": "Start Game", "options": "Options", "exit": "Exit"}}, f, indent=2)
+        with open(os.path.join(lang_dir, "extra.txt"), "w", encoding="utf-8") as f:
+            f.write("Credits\nSpecial thanks to players\n")
+
+        loc_dir = os.path.join(td, "localizations")
+        os.makedirs(loc_dir, exist_ok=True)
+        with open(os.path.join(loc_dir, "strings.ini"), "w", encoding="utf-8") as f:
+            f.write("[ui]\ncontinue=Continue Quest\nquit=Quit to Desktop\n")
+        with open(os.path.join(loc_dir, "dialogue.csv"), "w", encoding="utf-8", newline="") as f:
+            f.write("id,text\nquest_1,Speak with the Elder\nquest_2,Return the Sacred Relic\n")
+
+        # 1. Detection
+        assert detect_engine(td) == "gamemaker", f"Detect failed: {detect_engine(td)}"
+        p = get_parser("gamemaker")
+        assert isinstance(p, GameMakerParser)
+
+        # 2. Extraction & filtering
+        strings = p.extract(td)
+        assert len(strings) == 13, f"Expected 13 strings, got {len(strings)}: {[s.original for s in strings]}"
+
+        # Verify stability
+        ids1 = {s.id for s in strings}
+        ids2 = {s.id for s in p.extract(td)}
+        assert ids1 == ids2, "GameMaker string IDs not stable across runs"
+
+        expected_dw_origs = [
+            "Welcome to the game!",
+            "Press &y&SPACE&!& to jump",
+            "Line 1#Line 2",
+            "Save progress?%%",
+        ]
+        dw_origs = [s.original for s in strings if s.file == "data.win"]
+        assert dw_origs == expected_dw_origs, f"Unexpected data.win extracted: {dw_origs}"
+
+        # 3. Injection with tag repair & auto-generated Cyrillic font
+        tr = {
+            s.id: (
+                "Добро пожаловать в игру!" if s.original == "Welcome to the game!" else
+                "Нажмите &y&ПРОБЕЛ для прыжка" if s.original == "Press &y&SPACE&!& to jump" else
+                "Строка 1\nСтрока 2" if s.original == "Line 1#Line 2" else
+                "Сохранить прогресс?" if s.original == "Save progress?%%" else
+                "Начать игру" if s.original == "Start Game" else
+                "Настройки" if s.original == "Options" else
+                "Выход" if s.original == "Exit" else
+                "Продолжить задание" if s.original == "Continue Quest" else
+                "Выйти на рабочий стол" if s.original == "Quit to Desktop" else
+                "Поговорить со Старейшиной" if s.original == "Speak with the Elder" else
+                "Вернуть Священную Реликвию" if s.original == "Return the Sacred Relic" else
+                "Титры" if s.original == "Credits" else
+                "Особая благодарность игрокам" if s.original == "Special thanks to players" else
+                s.original
+            )
+            for s in strings
+        }
+
+        written = p.inject(td, tr, target_lang="Russian")
+        assert written == 13, f"Expected 13 written, got {written}"
+
+        with open(dw, "rb") as f:
+            mod_data = f.read()
+
+        # Check binary invariants:
+        assert b"obj_player\x00" in mod_data, "Technical string broken"
+        assert b"gml_Object_obj_player_Create_0\x00" in mod_data, "Code identifier broken"
+        assert "Добро пожаловать в игру!".encode("utf-8") in mod_data
+        assert "Нажмите &y&ПРОБЕЛ для прыжка&!&".encode("utf-8") in mod_data, "RoR &!& closing tag not restored"
+        assert "Строка 1#Строка 2".encode("utf-8") in mod_data, "GMS1 '#' newline not preserved"
+        assert "Сохранить прогресс?%%".encode("utf-8") in mod_data, "Undertale '%%' terminator not restored"
+
+        # Check Cyrillic font range & verify real Pillow render (coordinates vary):
+        font_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "FONT"]
+        assert len(font_chunks) == 1
+        fp = struct.unpack_from("<I", mod_data, font_chunks[0][1] + 4)[0]
+        r_end = struct.unpack_from("<I", mod_data, fp + 24)[0]
+        assert r_end >= 0x0451, f"Expected font r_end >= 0x0451, got {r_end}"
+
+        # Find glyphs table
+        gc_pos = None
+        for pos in range(fp + 40, fp + 68, 4):
+            gc = struct.unpack_from("<I", mod_data, pos)[0]
+            first_p = struct.unpack_from("<I", mod_data, pos + 4)[0]
+            if gc > 0 and first_p == pos + 4 + gc * 4:
+                gc_pos = pos
+                break
+        assert gc_pos is not None, "Glyph count position not found in augmented font"
+        new_gc = struct.unpack_from("<I", mod_data, gc_pos)[0]
+        cyr_glyphs = []
+        cyr_glyphs_full = []
+        for i in range(new_gc):
+            gp = struct.unpack_from("<I", mod_data, gc_pos + 4 + i * 4)[0]
+            char_c, gx, gy, gw, gh = struct.unpack_from("<HHHHH", mod_data, gp)
+            cyr_glyphs_full.append((char_c, gx, gy, gw, gh))
+            if 0x0410 <= char_c <= 0x0420:
+                cyr_glyphs.append((char_c, gx, gy, gw, gh))
+        assert len(cyr_glyphs) >= 10, "Cyrillic glyphs missing in font"
+        # Verify coordinates are NOT stubs (Pillow rendered distinct bounding boxes and positions)
+        assert len(set(g[1] for g in cyr_glyphs)) > 1, "Cyrillic gx coordinates must vary (not a stub)"
+
+        # Verify baseline alignment: lowercase 'а' (0x0430) spans down to baseline matching capital 'А' (0x0410)
+        glyph_A = next(g for g in cyr_glyphs_full if g[0] == 0x0410)
+        glyph_a = next(g for g in cyr_glyphs_full if g[0] == 0x0430)
+        assert glyph_a[4] >= glyph_A[4] - 1, f"Lowercase 'а' height ({glyph_a[4]}) must align to baseline with capital 'А' ({glyph_A[4]})"
+
+        # Check modified TXTR PNG opens via Image.open & verify strict blob_ptr monotonicity
+        txtr_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "TXTR"]
+        assert len(txtr_chunks) == 1
+        t_off = txtr_chunks[0][1]
+        t_count = struct.unpack_from("<I", mod_data, t_off)[0]
+        assert t_count == 2, f"Expected 2 texture entries, got {t_count}"
+        ep0_new = struct.unpack_from("<I", mod_data, t_off + 4)[0]
+        ep1_new = struct.unpack_from("<I", mod_data, t_off + 8)[0]
+        blob0_new = struct.unpack_from("<I", mod_data, ep0_new + 4)[0]
+        blob1_new = struct.unpack_from("<I", mod_data, ep1_new + 4)[0]
+        assert blob0_new < blob1_new, f"Strict blob_ptr monotonicity violated: {blob0_new} >= {blob1_new}"
+
+        # Verify TPAG updated to new shared atlas region: src_x=0, src_y=128, src_w=256, src_h>=100
+        tpag_chunks = [ch for ch in _parse_form_chunks(mod_data) if ch[0] == "TPAG"]
+        assert len(tpag_chunks) == 1
+        tpag_item_p = struct.unpack_from("<I", mod_data, tpag_chunks[0][1] + 4)[0]
+        sx, sy, sw, sh = struct.unpack_from("<4H", mod_data, tpag_item_p)
+        assert sx == 0 and sy == 128, f"TPAG not updated to new region: ({sx}, {sy})"
+        assert sw == 256, f"TPAG width must be 256, got {sw}"
+        assert sh >= 100, f"TPAG height must cover new glyphs, got {sh}"
+
+        txtr_img0 = Image.open(io.BytesIO(mod_data[blob0_new:]))
+        assert txtr_img0.size in ((256, 256), (256, 512)), f"Expected reasonable POT texture, got {txtr_img0.size}"
+        assert (txtr_img0.width & (txtr_img0.width - 1)) == 0, f"Width {txtr_img0.width} must be POT"
+        assert (txtr_img0.height & (txtr_img0.height - 1)) == 0, f"Height {txtr_img0.height} must be POT"
+
+        txtr_img1 = Image.open(io.BytesIO(mod_data[blob1_new:]))
+        assert txtr_img1.size == (64, 64), f"Unmodified texture page corrupted: {txtr_img1.size}"
+
+        # Verify pure Python QOI & BZ2+QOI texture decoding
+        from parsers.gamemaker import _decode_gm_texture
+        fioq_payload = bytes([0xFF, 255, 0, 0, 255, 0xFF, 0, 255, 0, 255, 0xFF, 0, 0, 255, 255, 0xFF, 255, 255, 255, 255])
+        qoi_blob = b"fioq" + struct.pack("<HHI", 2, 2, len(fioq_payload)) + fioq_payload
+        dec_qoi = _decode_gm_texture(qoi_blob)
+        assert dec_qoi is not None and dec_qoi.size == (2, 2)
+        assert dec_qoi.getpixel((0, 0)) == (255, 0, 0, 255)
+        assert dec_qoi.getpixel((1, 1)) == (255, 255, 255, 255)
+
+        import bz2
+        bz_blob = b"2q\x00\x00" + bz2.compress(qoi_blob)
+        dec_bz = _decode_gm_texture(bz_blob)
+        assert dec_bz is not None and dec_bz.size == (2, 2)
+        assert dec_bz.getpixel((0, 0)) == (255, 0, 0, 255)
+
+        # Check external CSV & TXT files
+        csv_path = os.path.join(loc_dir, "dialogue.csv")
+        csv_text = open(csv_path, encoding="utf-8").read()
+        assert "Поговорить со Старейшиной" in csv_text
+        assert "Вернуть Священную Реликвию" in csv_text
+
+        txt_path = os.path.join(lang_dir, "extra.txt")
+        txt_text = open(txt_path, encoding="utf-8").read()
+        assert "Титры" in txt_text
+        assert "Особая благодарность игрокам" in txt_text
+
+        # 4. Backup recovery
+        after_strings = p.extract(td)
+        after_origs = [s.original for s in after_strings if s.file == "data.win"]
+        assert after_origs == expected_dw_origs, f"Backup recovery failed: {after_origs}"
+
+        # 5. Idempotent second injection
+        written2 = p.inject(td, tr, target_lang="Russian")
+        assert written2 == 13, f"Idempotent second inject failed: {written2}"
+
+        print("OK — gamemaker: detect, extract, id-stability, bytecode push.s filter, technical pointer preservation, tag repair, font Cyrillic injection, idempotent inject, backup recovery")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 ALL_CHECKS = [
     # Heaviest / longest running first (Longest Job First for optimal packing across CPU cores):
     "check_scheduler_high_threads",
     "check_scheduler_tail",
     "check_scheduler",
+    "check_gamemaker",
     "check_scheduler_tpm",
     "check_unity",
     "check_unreal4_5_bytepatch",
@@ -8355,7 +8742,7 @@ def main() -> int:
 
     total_elapsed = time.perf_counter() - t_start
     print(f"\nTotal time: {total_elapsed:.2f}s")
-    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch + ue-pak-detection + tyrano) + scheduler all pass")
+    print("OK — detect, extract, id-stability, inject, parity (rpgmaker + renpy + renpy-rpa + renpy-decompile + csharp + unity/dll + unity/assets + unity/localization + i18n + fusion + mmf2 + qsp + twine + skyrim + unreal + unreal4 + unreal4-pak + unreal4_5-utoc + unreal4_5-cdo + unreal4_5-routing + unreal4_5-inherited + unreal4_5-bytepatch + ue-pak-detection + tyrano + gamemaker) + scheduler all pass")
     return 0
 
 

@@ -843,7 +843,7 @@ def _escape_bad_percent(s: str) -> str:
 
 
 # A single Ren'Py text tag: capture the leading "/" (closing) and the body.
-_TEXT_TAG_RE = re.compile(r'\{(/?)([^{}]*)\}')
+_TEXT_TAG_RE = re.compile(r'(?<!\{)\{(/?)([^{}]*)\}(?!\})')
 
 # Paired style tags the engine expects to nest LIFO. Standalones ({w}/{p}/{nw}/
 # {clear}/{image}/…) are NOT in this set — a stray `{/i}` after `{w=0.5}` must
@@ -851,6 +851,8 @@ _TEXT_TAG_RE = re.compile(r'\{(/?)([^{}]*)\}')
 _PAIRED_TEXT_TAGS = frozenset({
     "a", "alpha", "alt", "art", "b", "color", "cps", "font", "i", "k",
     "outlinecolor", "plain", "rb", "rt", "s", "shader", "size", "u",
+    # Common Kinetic Text Tags / community paired tags
+    "sc", "bt", "rotateto", "char", "fade", "glitch", "chaos", "move",
 })
 
 # Standalones ({w}/{p}/{nw}/{fast}/{done}/{clear}/{image}/…) are self-closing;
@@ -860,18 +862,18 @@ _STANDALONE_TEXT_TAGS = frozenset({
 })
 
 _STANDALONE_CLOSES_RE = re.compile(
-    r'\{/(?:w|p|nw|fast|done|clear|image|space|vspace)\b[^}]*\}',
+    r'(?<!\{)\{/(?:w|p|nw|fast|done|clear|image|space|vspace)\b[^}]*\}(?!\})',
     re.IGNORECASE,
 )
 
 # Unclosed opening paired tag typo, e.g. `{iменя{/i}` -> `{i}меня{/i}`
 _UNCLOSED_OPEN_TAG_RE = re.compile(
-    r'\{([a-zA-Z]+)([\u0400-\u04FF][^{}]*?)(?=\{|\})'
+    r'(?<!\{)\{([a-zA-Z]+)([\u0400-\u04FF][^{}]*?)(?=\{|\})'
 )
 
 # Cyrillic prose mistakenly wrapped in braces without '=', e.g. `{Далеко нет.}`
 _PROSE_IN_BRACES_RE = re.compile(
-    r'\{([^{}=]*[\u0400-\u04FF][^{}=]*)\}'
+    r'(?<!\{)\{([^{}=]*[\u0400-\u04FF][^{}=]*)\}(?!\})'
 )
 
 
@@ -933,6 +935,25 @@ def _repair_text_tags(s: str) -> str:
         # Tag name = text before '=' (args) and without surrounding spaces.
         return body.split("=", 1)[0].strip()
 
+    all_matches = list(_TEXT_TAG_RE.finditer(s))
+    open_names = set()
+    close_names = set()
+    for m in all_matches:
+        cname = _name(m.group(2)).lower()
+        if not cname or cname in _STANDALONE_TEXT_TAGS:
+            continue
+        if m.group(1):
+            close_names.add(cname)
+        else:
+            open_names.add(cname)
+
+    # Any tag that was BOTH opened and closed in this string is dynamically paired,
+    # plus all standard and community paired tags.
+    dynamic_paired = set(_PAIRED_TEXT_TAGS) | (open_names & close_names)
+
+    def _is_paired(tag_name: str) -> bool:
+        return bool(tag_name) and tag_name.lower() in dynamic_paired
+
     from collections import Counter
     open_stack: list[str] = []
     early_closed = Counter()
@@ -940,7 +961,7 @@ def _repair_text_tags(s: str) -> str:
     pos = 0
     changed = False
 
-    for m in _TEXT_TAG_RE.finditer(s):
+    for idx, m in enumerate(all_matches):
         out.append(s[pos:m.start()])
         pos = m.end()
         closing, body = m.group(1), m.group(2)
@@ -949,7 +970,7 @@ def _repair_text_tags(s: str) -> str:
         if not closing:
             # ONLY push paired tags onto open_stack! Standalones ({w}, {p}, etc.)
             # are self-closing and must NEVER be on the LIFO stack.
-            if _is_paired_text_tag(name):
+            if _is_paired(name):
                 open_stack.append(name)
             out.append(m.group(0))
         else:
@@ -973,7 +994,7 @@ def _repair_text_tags(s: str) -> str:
                 nested_closes = []
                 while open_stack and open_stack[-1] != name:
                     popped = open_stack.pop()
-                    if _is_paired_text_tag(popped):
+                    if _is_paired(popped):
                         nested_closes.append("{/%s}" % popped)
                         early_closed[popped] += 1
                 # Now pop 'name' itself
@@ -989,7 +1010,7 @@ def _repair_text_tags(s: str) -> str:
                 nested_closes = []
                 while open_stack and open_stack[-1] != target_tag:
                     popped = open_stack.pop()
-                    if _is_paired_text_tag(popped):
+                    if _is_paired(popped):
                         nested_closes.append("{/%s}" % popped)
                         early_closed[popped] += 1
                 if open_stack:
@@ -1009,22 +1030,39 @@ def _repair_text_tags(s: str) -> str:
                     if matched_early:
                         early_closed[matched_early] -= 1
                         changed = True
-                    elif (_is_paired_text_tag(name)
-                          and any(_is_paired_text_tag(t) for t in open_stack)):
-                        # LLM swapped the close-tag name entirely: `{i}…{/color}`.
-                        # Replace that close with the proper LIFO closes of every
-                        # still-open paired tag. Standalones on the stack ({w})
-                        # are popped without emitting a close.
-                        closes: list[str] = []
-                        while open_stack:
-                            popped = open_stack.pop()
-                            if _is_paired_text_tag(popped):
-                                closes.append("{/%s}" % popped)
-                                early_closed[popped] += 1
-                        out.append("".join(closes))
-                        changed = True
+                    elif (_is_paired(name)
+                          and any(_is_paired(t) for t in open_stack)):
+                        # Check if all remaining open tags will be closed properly later in this string
+                        remaining_closes = {_name(m2.group(2)).lower() for m2 in all_matches[idx + 1:] if m2.group(1)}
+                        if all(t in remaining_closes for t in open_stack):
+                            # Stray/orphan close tag that was never opened; all active open tags have
+                            # their own matching close tags later. Discard this stray close tag.
+                            changed = True
+                        else:
+                            # LLM swapped the close-tag name entirely: `{i}…{/color}`.
+                            # Close the open tags in LIFO order that lack their own close later.
+                            closes: list[str] = []
+                            while open_stack and open_stack[-1] not in remaining_closes:
+                                popped = open_stack.pop()
+                                if _is_paired(popped):
+                                    closes.append("{/%s}" % popped)
+                                    early_closed[popped] += 1
+                            if closes:
+                                out.append("".join(closes))
+                                changed = True
+                            else:
+                                out.append(m.group(0))
                     else:
                         out.append(m.group(0))
+
+    # Close any unclosed custom paired tags left on the stack in LIFO order
+    custom_dynamic = dynamic_paired - _PAIRED_TEXT_TAGS
+    unclosed_custom = [t for t in reversed(open_stack) if t in custom_dynamic]
+    if unclosed_custom:
+        for t in unclosed_custom:
+            out.append("{/%s}" % t)
+            open_stack.remove(t)
+        changed = True
 
     out.append(s[pos:])
     return "".join(out) if changed else s
@@ -4479,28 +4517,59 @@ def lint_with_engine(root: str, lang: str | None = None,
             pass
 
     result["available"] = True
+    ours, other = _parse_lint_output(out, lang)
+    result["ours"] = ours
+    result["ours_count"] = len(ours)
+    result["actionable_count"] = sum(1 for f in ours if f["actionable"])
+    result["other_count"] = other
+    return result
 
-    # Each finding starts with `game/...:<line> <message>`. Split ours vs others
-    # by whether the path is under our tl/<lang>/ output tree.
+
+def _parse_lint_output(out: str, lang: str | None = None) -> tuple[list[dict], int]:
+    """Parse raw engine lint stdout (or lint.txt content) and return (ours, other_count).
+    Applies baseline diff: findings in our tl/<lang>/ that match pre-existing errors in
+    the original game scripts are marked pre_existing=True and actionable=False."""
     finding_re = re.compile(r"^(game/[^\s:]+):(\d+)\s+(.*)$")
     tl_marker = f"/tl/{lang}/".lower() if lang else "/tl/"
-    ours, other = [], 0
+
+    # First pass: collect baseline errors from the original game scripts (outside tl/).
+    # Normalize path stem (strip .rpy / .rpyc) and strip trailing dialogue quote ` (in "...")`.
+    source_bugs: set[tuple[str, str]] = set()
+    raw_findings: list[tuple[str, int, str, bool]] = []
     for line in out.splitlines():
         m = finding_re.match(line.strip())
         if not m:
             continue
         fpath, lineno, msg = m.group(1), int(m.group(2)), m.group(3)
         norm = "/" + fpath.lower()
-        if (tl_marker in norm) or norm.startswith("/game/tl/" + (lang.lower() + "/" if lang else "")):
-            ours.append({"file": fpath, "line": lineno, "message": msg,
-                         "actionable": _lint_is_actionable(msg)})
+        is_tl = (tl_marker in norm) or norm.startswith("/game/tl/" + (lang.lower() + "/" if lang else ""))
+        raw_findings.append((fpath, lineno, msg, is_tl))
+        if not is_tl:
+            stem = re.sub(r'\.rpyc?$', '', os.path.basename(fpath).lower())
+            core_msg = re.sub(r'\s*\(in\s+["\'].*?["\']\)\s*$', '', msg.strip())
+            source_bugs.add((stem, core_msg))
+            source_bugs.add((stem, msg.strip()))
+
+    ours, other = [], 0
+    for fpath, lineno, msg, is_tl in raw_findings:
+        if is_tl:
+            stem = re.sub(r'\.rpyc?$', '', os.path.basename(fpath).lower())
+            core_msg = re.sub(r'\s*\(in\s+["\'].*?["\']\)\s*$', '', msg.strip())
+            pre_existing = (stem, core_msg) in source_bugs or (stem, msg.strip()) in source_bugs
+            actionable = _lint_is_actionable(msg) and not pre_existing
+            entry: dict = {
+                "file": fpath,
+                "line": lineno,
+                "message": msg,
+                "actionable": actionable,
+            }
+            if pre_existing:
+                entry["pre_existing"] = True
+            ours.append(entry)
         else:
             other += 1
-    result["ours"] = ours
-    result["ours_count"] = len(ours)
-    result["actionable_count"] = sum(1 for f in ours if f["actionable"])
-    result["other_count"] = other
-    return result
+
+    return ours, other
 
 
 # Lint findings inside tl/ files that are BENIGN artifacts of linting translation

@@ -1784,8 +1784,11 @@ def _validate_renpy_tokens(old: str, new: str) -> list[str]:
     new_vars = sorted(m.group(0) for m in _RENPY_VAR_RE.finditer(new))
     if old_vars != new_vars:
         violations.append(f"[var] tokens differ: {old_vars} -> {new_vars}")
-    old_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(old))
-    new_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(new))
+    from parsers.renpy import _repair_text_tags
+    old_repaired = _repair_text_tags(old)
+    new_repaired = _repair_text_tags(new)
+    old_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(old_repaired))
+    new_tags = sorted(m.group(0) for m in _RENPY_TAG_RE.finditer(new_repaired))
     if old_tags != new_tags:
         violations.append(f"{{tag}} tokens differ: {old_tags} -> {new_tags}")
     old_fmt = sorted(m.group(0) for m in _RENPY_PERCENT_RE.finditer(old))
@@ -2408,8 +2411,11 @@ def main(args_list=None):
     # %-format tokens got corrupted by the LLM, retry with an explicit
     # instruction to preserve them verbatim. Only skip after a second failure.
     if translations and not args.apply_cached_only:
+        from parsers.renpy import _repair_text_tags
         corrupted = []
         for orig, tr in list(translations.items()):
+            tr = _repair_text_tags(tr)
+            translations[orig] = tr
             viols = _validate_renpy_tokens(orig, tr)
             if viols:
                 corrupted.append((orig, tr, viols))
@@ -2443,6 +2449,8 @@ def main(args_list=None):
                 still_broken = 0
                 for orig, old_tr, viols in corrupted:
                     new_tr = retried.get(orig)
+                    if new_tr:
+                        new_tr = _repair_text_tags(new_tr)
                     if new_tr and not _validate_renpy_tokens(orig, new_tr):
                         translations[orig] = new_tr
                         fixed += 1

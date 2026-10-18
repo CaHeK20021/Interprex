@@ -18,6 +18,7 @@ from .twine import TwineParser
 from .sdf7d2d import Sdf7d2dParser
 from .skyrim import SkyrimParser
 from .tyrano import TyranoParser
+from .gamemaker import GameMakerParser
 
 # Order matters only for detect(): first match wins.
 # Tier 1: Exclusive markers (100% unique structure / manifests)
@@ -35,6 +36,7 @@ REGISTRY: list[type[BaseParser]] = [
     I18nParser,
     FusionParser,
     Mmf2Parser,
+    GameMakerParser,
     # Tier 2
     UnrealEngine4_5Parser,
     UnrealParser,
@@ -69,6 +71,7 @@ __all__ = [
     "BaseParser",
     "TranslationString",
     "make_id",
+    "GameMakerParser",
     "REGISTRY",
     "detect_engine",
     "get_parser",
