@@ -846,6 +846,9 @@ class GameMakerParser(BaseParser):
                 )
                 if font_records:
                     appended_strg_buf.extend(font_records)
+                redirected = self._redirect_sprite_fonts_in_bytecode(raw, buf, chunk_map)
+                if redirected:
+                    logger.info("Redirected %d font_add_sprite calls to FONT resources", redirected)
             except Exception as e:
                 logger.warning("Cyrillic font generation skipped: %s", e)
 
@@ -1105,7 +1108,16 @@ class GameMakerParser(BaseParser):
                             from PIL import Image, ImageDraw, ImageFont
                             tex_img = page_images[tex_page_id][0]
 
-                            cap_h = max(8, cap_glyph["gh"])
+                            orig_crop = tex_img.crop((src_x, src_y, src_x + src_w, src_y + src_h))
+                            a_crop = orig_crop.crop((
+                                cap_glyph["gx"],
+                                cap_glyph["gy"],
+                                cap_glyph["gx"] + cap_glyph["gw"],
+                                cap_glyph["gy"] + cap_glyph["gh"],
+                            ))
+                            a_bbox = a_crop.getbbox()
+                            cap_h = max(6, (a_bbox[3] - a_bbox[1]) if a_bbox else cap_glyph["gh"])
+
                             font_path = zpix_path if (anti_alias == 0 or cap_h <= 13) and os.path.exists(zpix_path) else noto_path
 
                             # Calibrate pil_size
@@ -1129,7 +1141,6 @@ class GameMakerParser(BaseParser):
                             lower_a = next((g for g in glyphs if g["char"] == 97), None)
                             is_all_caps = (lower_a is None or (lower_a["gx"] == cap_glyph["gx"] and lower_a["gy"] == cap_glyph["gy"]))
 
-                            orig_crop = tex_img.crop((src_x, src_y, src_x + src_w, src_y + src_h))
                             atlas_w = max(src_w, 256)
                             cur_x = 1
                             cur_y = src_h + 2
@@ -1140,9 +1151,11 @@ class GameMakerParser(BaseParser):
 
                             # Baseline & top metrics based on capital 'А' and Cyrillic glyphs
                             tb_cap = dummy_draw.textbbox((0, 0), "А", font=pil_font)
-                            base_y = tb_cap[3]
-                            all_tbs = [dummy_draw.textbbox((0, 0), chr(c), font=pil_font) for c in cyr_chars]
-                            top_y = min(tb_cap[1], min(t[1] for t in all_tbs))
+                            if a_bbox:
+                                top_y = tb_cap[3] - a_bbox[3]
+                            else:
+                                all_tbs = [dummy_draw.textbbox((0, 0), chr(c), font=pil_font) for c in cyr_chars]
+                                top_y = min(tb_cap[1], min(t[1] for t in all_tbs))
 
                             new_cyr_glyphs = []
                             for code in cyr_chars:
@@ -1261,7 +1274,8 @@ class GameMakerParser(BaseParser):
 
             # Copy header up to gc_pos, updating range_end
             header_prefix = bytearray(data[fp:gc_pos])
-            struct.pack_into("<I", header_prefix, 24, max(r_end, 0x0451))
+            max_char_code = max((g["char"] for g in glyphs), default=0x0451)
+            struct.pack_into("<I", header_prefix, 24, max(r_end, max_char_code))
             appended_buf.extend(header_prefix)
 
             # Write new glyph count and pointer table
@@ -1309,6 +1323,233 @@ class GameMakerParser(BaseParser):
                 modified_pages[tex_id] = (blob_ptr_pos, old_blob_off, png_bytes, mimg.width, mimg.height)
 
         return new_font_ptrs, appended_buf, modified_pages
+
+    def _redirect_sprite_fonts_in_bytecode(
+        self,
+        data: bytes,
+        buf: bytearray,
+        chunk_map: dict[str, tuple[int, int]],
+    ) -> int:
+        """Redirect font_add_sprite() calls in CODE to augmented FONT resources if matching fonts exist."""
+        if "CODE" not in chunk_map or "FONT" not in chunk_map or "SPRT" not in chunk_map or "STRG" not in chunk_map:
+            return 0
+
+        gen8_off, _ = chunk_map["GEN8"]
+        bytecode_version = data[gen8_off + 1]
+
+        # 1. Read STRG table to resolve resource names
+        strg_off, _ = chunk_map["STRG"]
+        strg_count = _u32(data, strg_off)
+        char_ptr_to_str: dict[int, str] = {}
+        for i in range(strg_count):
+            p = _u32(data, strg_off + 4 + i * 4)
+            if p + 4 <= len(data):
+                slen = _u32(data, p)
+                s_bytes = data[p + 4 : p + 4 + slen]
+                s_val = s_bytes.decode("utf-8", errors="replace")
+                char_ptr_to_str[p] = s_val
+                char_ptr_to_str[p + 4] = s_val
+
+        def _norm_font_stem(name: str) -> str:
+            s = name.lower()
+            s = re.sub(r'^(?:spr_fnt_|spr_font_|sfnt|sfont|fnt_|font_|fnt|s)', '', s)
+            s = re.sub(r'(?:outline|altnum|alt|num|old|new|_)+$', '', s)
+            return s
+
+        # 2. Map FONT stems -> font_id
+        font_off, _ = chunk_map["FONT"]
+        font_count = _u32(data, font_off)
+        font_by_stem: dict[str, int] = {}
+        font_by_name: dict[str, int] = {}
+        for f_idx in range(font_count):
+            fp = _u32(data, font_off + 4 + f_idx * 4)
+            if fp + 4 <= len(data):
+                fname = char_ptr_to_str.get(_u32(data, fp), "")
+                if fname:
+                    font_by_name[fname.lower()] = f_idx
+                    stem = _norm_font_stem(fname)
+                    if stem and stem not in font_by_stem:
+                        font_by_stem[stem] = f_idx
+
+        if not font_by_stem:
+            return 0
+
+        # 3. Map SPRT index -> matching FONT index
+        sprt_off, _ = chunk_map["SPRT"]
+        sprt_count = _u32(data, sprt_off)
+        spr_to_font: dict[int, int] = {}
+        for s_idx in range(sprt_count):
+            sp = _u32(data, sprt_off + 4 + s_idx * 4)
+            if sp + 4 <= len(data):
+                sname = char_ptr_to_str.get(_u32(data, sp), "")
+                if not sname:
+                    continue
+                stem = _norm_font_stem(sname)
+                if stem in font_by_stem:
+                    spr_to_font[s_idx] = font_by_stem[stem]
+
+        if not spr_to_font:
+            return 0
+
+        # 4. Find font_add_sprite entry in FUNC and collect its call chain
+        code_off, code_sz = chunk_map["CODE"]
+        func_entry_off: int | None = None
+        func_chain: list[tuple[int, int]] = []  # [(inst_addr, link_addr), ...]
+        first_addr_uses_link_off = False
+
+        if "FUNC" in chunk_map:
+            func_off, func_sz = chunk_map["FUNC"]
+            func_count = _u32(data, func_off)
+            for i in range(func_count):
+                entry = func_off + 4 + i * 12
+                if entry + 12 > func_off + func_sz:
+                    break
+                name_ptr, occurrences, first_addr = struct.unpack_from("<III", data, entry)
+                fname = char_ptr_to_str.get(name_ptr, "")
+                if fname != "font_add_sprite" or occurrences == 0 or first_addr == 0xFFFFFFFF:
+                    continue
+                func_entry_off = entry
+                curr = first_addr
+                visited: set[int] = set()
+                while curr != 0 and curr not in visited and len(visited) < occurrences and (code_off <= curr < code_off + code_sz):
+                    visited.add(curr)
+                    if curr + 8 <= len(data) and ((_u32(data, curr) >> 24) & 0xFF) in (0xD9, 0xDA):
+                        inst_addr, link_addr = curr, curr + 4
+                    elif curr >= code_off + 4 and ((_u32(data, curr - 4) >> 24) & 0xFF) in (0xD9, 0xDA):
+                        inst_addr, link_addr = curr - 4, curr
+                        if len(func_chain) == 0:
+                            first_addr_uses_link_off = True
+                    else:
+                        break
+                    func_chain.append((inst_addr, link_addr))
+                    raw_link = _u32(data, link_addr) & 0x00FFFFFF
+                    if raw_link == 0 or raw_link == 0x00FFFFFF:
+                        break
+                    next_delta = raw_link - 0x01000000 if (raw_link & 0x00800000) else raw_link
+                    if next_delta == 0:
+                        break
+                    curr = curr + next_delta
+                break
+
+        call_set = {inst_addr for inst_addr, _ in func_chain}
+        if not call_set:
+            return 0
+
+        # 5. Walk CODE entries to find the 4 push instructions preceding each font_add_sprite call
+        code_count = _u32(data, code_off)
+        code_ptrs = [_u32(data, code_off + 4 + i * 4) for i in range(code_count)]
+        patched_calls: set[int] = set()
+
+        for cp in code_ptrs:
+            if cp + 12 > len(data):
+                continue
+            bc_len = _u32(data, cp + 4)
+            if bytecode_version <= 14:
+                bc_start = cp + 8
+            else:
+                if cp + 16 > len(data):
+                    continue
+                bc_start = cp + 12 + _i32(data, cp + 12)
+            bc_end = bc_start + bc_len
+
+            # Quick check if any font_add_sprite call is inside this CODE block
+            if not any(bc_start <= ca < bc_end for ca in call_set):
+                continue
+
+            pos = bc_start
+            # Stack of (inst_pos, inst_len, int_val_or_None)
+            push_history: list[tuple[int, int, int | None]] = []
+
+            while pos + 4 <= bc_end and pos + 4 <= len(data):
+                w0 = _u32(data, pos)
+                op = (w0 >> 24) & 0xFF
+                t1 = (w0 >> 16) & 0x0F
+
+                if op == 0x84 or (op in (0xC0, 0xC1, 0xC2, 0xC3) and t1 == 0x0F):
+                    push_history.append((pos, 4, _i16(data, pos)))
+                    pos += 4
+                elif op == 0x07:  # conv instruction: extends preceding push with conversion to RValue
+                    if push_history:
+                        prev_pos, prev_len, prev_val = push_history[-1]
+                        push_history[-1] = (prev_pos, prev_len + 4, prev_val)
+                    pos += 4
+                elif op in (0xC0, 0xC1, 0xC2, 0xC3):
+                    if t1 in (0x00, 0x03):
+                        push_history.append((pos, 12, None))
+                        pos += 12
+                    elif t1 == 0x02 and pos + 8 <= len(data):
+                        push_history.append((pos, 8, _i32(data, pos + 4)))
+                        pos += 8
+                    else:
+                        push_history.append((pos, 8, None))
+                        pos += 8
+                elif op in (0xD9, 0xDA):
+                    argc = w0 & 0xFFFF
+                    if pos in call_set and argc == 4 and len(push_history) >= 4:
+                        args4 = push_history[-4:]
+                        block_start = args4[0][0]
+                        block_end = pos + 8
+                        block_len = block_end - block_start
+                        is_contiguous = (block_start + sum(a[1] for a in args4) == pos)
+
+                        # Determine sprite index (GML pushes right-to-left so spr is args4[-1], or left-to-right args4[0])
+                        spr_id = None
+                        if args4[-1][2] in spr_to_font:
+                            spr_id = args4[-1][2]
+                        elif args4[0][2] in spr_to_font:
+                            spr_id = args4[0][2]
+
+                        if is_contiguous and spr_id is not None and block_len >= 8 and block_len % 4 == 0:
+                            target_font_id = spr_to_font[spr_id]
+                            patch_bytes = bytearray()
+                            rem = block_len
+                            # Pad with stack-neutral pushi.e 0 (4B) + popz.i (4B) pairs
+                            while rem > 12 or rem == 16:
+                                patch_bytes.extend(struct.pack("<II", 0x840F0000, 0x46020000))
+                                rem -= 8
+                            if rem == 12:
+                                # 8-byte push.i <font_id> + 4-byte conv.i.v
+                                patch_bytes.extend(struct.pack("<III", 0xC0020000, target_font_id, 0x07520000))
+                            elif rem == 8:
+                                # 4-byte pushi.e <font_id> + 4-byte conv.i.v
+                                w_push = (0x84 << 24) | (0x0F << 16) | (target_font_id & 0xFFFF)
+                                patch_bytes.extend(struct.pack("<II", w_push, 0x07520000))
+
+                            if len(patch_bytes) == block_len:
+                                buf[block_start:block_end] = patch_bytes
+                                patched_calls.add(pos)
+
+                    push_history.clear()
+                    pos += 8
+                elif op == 0x45:
+                    push_history.clear()
+                    pos += 8
+                elif op in (0xB7, 0xB8, 0xB9, 0x9C, 0x9D):
+                    push_history.clear()
+                    pos += 4
+                else:
+                    push_history.clear()
+                    pos += 4
+
+        # 6. Unlink patched calls from FUNC chunk so the runner does not overwrite our bytecode at startup
+        if patched_calls and func_entry_off is not None:
+            remaining = [(ia, la) for ia, la in func_chain if ia not in patched_calls]
+            if not remaining:
+                struct.pack_into("<II", buf, func_entry_off + 4, 0, 0xFFFFFFFF)
+            else:
+                new_first = remaining[0][1] if first_addr_uses_link_off else remaining[0][0]
+                struct.pack_into("<II", buf, func_entry_off + 4, len(remaining), new_first)
+                for idx_r, (ia, la) in enumerate(remaining):
+                    old_hi = _u32(data, la) & 0xFF000000
+                    if idx_r + 1 < len(remaining):
+                        next_ia, next_la = remaining[idx_r + 1]
+                        delta = (next_la - la) if first_addr_uses_link_off else (next_ia - ia)
+                        low24 = delta & 0x00FFFFFF
+                    else:
+                        low24 = 0
+                    struct.pack_into("<I", buf, la, old_hi | low24)
+
+        return len(patched_calls)
 
     def _inject_external_file(self, root: str, rel_p: str, file_tr: dict[str, str]) -> int:
         full_p = os.path.join(root, rel_p.replace("/", os.sep))
