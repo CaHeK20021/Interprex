@@ -1330,7 +1330,7 @@ class GameMakerParser(BaseParser):
         buf: bytearray,
         chunk_map: dict[str, tuple[int, int]],
     ) -> int:
-        """Redirect font_add_sprite() calls in CODE to augmented FONT resources if matching fonts exist."""
+        """Redirect font_add_sprite() and font_add_sprite_ext() calls in CODE to augmented FONT resources if matching fonts exist."""
         if "CODE" not in chunk_map or "FONT" not in chunk_map or "SPRT" not in chunk_map or "STRG" not in chunk_map:
             return 0
 
@@ -1356,11 +1356,18 @@ class GameMakerParser(BaseParser):
             s = re.sub(r'(?:outline|altnum|alt|num|old|new|_)+$', '', s)
             return s
 
-        # 2. Map FONT stems -> font_id
+        def _get_tokens(name: str) -> set[str]:
+            parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+', name)
+            tokens = {p.lower() for p in parts if not p.isdigit()}
+            tokens.difference_update({"s", "spr", "fnt", "font", "spr_fnt", "old", "new"})
+            return tokens
+
+        # 2. Map FONT stems and tokens -> font_id
         font_off, _ = chunk_map["FONT"]
         font_count = _u32(data, font_off)
         font_by_stem: dict[str, int] = {}
         font_by_name: dict[str, int] = {}
+        font_tokens: dict[int, tuple[str, set[str]]] = {}
         for f_idx in range(font_count):
             fp = _u32(data, font_off + 4 + f_idx * 4)
             if fp + 4 <= len(data):
@@ -1370,8 +1377,9 @@ class GameMakerParser(BaseParser):
                     stem = _norm_font_stem(fname)
                     if stem and stem not in font_by_stem:
                         font_by_stem[stem] = f_idx
+                    font_tokens[f_idx] = (fname, _get_tokens(fname))
 
-        if not font_by_stem:
+        if not font_by_stem and not font_tokens:
             return 0
 
         # 3. Map SPRT index -> matching FONT index
@@ -1384,18 +1392,39 @@ class GameMakerParser(BaseParser):
                 sname = char_ptr_to_str.get(_u32(data, sp), "")
                 if not sname:
                     continue
+                lower_s = sname.lower()
                 stem = _norm_font_stem(sname)
-                if stem in font_by_stem:
+                stoks = _get_tokens(sname)
+                is_font_sprite = any(k in lower_s for k in ("fnt", "font", "sfnt", "sfont")) or (stem in font_by_stem)
+                if not is_font_sprite or (not stoks and not stem):
+                    continue
+
+                best_fid = None
+                best_score = -1
+                for fid, (fname, ftoks) in font_tokens.items():
+                    overlap = len(stoks & ftoks)
+                    if overlap > 0 and overlap > best_score:
+                        best_score = overlap
+                        best_fid = fid
+                    elif overlap > 0 and overlap == best_score and best_fid is not None:
+                        prev_extra = len(font_tokens[best_fid][1] - stoks)
+                        curr_extra = len(ftoks - stoks)
+                        if curr_extra < prev_extra:
+                            best_fid = fid
+
+                if best_fid is not None:
+                    spr_to_font[s_idx] = best_fid
+                elif stem in font_by_stem:
                     spr_to_font[s_idx] = font_by_stem[stem]
 
         if not spr_to_font:
             return 0
 
-        # 4. Find font_add_sprite entry in FUNC and collect its call chain
+        # 4. Find all font creation functions in FUNC and collect their call chains
+        TARGET_FUNCS = {"font_add_sprite", "font_add_sprite_ext"}
         code_off, code_sz = chunk_map["CODE"]
-        func_entry_off: int | None = None
-        func_chain: list[tuple[int, int]] = []  # [(inst_addr, link_addr), ...]
-        first_addr_uses_link_off = False
+        func_entries: dict[str, tuple[int, int, int, list[tuple[int, int]], bool]] = {}
+        call_to_func: dict[int, str] = {}
 
         if "FUNC" in chunk_map:
             func_off, func_sz = chunk_map["FUNC"]
@@ -1406,9 +1435,10 @@ class GameMakerParser(BaseParser):
                     break
                 name_ptr, occurrences, first_addr = struct.unpack_from("<III", data, entry)
                 fname = char_ptr_to_str.get(name_ptr, "")
-                if fname != "font_add_sprite" or occurrences == 0 or first_addr == 0xFFFFFFFF:
+                if fname not in TARGET_FUNCS or occurrences == 0 or first_addr == 0xFFFFFFFF:
                     continue
-                func_entry_off = entry
+                func_chain: list[tuple[int, int]] = []
+                first_addr_uses_link_off = False
                 curr = first_addr
                 visited: set[int] = set()
                 while curr != 0 and curr not in visited and len(visited) < occurrences and (code_off <= curr < code_off + code_sz):
@@ -1422,6 +1452,7 @@ class GameMakerParser(BaseParser):
                     else:
                         break
                     func_chain.append((inst_addr, link_addr))
+                    call_to_func[inst_addr] = fname
                     raw_link = _u32(data, link_addr) & 0x00FFFFFF
                     if raw_link == 0 or raw_link == 0x00FFFFFF:
                         break
@@ -1429,13 +1460,12 @@ class GameMakerParser(BaseParser):
                     if next_delta == 0:
                         break
                     curr = curr + next_delta
-                break
+                func_entries[fname] = (entry, occurrences, first_addr, func_chain, first_addr_uses_link_off)
 
-        call_set = {inst_addr for inst_addr, _ in func_chain}
-        if not call_set:
+        if not call_to_func:
             return 0
 
-        # 5. Walk CODE entries to find the 4 push instructions preceding each font_add_sprite call
+        # 5. Walk CODE entries to find the 4 push instructions preceding each font_add_sprite* call
         code_count = _u32(data, code_off)
         code_ptrs = [_u32(data, code_off + 4 + i * 4) for i in range(code_count)]
         patched_calls: set[int] = set()
@@ -1452,8 +1482,8 @@ class GameMakerParser(BaseParser):
                 bc_start = cp + 12 + _i32(data, cp + 12)
             bc_end = bc_start + bc_len
 
-            # Quick check if any font_add_sprite call is inside this CODE block
-            if not any(bc_start <= ca < bc_end for ca in call_set):
+            # Quick check if any target font creation call is inside this CODE block
+            if not any(bc_start <= ca < bc_end for ca in call_to_func):
                 continue
 
             pos = bc_start
@@ -1485,7 +1515,7 @@ class GameMakerParser(BaseParser):
                         pos += 8
                 elif op in (0xD9, 0xDA):
                     argc = w0 & 0xFFFF
-                    if pos in call_set and argc == 4 and len(push_history) >= 4:
+                    if pos in call_to_func and argc == 4 and len(push_history) >= 4:
                         args4 = push_history[-4:]
                         block_start = args4[0][0]
                         block_end = pos + 8
@@ -1532,18 +1562,21 @@ class GameMakerParser(BaseParser):
                     pos += 4
 
         # 6. Unlink patched calls from FUNC chunk so the runner does not overwrite our bytecode at startup
-        if patched_calls and func_entry_off is not None:
-            remaining = [(ia, la) for ia, la in func_chain if ia not in patched_calls]
+        for fname, (entry_off, occurrences, first_addr, func_chain, uses_link_off) in func_entries.items():
+            patched_in_func = {ia for ia, _ in func_chain if ia in patched_calls}
+            if not patched_in_func:
+                continue
+            remaining = [(ia, la) for ia, la in func_chain if ia not in patched_in_func]
             if not remaining:
-                struct.pack_into("<II", buf, func_entry_off + 4, 0, 0xFFFFFFFF)
+                struct.pack_into("<II", buf, entry_off + 4, 0, 0xFFFFFFFF)
             else:
-                new_first = remaining[0][1] if first_addr_uses_link_off else remaining[0][0]
-                struct.pack_into("<II", buf, func_entry_off + 4, len(remaining), new_first)
+                new_first = remaining[0][1] if uses_link_off else remaining[0][0]
+                struct.pack_into("<II", buf, entry_off + 4, len(remaining), new_first)
                 for idx_r, (ia, la) in enumerate(remaining):
                     old_hi = _u32(data, la) & 0xFF000000
                     if idx_r + 1 < len(remaining):
                         next_ia, next_la = remaining[idx_r + 1]
-                        delta = (next_la - la) if first_addr_uses_link_off else (next_ia - ia)
+                        delta = (next_la - la) if uses_link_off else (next_ia - ia)
                         low24 = delta & 0x00FFFFFF
                     else:
                         low24 = 0

@@ -445,11 +445,31 @@ function getModNameForString(
     const sepIdx = inner.indexOf("!");
     const modPath = sepIdx >= 0 ? inner.slice(0, sepIdx) : inner;
     const modPathNorm = norm(modPath);
+    const modPathAbsGame = norm(
+      !modPath.startsWith("/") && !modPath.includes(":")
+        ? `${gameRoot}/${modPath}`
+        : modPath,
+    );
+    const modPathAbsMods = norm(
+      !modPath.startsWith("/") && !modPath.includes(":")
+        ? `${modsDir}/${modPath}`
+        : modPath,
+    );
     const matchingMod = detectedMods.find((mod) => {
       const mp = norm(mod.path);
-      return modPathNorm === mp || modPathNorm.startsWith(mp + "/");
+      const modAbs = norm(`${modsDir}/${mod.path}`);
+      return (
+        modPathNorm === mp ||
+        modPathNorm.startsWith(mp + "/") ||
+        modPathAbsGame === modAbs ||
+        modPathAbsGame.startsWith(modAbs + "/") ||
+        modPathAbsMods === modAbs ||
+        modPathAbsMods.startsWith(modAbs + "/")
+      );
     });
     if (matchingMod) return matchingMod.name;
+    const bySub = detectedMods.find((mod) => norm(modPath).includes(norm(mod.path)));
+    if (bySub) return bySub.name;
     // fallback — leaf directory name
     return modPath.split("/").pop() || "—";
   }
@@ -484,11 +504,31 @@ function getModPathForString(
     const sepIdx = inner.indexOf("!");
     const modPath = sepIdx >= 0 ? inner.slice(0, sepIdx) : inner;
     const modPathNorm = norm(modPath);
+    const modPathAbsGame = norm(
+      !modPath.startsWith("/") && !modPath.includes(":")
+        ? `${gameRoot}/${modPath}`
+        : modPath,
+    );
+    const modPathAbsMods = norm(
+      !modPath.startsWith("/") && !modPath.includes(":")
+        ? `${modsDir}/${modPath}`
+        : modPath,
+    );
     const matchingMod = detectedMods.find((mod) => {
       const mp = norm(mod.path);
-      return modPathNorm === mp || modPathNorm.startsWith(mp + "/");
+      const modAbs = norm(`${modsDir}/${mod.path}`);
+      return (
+        modPathNorm === mp ||
+        modPathNorm.startsWith(mp + "/") ||
+        modPathAbsGame === modAbs ||
+        modPathAbsGame.startsWith(modAbs + "/") ||
+        modPathAbsMods === modAbs ||
+        modPathAbsMods.startsWith(modAbs + "/")
+      );
     });
     if (matchingMod) return matchingMod.path;
+    const bySub = detectedMods.find((mod) => norm(modPath).includes(norm(mod.path)));
+    if (bySub) return bySub.path;
     return modPath;
   }
 
