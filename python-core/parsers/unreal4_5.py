@@ -145,12 +145,12 @@ def _build_uasset_path_key(item: dict) -> list[str]:
 
 
 # --- ContentLib patch routing ------------------------------------------------
-# WHICH ContentLib patch folder an asset goes to is decided by its PARENT UE class
-# (the same type ContentLib gates on: "Was not FGRecipe after loading"), NOT by its
-# filename. Routing by name over-matched categories/input-actions that merely sit in
-# a /Recipes/ folder or contain "Recipe" (CAT_PP, RecipeCatUpgrade, IA_Smart_Recipe*)
-# -> they failed as RecipePatches. The parent class (Program.cs SuperClass) is the
-# ground truth; HasIngredientsAndProduct is the fallback when retoc erased the parent.
+# WHICH ContentLib patch folder an asset goes to is decided by its PARENT UE class.
+# Recipes MUST go to CDO: ContentLib's RecipePatches loader (UCLRecipeBPFLib::SerializeRecipe)
+# attempts to deserialize full recipe definitions (Ingredients, Products) from JSON,
+# and crashes with EXCEPTION_ACCESS_VIOLATION (nullptr + 0x18) when given a text-only
+# localization patch. CDO modifies mDisplayName directly via UE reflection on the recipe
+# class default object without touching ingredients or invoking SerializeRecipe.
 _RECIPE_SUPERS = {"FGRecipe"}
 _CATEGORY_SUPERS = {
     "FGItemCategory", "FGCategory", "FGRecipeCategory",
@@ -162,14 +162,12 @@ _ERASED_SUPERS = {"", "UnknownExport", "<null>", "None"}
 
 
 def _route_patch_kind(super_class: str, has_ing_prod: bool, asset_leaf: str) -> str:
-    """Decide the ContentLib patch kind ("recipes"|"items"|"cdos") from the asset's
+    """Decide the ContentLib patch kind ("items"|"cdos") from the asset's
     PARENT UE class (ground truth), with a property-set fallback for assets whose
-    parent retoc erased to UnknownExport. asset_leaf (lowercased asset name) is used
-    ONLY as a last-resort name heuristic so an old/missing-metadata build degrades to
-    the previous behaviour instead of mis-routing."""
+    parent retoc erased to UnknownExport. Recipes and categories route to CDO."""
     sc = (super_class or "").strip()
     if sc in _RECIPE_SUPERS:
-        return "recipes"
+        return "cdos"
     if sc in _CATEGORY_SUPERS:
         # ContentLib has no category patch; CDO patches mDisplayName by raw name with
         # no type gate -> the right home for a category caption.
@@ -178,11 +176,11 @@ def _route_patch_kind(super_class: str, has_ing_prod: bool, asset_leaf: str) -> 
         return "items"
     if sc in _ERASED_SUPERS:
         if has_ing_prod:
-            return "recipes"            # Recipe_MK*, Rec_packing* (erased but real recipes)
+            return "cdos"               # Recipe_MK*, Rec_packing* (erased but real recipes -> CDO)
         if asset_leaf.startswith("desc_"):
             return "items"
         if asset_leaf.startswith("recipe_"):
-            return "recipes"
+            return "cdos"
         return "cdos"                   # CAT_PP, IA_Smart_*, and any unknown -> safe CDO
     # Any other concrete parent (FGSchematic, a mod intermediate, a non-FG class) ->
     # CDO is the safe catch-all (patches any class with no type gate).
@@ -1606,6 +1604,13 @@ class UnrealEngine4_5Parser(BaseParser):
                 )
 
         # 2. Write patch files and register in backups as 'created'
+        # Clean up legacy RecipePatches if any exist from older versions
+        import shutil
+        for legacy_base in [os.path.join(root, "Configs", "ContentLib", "RecipePatches"),
+                            os.path.join(root, "FactoryGame", "Configs", "ContentLib", "RecipePatches")]:
+            if os.path.isdir(legacy_base):
+                shutil.rmtree(legacy_base, ignore_errors=True)
+
         FOLDER = {"recipes": "RecipePatches", "items": "ItemPatches", "cdos": "CDOs"}
         for mod_name, kinds in patches_by_mod.items():
             for kind, target_map in kinds.items():

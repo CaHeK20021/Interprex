@@ -5449,13 +5449,13 @@ def check_unreal4_5_routing() -> None:
 
     cases = [
         # (super, has_ing_prod, asset_leaf, expected_kind)
-        # real recipes (parent survives) -> recipes
-        ("FGRecipe",        True,  "advanced-circuit",      "recipes"),
-        ("FGRecipe",        True,  "battery",               "recipes"),
-        ("FGRecipe",        True,  "recipe-minermk5",       "recipes"),
-        # recipes whose parent retoc erased, but props prove it -> recipes
-        ("",                True,  "recipe_mk2",            "recipes"),
-        ("UnknownExport",   True,  "rec_packinguraniumore", "recipes"),
+        # real recipes (parent survives) -> cdos (safe property patch, bypasses SerializeRecipe)
+        ("FGRecipe",        True,  "advanced-circuit",      "cdos"),
+        ("FGRecipe",        True,  "battery",               "cdos"),
+        ("FGRecipe",        True,  "recipe-minermk5",       "cdos"),
+        # recipes whose parent retoc erased, but props prove it -> cdos
+        ("",                True,  "recipe_mk2",            "cdos"),
+        ("UnknownExport",   True,  "rec_packinguraniumore", "cdos"),
         # categories -> cdos (the 4 that failed as recipes)
         ("",                False, "cat_pp",                "cdos"),   # erased category
         ("FGItemCategory",  False, "recipecatupgrade",      "cdos"),
@@ -5470,16 +5470,15 @@ def check_unreal4_5_routing() -> None:
         ("FGItemDescriptor",False, "desc_oreiron",          "items"),
         # graceful degradation: no super metadata, fall back to the name heuristic
         ("",                False, "desc_thing",            "items"),
-        ("",                False, "recipe_thing",          "recipes"),
+        ("",                False, "recipe_thing",          "cdos"),
         ("",                False, "build_thing",           "cdos"),
     ]
     for sup, hip, leaf, exp in cases:
         got = _route_patch_kind(sup, hip, leaf)
         assert got == exp, f"_route_patch_kind({sup!r}, {hip}, {leaf!r}) -> {got!r}, expected {exp!r}"
 
-    print(f"OK — unreal4_5 routing: {len(cases)} cases (FGRecipe->recipes, "
-          "categories/IA/schematics->cdos, FGItemDescriptor->items, erased-parent "
-          "prop fallback, name-fallback degradation)")
+    print(f"OK — unreal4_5 routing: {len(cases)} cases (FGRecipe/categories/IA/schematics->cdos, "
+          "FGItemDescriptor->items, erased-parent prop fallback, name-fallback degradation)")
 
 
 def check_unreal4_5_inherited() -> None:
